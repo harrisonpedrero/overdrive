@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
-import { TheaterError, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
+import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function featureChecks(db, featureId) {
   return parseJson(meta(db, `checks:${featureId}`), []);
@@ -59,6 +61,43 @@ async function withFeature(args, fn) {
   });
 }
 
+function artifactPaths(value = []) {
+  if (!Array.isArray(value) || value.length > 20) throw new TheaterError('artifact_paths must contain at most 20 checkout-relative paths.', 'INVALID_INPUT');
+  const paths = value.map(value => {
+    const relative = requiredText(value, 'artifact path', { max: 4096 }).replaceAll('\\', '/');
+    if (relative.includes('\0') || relative.includes(':') || relative.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')) {
+      throw new TheaterError('Artifact paths must name files or directories below the checkout, without traversal, Git metadata, or absolute paths.', 'INVALID_INPUT');
+    }
+    return relative;
+  }).sort();
+  if (paths.some((value, index) => paths.slice(0, index).some(parent => value === parent || value.startsWith(`${parent}/`)))) {
+    throw new TheaterError('Artifact paths must not duplicate or contain one another.', 'INVALID_INPUT');
+  }
+  return paths;
+}
+
+async function archiveCheckArtifacts(ctx, feature, check, id, revision) {
+  const paths = artifactPaths(check.artifact_paths);
+  if (!paths.length) return null;
+  const directory = await ensureManagedPath(ctx.root, contained(ctx.root, '.theater', 'artifacts', id));
+  await fs.mkdir(directory, { recursive: true });
+  for (const relative of paths) {
+    const source = await ensureManagedPath(feature.checkout_path, contained(feature.checkout_path, relative));
+    const destination = contained(directory, 'files', relative);
+    await fs.cp(source, destination, {
+      recursive: true, force: false, errorOnExist: true,
+      filter: async source => {
+        const stat = await fs.lstat(source);
+        if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) throw new TheaterError(`Artifact contains a symlink, junction, or special file: ${source}`, 'UNSAFE_PATH');
+        return true;
+      },
+    });
+  }
+  const manifest = path.join(directory, 'manifest.json');
+  await atomicWrite(ctx.root, manifest, `${JSON.stringify({ evidenceId: id, checkKey: check.key, revision, collectedAt: now(), paths }, null, 2)}\n`);
+  return manifest;
+}
+
 export async function updateChecks(args) {
   if (!Array.isArray(args.checks) || args.checks.length > 50) throw new TheaterError('checks must be an array of at most 50 commands.', 'INVALID_INPUT');
   const checks = args.checks.map(check => {
@@ -69,7 +108,8 @@ export async function updateChecks(args) {
     const timeout = check.timeout_seconds ?? 300;
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1800) throw new TheaterError('Check timeout must be 1–1800 seconds.', 'INVALID_INPUT');
     if (check.required !== undefined && typeof check.required !== 'boolean') throw new TheaterError('required must be a boolean.', 'INVALID_INPUT');
-    return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout };
+    const paths = artifactPaths(check.artifact_paths);
+    return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}) };
   }).sort((a, b) => a.key.localeCompare(b.key));
   if (new Set(checks.map(check => check.key)).size !== checks.length) throw new TheaterError('Check keys must be unique.', 'INVALID_INPUT');
   return withFeature(args, async (ctx, feature) => {
@@ -98,19 +138,23 @@ export async function runChecks(args) {
       let result;
       try { result = await run(check.argv, { cwd: feature.checkout_path, timeoutMs: check.timeout_seconds * 1000, maxOutput: 500_000, allowFailure: true }); }
       catch (error) { result = { exitCode: null, stderr: error.message, stdout: '', durationMs: 0 }; }
+      const id = newId('evidence');
+      let artifact = null;
+      let artifactError = null;
+      try { artifact = await archiveCheckArtifacts(ctx, feature, check, id, before.head); }
+      catch (error) { artifactError = redactString(error.message); }
       const after = await repositorySnapshot(feature.checkout_path);
       const unchanged = after.clean && after.head === before.head;
-      const passed = result.exitCode === 0 && !result.timedOut && !result.overflow && unchanged;
-      const summary = `${check.purpose}: ${passed ? 'passed' : 'failed'}${result.timedOut ? ' (timed out)' : result.overflow ? ' (output limit)' : !unchanged ? ' (checkout changed during verification)' : ` (exit ${result.exitCode ?? 'unavailable'})`}.`;
-      const id = newId('evidence');
-      ctx.db.prepare(`INSERT INTO evidence(id, feature_id, kind, summary, command, revision, passed, created_at, source, spec_revision, contract_hash, check_key, argv_json, exit_code, output, duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?)`).run(
+      const passed = result.exitCode === 0 && !result.timedOut && !result.overflow && unchanged && !artifactError;
+      const summary = `${check.purpose}: ${passed ? 'passed' : 'failed'}${result.timedOut ? ' (timed out)' : result.overflow ? ' (output limit)' : !unchanged ? ' (checkout changed during verification)' : ` (exit ${result.exitCode ?? 'unavailable'})`}${artifactError ? ' (artifact collection failed; remaining checks stopped)' : ''}.`;
+      ctx.db.prepare(`INSERT INTO evidence(id, feature_id, kind, summary, command, revision, passed, created_at, source, spec_revision, contract_hash, check_key, argv_json, exit_code, output, duration_ms, artifact)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         id, feature.id, check.kind, summary, redactString(JSON.stringify(check.argv)), before.head, passed ? 1 : 0, now(),
         feature.spec_revision, contract, check.key, redactString(JSON.stringify(result.argv ?? check.argv)), result.exitCode ?? null,
-        redactString(`${result.stdout}\n${result.stderr}`).slice(-24_000), result.durationMs,
+        redactString(`${result.stdout}\n${result.stderr}${artifactError ? `\nArtifact collection failed: ${artifactError}` : ''}`).slice(-24_000), result.durationMs, artifact,
       );
-      receipts.push({ id, key: check.key, passed, summary, exitCode: result.exitCode, durationMs: result.durationMs });
-      if (!unchanged) break;
+      receipts.push({ id, key: check.key, passed, summary, exitCode: result.exitCode, durationMs: result.durationMs, artifact });
+      if (!unchanged || artifactError) break;
     }
     const verification = verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head);
     if (!verification.ready) invalidateCandidates(ctx.db, feature.id);
