@@ -27,7 +27,7 @@ import {
   waitFeatureAgent,
 } from './agent-runtime.mjs';
 import { readEvidence, runChecks, updateChecks } from './verification.mjs';
-import { COMPONENTS, composeView, snapshotState } from './presentation.mjs';
+import { STATE_SECTIONS, composeView, snapshotState } from './presentation.mjs';
 
 const string = (description, extra = {}) => ({ type: 'string', description, ...extra });
 const boolean = description => ({ type: 'boolean', description });
@@ -49,16 +49,19 @@ function tool(name, title, description, inputSchema, annotations = {}) {
 
 const workspace = { workspace_path: string('Absolute path to the Feature Theater control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
-const view = {
+const state = {
   ...workspace, ...feature,
-  components: { type: 'array', minItems: 1, maxItems: 6, uniqueItems: true, items: string('Composable state component.', { enum: Object.keys(COMPONENTS) }), description: 'Choose components in display order. Defaults to features. Other components use the named or focused feature.' },
+  components: { type: 'array', minItems: 1, maxItems: 6, uniqueItems: true, items: string('State data section.', { enum: Object.keys(STATE_SECTIONS) }), description: 'Read only the data needed for the reply. Defaults to features. Other sections use the named or focused feature; these are data, not UI panels.' },
   include_archived: boolean('Include archived feature lanes in the overview.'),
 };
 
 export const TOOLS = [
-  tool('theater_view_catalog', 'State component patterns', 'Discover composable conversation components and their data scope. Use the smallest composition that answers the user.', object({}), { readOnlyHint: true, idempotentHint: true }),
-  tool('theater_state', 'Observe scoped feature state', 'Read a versioned, bounded snapshot for native conversation composition. Only load the selected components; a feature overview never loads other specifications or raw logs.', object(view, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
-  tool('theater_view', 'Compose state in conversation', 'Compose selected state components into an inline Codex conversation fragment. Returns its content reference and immutable snapshot. Buttons send follow-up requests through the meta agent; they never directly mutate runtime state.', object(view, ['workspace_path']), { destructiveHint: false }),
+  tool('theater_view_catalog', 'Work graph pattern', 'Describe the built-in work graph. Other state is answered in normal conversation, not separate panels or controls.', object({}), { readOnlyHint: true, idempotentHint: true }),
+  tool('theater_state', 'Observe scoped feature state', 'Read a versioned, bounded data snapshot for a normal conversational reply. Only load selected sections; an overview never loads other specifications or raw logs.', object(state, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('theater_view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
+    ...workspace, ...feature,
+    work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items.' },
+  }, ['workspace_path']), { destructiveHint: false }),
   tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Changes invalidate earlier candidates; commands execute only through theater_checks_run.', object({
     ...workspace, ...feature,
     checks: { type: 'array', maxItems: 50, items: object({
@@ -239,7 +242,7 @@ export const TOOLS = [
 ];
 
 const handlers = {
-  theater_view_catalog: () => ({ schemaVersion: 1, components: COMPONENTS, patterns: { overview: ['features'], feature: ['work', 'handoff'], delivery: ['evidence', 'handoff'], refinement: ['spec', 'work'], progress: ['activity', 'handoff'] } }),
+  theater_view_catalog: () => ({ schemaVersion: 2, components: { work: 'Native dependency graph with actual task states and blockers. Arrows run from prerequisite to dependent work.' }, interaction: 'Use the existing conversation. No embedded controls.', stateSections: Object.keys(STATE_SECTIONS) }),
   theater_state: snapshotState,
   theater_view: composeView,
   theater_checks_update: updateChecks,

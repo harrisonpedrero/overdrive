@@ -1,27 +1,11 @@
-# Composing state inside the coordinator conversation
+# Work graph in the conversation
 
-Use components to help the user understand, choose, or steer. Ordinary prose is sufficient for a single fact. For an overview or a meaningful feature transition, call `theater_view` with the smallest useful composition and embed its returned `contentReference` on its own line in the same response.
+The built-in visual is a work graph, not a second interface. It shows the shape of the work: prerequisites, parallel branches, joins, actual progress states, and explicit blockers. Everything else normally belongs in the existing chat.
 
-| User need | Components in display order | Context loaded |
-| --- | --- | --- |
-| What is active or blocked? | `features` | Compact cross-feature rows only |
-| Where are we on this feature? | `work`, `handoff` | Selected work, dependencies, checkpoint, requests |
-| Is this ready to accept? | `evidence`, `handoff` | Current Git, required command receipts, candidate, unresolved work |
-| What changed while I was away? | `activity`, `handoff` | Bounded safe events and current next action |
-| Refine the feature | `spec`, `work` | Current spec, recent revision reasons, selected work |
+Call `theater_view` with the workspace and selected feature, or let it use the current focus. Render its `markdown` directly; it is a native Mermaid diagram, not an HTML content reference. Identify the feature and observation time in the surrounding reply. Arrows run from prerequisite to dependent task. Do not add fake stages, percentage-complete scores, or statuses that are not in the work graph. Empty work returns a plain message instead of an invented diagram.
 
-These are composable patterns, not permanent pages. You can change their order, use one alone, or choose a different subset as the user's need changes. `theater_view_catalog` describes the available primitives.
+For graphs above 24 work items, select the keys relevant to the user's question with `work_items`. The response counts omitted work and labels prerequisites outside the view. State that the view is partial. Do not imply that unrelated branches have disappeared or that an outside prerequisite is complete.
 
-## State contract
+`theater_state` remains available for scoped, versioned data: feature summaries, work, evidence, recent activity, handoff, or spec. Those selections are context retrieval, not a catalog of UI panels. Prefer normal prose or a short list for that information. `renderWorkGraph(snapshot)` is the pure graph renderer; the saved snapshot and `.mmd` source keep its facts inspectable.
 
-`theater_state` returns the same versioned data used by the renderer without producing a view. It includes `schemaVersion`, `id`, `observedAt`, `stateVersion`, `digest`, `changedDuringRead`, explicit omissions, and only the requested sections. The workspace is identified by both id and absolute path. Feature lifecycle and agent execution are separate fields. Counts describe work items, not an invented percentage of product completion. Missing evidence, unavailable Git, and disconnected agents remain explicit unknown or incomplete states.
-
-Use this data when the user needs a custom composition the built-in patterns cannot express. Follow the available visualization skill for the host's rendering contract. The plugin's `scripts/presentation.mjs` exports `COMPONENTS`, `snapshotState`, and the pure `renderState(snapshot)` function for reusable composition. Keep the snapshot accessible beside any derived view; do not invent facts or infer success from a visual color.
-
-## Interaction and freshness
-
-Views are immutable observations. Their timestamp remains visible; they never claim to update themselves while an agent works. Refresh obtains a new observation through Astra. Local disclosure controls only reveal already selected data. Inspect, switch, refresh, and steering actions use the host's `window.openai.sendFollowUpMessage` bridge. The coordinator re-reads current state and performs the normal workflow. A view never invokes MCP tools, fetches a local server, grants permissions, or promotes a candidate directly.
-
-If `changedDuringRead` is true, refresh before a delivery decision. A prior snapshot, candidate, or button label never authorizes acting on stale state. Keep direction text and selected feature identity in the follow-up request. A screenshot or view is presentation, not test evidence.
-
-The renderer escapes all data, uses host theme/control utilities, and stacks at narrow widths. Retain accessible labels and native controls when composing a custom view. Do not build an application shell, navigation sidebar, global toolbar, or duplicate dashboard around these components.
+The graph is a timestamped observation, not a continuously updating dashboard. If `changedDuringRead` is true, obtain a fresh snapshot before drawing conclusions. Never add a message composer, steering form, navigation, refresh toolbar, or duplicated chat controls. Refreshes and user directions happen in the actual conversation. A graph's status labels are not a substitute for executed verification.

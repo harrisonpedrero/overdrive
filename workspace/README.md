@@ -12,4 +12,4 @@ Feature Theater will create its local state here. Feature clones appear under `f
 
 Nothing is configured yet. Existing-repository initialization never runs setup scripts automatically. Scratch initialization creates a minimal local Git repository under `project/`; completed, evidence-backed candidates can be promoted there by fast-forward so each later lane inherits accepted work.
 
-Ask “Show active features” or “Show the work and evidence for this feature” to compose state directly in the conversation. Inspect, switch, refresh, and steering controls return through Astra. Delivery requires current executed checks; the coordinator keeps reports and verified results distinct.
+Ask “Show the work graph” to see dependencies, progress, and blockers directly in the conversation. Ask questions and steer through this chat as usual. Delivery requires current executed checks; the coordinator keeps reports and verified results distinct.

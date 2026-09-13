@@ -61,9 +61,9 @@ For a real focus change:
 
 Switching coordinator focus does not change feature lifecycle or pause independent tasks. A paused destination stays paused until the user requests resumption.
 
-## Express state with conversation components
+## Show the work graph
 
-Use [state component patterns](references/state-components.md) when a view helps the user compare features, inspect dependencies or evidence, recover a handoff, or steer. Compose only the relevant primitives using `theater_view`; embed the returned content reference in the response. Use `theater_state` for bounded data when a custom composition would better answer the question. The snapshot timestamp and data scope are part of the contract. Views send actions back through the meta conversation and never bypass canonical tools.
+Use [the work graph pattern](references/state-components.md) when the user asks for the graph or dependencies make progress hard to explain. `theater_view` returns native Mermaid Markdown for the selected feature's actual work, statuses, and blockers. Include it directly in the response. Steering, switching, specification, evidence, and handoff discussion belong in this existing conversation; do not recreate them as forms, chat boxes, buttons, or separate panels. `theater_state` supplies bounded data for those replies. Add another visual only when it communicates a relationship that prose or a short list cannot express clearly.
 
 ## Evidence and delivery
 

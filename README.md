@@ -18,7 +18,7 @@ Useful requests include:
 - `Checkpoint this lane and switch to billing-recovery.`
 - `Record the tested commit as an integration candidate.`
 - `Promote the accepted foundation candidate, then create the next feature from it.`
-- `Show active features, then compose the work and handoff views for search-redesign.`
+- `Show the work graph for search-redesign.`
 - `Show the candidate evidence and explain what is still missing.`
 
 ## Design boundary
@@ -27,4 +27,4 @@ Feature Theater stores orchestration state in a local SQLite database and writes
 
 See [architecture](docs/architecture.md) and [operator guide](docs/operator-guide.md) for the runtime contract and recovery behavior.
 
-The coordinator can embed reusable state components directly in the conversation. Their buttons route inspect, switch, refresh, and steering requests back through Astra. Required checks execute through the plugin and bind to the current spec and commit; manually reported passes cannot authorize completion. New workspaces default to Astra, while an explicit model selection in an existing task remains the user's choice.
+The coordinator can show the actual work graph directly in the conversation: dependencies, parallel branches, status, and blockers. Steering and other interaction stay in the existing chat. Required checks execute through the plugin and bind to the current spec and commit; manually reported passes cannot authorize completion. New workspaces default to Astra, while an explicit model selection in an existing task remains the user's choice.

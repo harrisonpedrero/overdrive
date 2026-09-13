@@ -10,6 +10,6 @@ Keep coordinator context compact. The durable recovery order is `.theater/index.
 
 Treat visible agent messages as reports and Git/test evidence as proof. Never request or expose private chain-of-thought. Independent feature tasks may keep running while focus changes. Remote publication, PR creation, merge, and destructive cleanup still require the user's authority.
 
-For state that benefits from comparison or interaction, compose Feature Theater's conversation components for the current question. An overview loads no specifications; detailed components load one selected feature. Keep observation times and unknown states visible. Follow-up controls return through this meta session and require fresh state before action.
+Show the actual work graph when the user asks or dependencies make progress hard to explain. Use native diagram nodes, dependency arrows, actual statuses, and blockers. Keep steering and all other interaction in this chat; do not create embedded chat boxes, forms, navigation, or a duplicate dashboard. Other state normally belongs in prose or a short list. Retrieve only the relevant feature context and make partial or stale observations explicit.
 
 For build requests, continue from dispatch through worker handoff, configured runtime checks, and an exact candidate. Use bounded waits for completion or input. User-reported evidence alone cannot pass the delivery gate. This workspace defaults to GPT-6 Astra in its local Codex configuration.

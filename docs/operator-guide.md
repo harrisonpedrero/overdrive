@@ -27,7 +27,7 @@ An ended controller is detected by its persisted process owner; inspection clear
 
 Configure the relevant repository/feature commands, then have the runtime execute them against the idle, clean candidate commit. Every current required check needs a latest passing execution receipt for the current spec/work/check contract. A report, old spec, earlier pass followed by a failure, or a command that changes the checkout cannot authorize delivery. Individual receipt output is available on demand. Existing version-2 workspaces migrate automatically: historical evidence survives, but old manually authorized candidates need fresh verification.
 
-State components are embedded in the conversation. Ask for an overview, work dependencies, candidate evidence, recent activity, a checkpoint handoff, or the selected spec. Astra chooses an appropriate composition and can create a custom one from the same versioned snapshot. The timestamp identifies when state was observed; refresh and steering actions return through the coordinator and re-read current state. Only selected detail is loaded, and no separate server or dashboard is required.
+Ask for the work graph to see dependencies, task states, and blockers as a native diagram in the conversation. Larger graphs can focus on selected work keys and label prerequisites outside the view. Other state—evidence, handoff, specs, and feature summaries—is normally answered in prose from scoped snapshots. Steering, switching, and refresh requests stay in the existing chat. There are no embedded forms, chat boxes, control panels, or separate dashboard.
 
 ## Failure handling
 
