@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
 export class TheaterError extends Error {
@@ -123,16 +125,31 @@ function commandDescription(argv) {
   return argv.map(part => (/^[a-zA-Z0-9_./:@\\=-]+$/.test(part) ? part : JSON.stringify(part))).join(' ');
 }
 
-export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000 } = {}) {
+export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new TheaterError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
+  if (process.platform === 'win32' && /^(npm|npx|pnpm|yarn)(\.cmd)?$/i.test(argv[0])) {
+    const manager = argv[0].replace(/\.cmd$/i, '').toLowerCase();
+    const found = spawnSync('where.exe', [`${manager}.cmd`], { encoding: 'utf8', windowsHide: true });
+    const folder = found.status === 0 ? path.dirname(found.stdout.trim().split(/\r?\n/)[0]) : null;
+    const candidates = folder ? [
+      path.join(folder, 'node_modules', 'npm', 'bin', `${manager}-cli.js`),
+      path.join(folder, 'node_modules', 'corepack', 'dist', `${manager}.js`),
+      path.join(folder, 'node_modules', manager, 'bin', `${manager}.cjs`),
+      path.join(folder, 'node_modules', manager, 'bin', `${manager}.js`),
+    ] : [];
+    const script = candidates.find(candidate => fsSync.existsSync(candidate));
+    if (script) argv = [process.execPath, script, ...argv.slice(1)];
+  }
   return await new Promise((resolve, reject) => {
+    const started = Date.now();
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
       env,
       windowsHide: true,
       shell: false,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -149,21 +166,39 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
     };
     child.stdout.on('data', chunk => { stdout = collect(stdout, chunk); });
     child.stderr.on('data', chunk => { stderr = collect(stderr, chunk); });
-    const timer = setTimeout(() => child.kill(), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', shell: false });
+        killer.once('error', () => child.kill());
+      } else {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill(); }
+      }
+    }, timeoutMs);
     child.once('error', error => {
       clearTimeout(timer);
       reject(new TheaterError(`Unable to launch ${argv[0]}: ${error.message}`, 'COMMAND_LAUNCH_FAILED'));
     });
     child.once('close', code => {
       clearTimeout(timer);
-      if (code === 0 && !overflow) return resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+      if (allowFailure) return resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs: Date.now() - started, argv });
+      if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
       const detail = stderr.trim().slice(-4_000) || stdout.trim().slice(-4_000) || 'No output';
-      reject(new TheaterError(`${commandDescription(argv)} failed${overflow ? ' because its output was too large' : ` (exit ${code})`}: ${detail}`, 'COMMAND_FAILED'));
+      reject(new TheaterError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}: ${detail}`, 'COMMAND_FAILED'));
     });
   });
 }
 
 export const git = (cwd, ...args) => run(['git', ...args], { cwd });
+
+export function redactString(value) {
+  return String(value)
+    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[credentials-redacted]@')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/-]+/gi, '$1 [redacted]')
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|ctx7sk-[A-Za-z0-9-]{20,})\b/g, '[redacted]')
+    .replace(/\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[:=]\s*([^\s,;]+)/gi, '$1=[redacted]');
+}
 
 export async function normalizeRepositorySource(value) {
   const source = requiredText(value, 'repository', { max: 4_096 });
@@ -200,14 +235,19 @@ export async function withWorkspaceLock(root, operation, fn) {
       if (error?.code !== 'EEXIST') throw error;
       try {
         const stat = await fs.stat(lockFile);
-        if (Date.now() - stat.mtimeMs > 6 * 60 * 60_000) {
+        const record = JSON.parse(await fs.readFile(lockFile, 'utf8'));
+        let alive = true;
+        if (Number.isInteger(record.pid) && record.pid > 0) {
+          try { process.kill(record.pid, 0); } catch (error) { if (error.code === 'ESRCH') alive = false; }
+        }
+        if (!alive && Date.now() - stat.mtimeMs > 500) {
           const stale = `${lockFile}.stale-${randomUUID()}`;
           await fs.rename(lockFile, stale);
           await fs.rm(stale, { force: true });
           continue;
         }
       } catch (statError) {
-        if (!['ENOENT', 'EACCES'].includes(statError?.code)) throw statError;
+        if (!(statError instanceof SyntaxError) && !['ENOENT', 'EACCES'].includes(statError?.code)) throw statError;
       }
       if (Date.now() >= deadline) throw new TheaterError(`Timed out waiting for the ${operation} workspace lock.`, 'WORKSPACE_BUSY');
       await sleep(150);

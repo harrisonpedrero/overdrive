@@ -154,9 +154,16 @@ export async function repositorySnapshot(repository, baseRevision = undefined) {
   const head = (await git(repository, 'rev-parse', 'HEAD')).stdout;
   let branch = '';
   try { branch = (await git(repository, 'branch', '--show-current')).stdout; } catch { branch = ''; }
-  const porcelain = (await git(repository, 'status', '--porcelain=v1', '--untracked-files=all')).stdout;
-  const lines = porcelain ? porcelain.split(/\r?\n/).filter(Boolean) : [];
-  const changedFiles = lines.map(line => line.slice(3).replace(/^.* -> /, '')).slice(0, 200);
+  const porcelain = (await run(['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: repository, rawOutput: true })).stdout;
+  const entries = porcelain.split('\0').filter(Boolean);
+  const lines = [];
+  const changedFiles = [];
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    lines.push(entry);
+    changedFiles.push(entry.slice(3));
+    if (/R|C/.test(entry.slice(0, 2))) index++;
+  }
   let ahead = undefined;
   let behind = undefined;
   if (baseRevision) {
@@ -173,7 +180,7 @@ export async function repositorySnapshot(repository, baseRevision = undefined) {
     branch,
     clean: lines.length === 0,
     changedFileCount: lines.length,
-    changedFiles,
+    changedFiles: changedFiles.slice(0, 200),
     status: lines.slice(0, 200),
     ahead,
     behind,

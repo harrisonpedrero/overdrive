@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { TheaterError, contained, now, readJson } from './util.mjs';
+import { TheaterError, contained, ensureManagedPath, now, readJson } from './util.mjs';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 function schema(db) {
   db.exec(`
@@ -142,10 +142,10 @@ function schema(db) {
 }
 
 function migrate(db, currentVersion) {
-  if (currentVersion >= 2) return;
+  if (currentVersion >= SCHEMA_VERSION) return;
   db.exec('BEGIN IMMEDIATE');
   try {
-    db.exec(`
+    if (currentVersion < 2) db.exec(`
       ALTER TABLE pending_agent_requests RENAME TO pending_agent_requests_v1;
       CREATE TABLE pending_agent_requests (
         request_id TEXT NOT NULL,
@@ -165,6 +165,26 @@ function migrate(db, currentVersion) {
       FROM pending_agent_requests_v1;
       DROP TABLE pending_agent_requests_v1;
     `);
+    const additions = {
+      evidence: {
+        source: "TEXT NOT NULL DEFAULT 'reported'", spec_revision: 'INTEGER NOT NULL DEFAULT -1',
+        contract_hash: "TEXT NOT NULL DEFAULT ''", check_key: 'TEXT', argv_json: 'TEXT',
+        exit_code: 'INTEGER', output: "TEXT NOT NULL DEFAULT ''", duration_ms: 'INTEGER',
+      },
+      candidates: { spec_revision: 'INTEGER NOT NULL DEFAULT -1', contract_hash: "TEXT NOT NULL DEFAULT ''" },
+    };
+    for (const [table, columns] of Object.entries(additions)) {
+      const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(column => column.name));
+      for (const [name, declaration] of Object.entries(columns)) {
+        if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${declaration}`);
+      }
+    }
+    db.exec(`
+      UPDATE features SET status = 'active' WHERE status IN ('done','review') AND id IN (
+        SELECT feature_id FROM candidates WHERE contract_hash = '' AND status IN ('ready','accepted')
+      );
+      UPDATE candidates SET status = 'superseded' WHERE contract_hash = '' AND status IN ('ready','accepted');
+    `);
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
@@ -181,7 +201,7 @@ export function openDatabase(root) {
     db.close();
     throw new TheaterError('This workspace was created by a newer Feature Theater version.', 'NEWER_SCHEMA');
   }
-  if (current) migrate(db, Number(current.value));
+  migrate(db, current ? Number(current.value) : 2);
   db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
   return db;
 }
@@ -213,7 +233,7 @@ export function initializeDatabase(root, config) {
 }
 
 export async function loadWorkspace(root) {
-  const configFile = contained(root, 'theater.json');
+  const configFile = await ensureManagedPath(root, contained(root, 'theater.json'));
   let config;
   try { config = await readJson(configFile); } catch (error) {
     if (error?.code === 'ENOENT') throw new TheaterError('Feature Theater is not initialized in this workspace.', 'NOT_INITIALIZED');
@@ -222,10 +242,15 @@ export async function loadWorkspace(root) {
   if (config?.formatVersion !== 1 || typeof config.workspaceId !== 'string' || typeof config.repository !== 'string') {
     throw new TheaterError('theater.json is invalid.', 'INVALID_STATE');
   }
-  try { await fs.access(contained(root, '.theater', 'state.sqlite3')); } catch {
+  const databaseFile = await ensureManagedPath(root, contained(root, '.theater', 'state.sqlite3'));
+  try { await fs.access(databaseFile); } catch {
     throw new TheaterError('Feature Theater state database is missing.', 'INVALID_STATE');
   }
   const db = openDatabase(root);
+  if (meta(db, 'workspace_id') !== config.workspaceId) {
+    db.close();
+    throw new TheaterError('Workspace configuration and database identities disagree.', 'INVALID_STATE');
+  }
   return { root, config, db };
 }
 

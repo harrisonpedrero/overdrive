@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { assertAgentIdle, assertVerified, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
+import { ownsAgent, recoverAgentState } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -60,6 +62,10 @@ async function withContext(workspacePath, fn) {
   try { return await fn(ctx); } finally { closeContext(ctx); }
 }
 
+async function withCheckoutLock(root, slug, fn) {
+  return withWorkspaceLock(root, `control-${slug}`, () => withWorkspaceLock(root, 'features', fn));
+}
+
 function progressFor(db, featureId) {
   const counts = Object.fromEntries([...WORK_STATUSES].map(status => [status, 0]));
   for (const row of db.prepare('SELECT status, COUNT(*) AS count FROM work_items WHERE feature_id = ? GROUP BY status').all(featureId)) {
@@ -88,7 +94,7 @@ function latestCheckpoint(db, featureId) {
 
 function evidenceRows(db, featureId, limit = 50) {
   return db.prepare('SELECT * FROM evidence WHERE feature_id = ? ORDER BY created_at DESC LIMIT ?').all(featureId, limit)
-    .map(row => ({ ...row, passed: row.passed === null ? null : Boolean(row.passed) }));
+    .map(({ output, ...row }) => ({ ...row, passed: row.passed === null ? null : Boolean(row.passed), outputAvailable: Boolean(output) }));
 }
 
 function pendingRows(db, featureId) {
@@ -108,6 +114,8 @@ function markdownCell(value) {
 }
 
 async function ensureWorkspaceFiles(root, config) {
+  const coordinatorConfig = contained(root, '.codex', 'config.toml');
+  if (!await exists(coordinatorConfig)) await atomicWrite(root, coordinatorConfig, 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n');
   const ignoreFile = contained(root, '.gitignore');
   const required = [
     'features/',
@@ -147,6 +155,8 @@ Before each turn, read:
 Use the durable work graph in the context packet to choose the next useful work. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit Feature Theater state files directly. Do not put coordination artifacts into application commits.
 
 Your visible updates and final messages may be recorded as safe progress summaries. Never reveal private chain-of-thought. Record exact commands, revisions, and observed outcomes in your visible handoff. Remote pushes, pull requests, merges, destructive cleanup, and new external authority require explicit user authorization.
+
+The coordinator owns final Git staging and commits. Implement and verify the requested change, then report the exact modified paths and remaining work. If Git metadata writes are blocked by the workspace sandbox, preserve the diff and hand it back; do not seek broader permissions just to make a local commit.
 `;
 }
 
@@ -207,6 +217,8 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const checkpoint = latestCheckpoint(ctx.db, feature.id);
   const evidence = evidenceRows(ctx.db, feature.id, 10);
   const pending = pendingRows(ctx.db, feature.id);
+  const canonicalSpec = latestSpec(ctx.db, feature.id);
+  if (canonicalSpec) await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'spec.md'), `${canonicalSpec.content.trim()}\n`);
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
   catch (error) { snapshot = { unavailable: error.message }; }
@@ -214,7 +226,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
     ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}`).join('\n')
     : '- No work items yet.';
   const evidenceLines = evidence.length
-    ? evidence.map(item => `- ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
+    ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
   const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id}` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${checkpoint?.next_action || feature.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'context.md'), packet);
@@ -465,7 +477,7 @@ export async function listFeatures({ workspace_path, include_archived = false, r
     const focus = meta(ctx.db, 'focus') || null;
     const features = [];
     for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived) })) {
-      const result = summarizeFeature(ctx, feature);
+      const result = summarizeFeature(ctx, recoverAgentState(ctx, feature));
       result.focused = feature.slug === focus;
       if (refresh_git) {
         try { result.git = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
@@ -479,7 +491,7 @@ export async function listFeatures({ workspace_path, include_archived = false, r
 
 export async function getFeatureContext({ workspace_path, feature, timeline_limit = 20 }) {
   return await withContext(workspace_path, async ctx => {
-    const row = featureBySlug(ctx.db, safeSlug(feature));
+    const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     reconcileReady(ctx.db, row.id);
     const projection = await writeFeatureContext(ctx, row);
     const spec = latestSpec(ctx.db, row.id);
@@ -491,6 +503,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       checkpoint: projection.checkpoint,
       evidence: projection.evidence,
       candidates: candidateRows(ctx.db, row.id),
+      verification: verificationStatus(ctx, row, projection.snapshot.head),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
       timeline,
@@ -513,6 +526,7 @@ export async function updateSpec({ workspace_path, feature, content, rationale =
       const revision = row.spec_revision + 1;
       const stamp = now();
       transaction(ctx.db, () => {
+        invalidateCandidates(ctx.db, row.id);
         ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, ?, ?, ?, ?)')
           .run(newId('spec'), row.id, revision, cleanContent, cleanRationale, stamp);
         ctx.db.prepare('UPDATE features SET spec_revision = ?, updated_at = ?, next_action = ? WHERE id = ?')
@@ -596,6 +610,8 @@ export async function planWork({ workspace_path, feature, items }) {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      assertAgentIdle(row);
+      const previousContract = featureContract(ctx.db, row);
       const stamp = now();
       transaction(ctx.db, () => {
         const existing = workItems(ctx.db, row.id);
@@ -636,6 +652,7 @@ export async function planWork({ workspace_path, feature, items }) {
         }
         validateWorkGraph(ctx.db, row.id);
         reconcileReady(ctx.db, row.id);
+        if (previousContract !== featureContract(ctx.db, row)) invalidateCandidates(ctx.db, row.id);
         ctx.db.prepare('UPDATE features SET next_action = ?, updated_at = ? WHERE id = ?').run('Start or continue the highest-priority ready work.', stamp, row.id);
       });
       await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key) } });
@@ -685,7 +702,7 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       }
       let revision = optionalText(result_revision, 'result_revision', { max: 200 });
       if (revision) revision = await verifyCheckoutRevision(row.checkout_path, revision);
-      if (status === 'running' && item.status === 'running' && item.owner && item.owner !== cleanOwner && item.lease_expires_at && item.lease_expires_at > now()) {
+      if (item.status === 'running' && item.owner && item.owner !== cleanOwner && item.lease_expires_at && item.lease_expires_at > now()) {
         throw new TheaterError(`${itemKey} is leased to ${item.owner} until ${item.lease_expires_at}.`, 'WORK_LEASED');
       }
       const lease = status === 'running' ? new Date(Date.now() + lease_seconds * 1000).toISOString() : null;
@@ -768,7 +785,6 @@ export async function switchFeature({ workspace_path, feature }) {
       const stamp = now();
       transaction(ctx.db, () => {
         if (outgoing) ctx.db.prepare('UPDATE features SET compaction_pending = 1, updated_at = ? WHERE id = ?').run(stamp, outgoing.id);
-        if (['planned', 'paused'].includes(destination.status)) ctx.db.prepare("UPDATE features SET status = 'active', updated_at = ? WHERE id = ?").run(stamp, destination.id);
         meta(ctx.db, 'focus', slug);
       });
       await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoing?.slug ?? null, to: slug } });
@@ -797,25 +813,26 @@ export async function setFeatureStatus({ workspace_path, feature, status, blocke
   if (!FEATURE_STATUSES.has(status)) throw new TheaterError(`Unknown feature status: ${status}`, 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
-  return await withWorkspaceLock(root, 'features', async () => {
+  return await withCheckoutLock(root, slug, async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      if (row.status === status && ['done', 'archived'].includes(status)) return { feature: summarizeFeature(ctx, row), unchanged: true };
+      if (row.status === status && status === 'archived') return { feature: summarizeFeature(ctx, row), unchanged: true };
       const cleanBlocker = optionalText(blocker, 'blocker', { max: 20_000 }) || '';
       const cleanDisposition = optionalText(disposition, 'disposition', { max: 20_000 }) || '';
       if (status === 'blocked' && !cleanBlocker) throw new TheaterError('A blocked feature requires a blocker.', 'INVALID_INPUT');
       if (status === 'archived' && !cleanDisposition) throw new TheaterError('Archiving requires a disposition.', 'INVALID_INPUT');
       let completionCandidate = null;
       if (status === 'done') {
+        assertAgentIdle(row);
         const progress = progressFor(ctx.db, row.id);
         if (progress.open > 0) throw new TheaterError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
-        completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status = 'ready' ORDER BY created_at DESC LIMIT 1").get(row.id);
+        completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY rowid DESC LIMIT 1").get(row.id);
         if (!completionCandidate) throw new TheaterError('Feature completion requires a ready integration candidate.', 'COMPLETION_NOT_PROVEN');
         const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
         if (!snapshot.clean || snapshot.head !== completionCandidate.revision) throw new TheaterError('The ready candidate must still be the clean checkout HEAD.', 'STALE_CANDIDATE');
-        const evidenceCount = Number(ctx.db.prepare('SELECT COUNT(*) AS count FROM evidence WHERE feature_id = ? AND passed = 1 AND revision = ?').get(row.id, completionCandidate.revision).count);
-        if (!evidenceCount) throw new TheaterError('Feature completion requires passing evidence at the candidate revision.', 'COMPLETION_NOT_PROVEN');
+        assertVerified(ctx, row, completionCandidate.revision, completionCandidate);
+        if (row.status === status) return { feature: summarizeFeature(ctx, row), unchanged: true };
       }
       const stamp = now();
       transaction(ctx.db, () => {
@@ -867,16 +884,16 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
   const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
   const cleanChecks = cleanStringArray(checks, 'checks');
   if (!cleanChecks.length) throw new TheaterError('A candidate requires at least one executed check.', 'COMPLETION_NOT_PROVEN');
-  return await withWorkspaceLock(root, 'features', async () => {
+  return await withCheckoutLock(root, slug, async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      assertAgentIdle(row);
       const resolved = await verifyCheckoutRevision(row.checkout_path, revision);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       if (snapshot.head !== resolved) throw new TheaterError(`Candidate ${resolved.slice(0, 12)} is not the checkout HEAD ${snapshot.head.slice(0, 12)}.`, 'STALE_CANDIDATE');
-      if (!allow_dirty && !snapshot.clean) throw new TheaterError('Candidate checkout is dirty.', 'DIRTY_CANDIDATE');
-      const evidenceCount = Number(ctx.db.prepare('SELECT COUNT(*) AS count FROM evidence WHERE feature_id = ? AND passed = 1 AND revision = ?').get(row.id, resolved).count);
-      if (!evidenceCount) throw new TheaterError('A candidate requires passing evidence recorded at the same revision.', 'COMPLETION_NOT_PROVEN');
+      if (allow_dirty || !snapshot.clean) throw new TheaterError('Candidates require a clean committed checkout.', 'DIRTY_CANDIDATE');
+      const verification = assertVerified(ctx, row, resolved);
       const changes = await diffSummary(row.checkout_path, row.base_revision, resolved);
       const id = newId('candidate');
       const stamp = now();
@@ -884,6 +901,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
         ctx.db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status = 'ready'").run(row.id);
         ctx.db.prepare('INSERT INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, \'ready\', ?)')
           .run(id, row.id, resolved, row.base_revision, cleanSummary, JSON.stringify(cleanChecks), stamp);
+        ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
         ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, next_action = ?, updated_at = ? WHERE id = ?")
           .run(cleanSummary, 'Review or integrate the exact recorded candidate.', stamp, row.id);
       });
@@ -911,7 +929,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
   const slug = safeSlug(feature);
   const cleanSummary = optionalText(summary, 'summary', { max: 50_000 });
   // Promotion changes the revision used by lane creation, so both operations share one lock.
-  return await withWorkspaceLock(root, 'features', async () => {
+  return await withCheckoutLock(root, slug, async () => {
     const ctx = await loadWorkspace(root);
     try {
       const managed = ctx.config.managedProject;
@@ -922,12 +940,14 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
       if (path.resolve(managed.path) !== project) throw new TheaterError('Managed project path does not match this workspace.', 'INVALID_STATE');
       const row = featureBySlug(ctx.db, slug);
       if (row.status !== 'done') throw new TheaterError('Complete the feature evidence and candidate gates before promotion.', 'PROMOTION_NOT_READY');
+      assertAgentIdle(row);
       let resolved = optionalText(revision, 'revision', { max: 200 });
       if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
       const candidate = resolved
         ? ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND revision = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id, resolved)
         : ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id);
       if (!candidate) throw new TheaterError('No accepted candidate matches this promotion request.', 'PROMOTION_NOT_READY');
+      assertVerified(ctx, row, candidate.revision, candidate);
       const featureSnapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       if (!featureSnapshot.clean || featureSnapshot.head !== candidate.revision) {
         throw new TheaterError('The accepted candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
@@ -1006,9 +1026,10 @@ export async function readTimeline({ workspace_path, feature, limit = 30 }) {
 
 export async function featureRuntime({ workspace_path, feature, allow_inactive = false }) {
   return await withContext(workspace_path, async ctx => {
-    const row = featureBySlug(ctx.db, safeSlug(feature));
+    const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new TheaterError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
     const packet = await writeFeatureContext(ctx, row);
+    await writeFeatureAgentFile(ctx, row);
     return {
       root: ctx.root,
       feature: row,
@@ -1021,13 +1042,14 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
   });
 }
 
-export async function saveAgentSession({ workspace_path, feature, thread_id, turn_id = null, status, summary = undefined, compacted = false }) {
+export async function saveAgentSession({ workspace_path, feature, thread_id, turn_id = null, status, summary = undefined, compacted = false, owner_token, only_if_starting = false }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token) || (only_if_starting && row.agent_status !== 'starting')) return { ignored: true };
       const cleanSummary = summary ? requiredText(summary, 'summary', { max: 100_000 }) : undefined;
       const stamp = now();
       ctx.db.prepare(`UPDATE features SET thread_id = ?, active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
@@ -1040,26 +1062,28 @@ export async function saveAgentSession({ workspace_path, feature, thread_id, tur
   });
 }
 
-export async function recordAgentEvent({ workspace_path, feature, kind, summary, details = {} }) {
+export async function recordAgentEvent({ workspace_path, feature, kind, summary, details = {}, owner_token }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
       const cleanSummary = requiredText(summary, 'summary', { max: 100_000 });
       return await addEvent(ctx, { featureId: row.id, kind, summary: cleanSummary, details });
     } finally { ctx.db.close(); }
   });
 }
 
-export async function savePendingAgentRequest({ workspace_path, feature, request_id, thread_id, turn_id, method, summary, payload }) {
+export async function savePendingAgentRequest({ workspace_path, feature, request_id, thread_id, turn_id, method, summary, payload, owner_token }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
       const stamp = now();
       ctx.db.prepare(`INSERT OR REPLACE INTO pending_agent_requests(request_id, feature_id, thread_id, turn_id, method, summary, payload_json, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`)
         .run(String(request_id), row.id, thread_id, turn_id ?? null, method, summary, JSON.stringify(payload ?? {}), stamp);
@@ -1100,13 +1124,14 @@ export async function resolveAgentRequestRecord({ workspace_path, feature, reque
   });
 }
 
-export async function markCompacted({ workspace_path, feature }) {
+export async function markCompacted({ workspace_path, feature, owner_token }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
       ctx.db.prepare('UPDATE features SET compaction_pending = 0 WHERE id = ?').run(row.id);
       await addEvent(ctx, { featureId: row.id, kind: 'agent.compacted', summary: 'Compacted the feature agent at a saved checkpoint.', details: { threadId: row.thread_id } });
       const current = featureBySlug(ctx.db, slug);
@@ -1114,5 +1139,14 @@ export async function markCompacted({ workspace_path, feature }) {
       await writeIndex(ctx);
       return summarizeFeature(ctx, current);
     } finally { ctx.db.close(); }
+  });
+}
+
+export async function queueCompaction({ workspace_path, feature, owner_token }) {
+  return withContext(workspace_path, async ctx => {
+    const row = featureBySlug(ctx.db, safeSlug(feature));
+    if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
+    ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(row.id);
+    return { queued: true };
   });
 }

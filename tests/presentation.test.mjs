@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import vm from 'node:vm';
+import { initializeManagedProject, createFeature } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { composeView, snapshotState, renderState } from '../plugins/feature-theater/scripts/presentation.mjs';
+
+test('state compositions stay feature scoped, escape data, and send requests through the host', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-view-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await initializeManagedProject({ workspace_path: root, project_name: 'Views', description: 'Inspect states.' });
+  await createFeature({ workspace_path: root, feature: 'alpha', title: '</script><img src=x onerror=alert(1)>', outcome: 'Inspect alpha.', spec: '# Alpha\n\nALPHA_ONLY' });
+  await createFeature({ workspace_path: root, feature: 'beta', title: 'Beta', outcome: 'Inspect beta.', spec: '# Beta\n\nBETA_PRIVATE_CONTEXT' });
+  const overview = await snapshotState({ workspace_path: root });
+  assert.equal(overview.selected, null);
+  assert.doesNotMatch(JSON.stringify(overview), /ALPHA_ONLY|BETA_PRIVATE_CONTEXT/);
+  const scoped = await snapshotState({ workspace_path: root, feature: 'alpha', components: ['spec', 'handoff'] });
+  assert.match(JSON.stringify(scoped), /ALPHA_ONLY/);
+  assert.doesNotMatch(JSON.stringify(scoped), /BETA_PRIVATE_CONTEXT/);
+  const fragment = renderState(scoped);
+  assert.doesNotMatch(fragment, /<img src=x|fetch\(|WebSocket/);
+  assert.match(fragment, /&lt;img/);
+  const script = fragment.match(/<script>([\s\S]*?)<\/script>/)[1];
+  let listener;
+  const sent = [];
+  const feedback = { textContent: '' };
+  vm.runInNewContext(script, { document: { getElementById: () => ({ querySelector: () => feedback, contains: () => true, addEventListener: (_, callback) => { listener = callback; } }) }, window: { openai: { sendFollowUpMessage: async message => { sent.push(message); } } } });
+  const button = { dataset: { action: '0' }, hasAttribute: name => name === 'data-action' };
+  await listener({ target: { closest: () => button } });
+  assert.match(sent[0].prompt, /Re-read current canonical state/);
+  assert.match(sent[0].prompt, /Refresh the spec, handoff components for feature alpha/);
+  const rendered = await composeView({ workspace_path: root, components: ['features'] });
+  assert.equal(await fs.readFile(rendered.fragmentPath, 'utf8') !== '', true);
+  assert.match(rendered.contentReference, /visualize/);
+});

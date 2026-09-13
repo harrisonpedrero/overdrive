@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { git } from '../plugins/feature-theater/scripts/util.mjs';
+import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
 import {
   checkpointFeature,
   createFeature,
@@ -39,6 +40,12 @@ async function fixture(t) {
   await git(source, 'add', '.');
   await git(source, 'commit', '-m', 'base');
   return { parent, source, workspace };
+}
+
+async function verifyFile(workspace, feature, file, expected) {
+  await updateChecks({ workspace_path: workspace, feature, checks: [{ key: 'artifact', purpose: 'Inspect the actual committed artifact', argv: [process.execPath, '-e', `require('node:assert/strict').equal(require('node:fs').readFileSync(${JSON.stringify(file)}, 'utf8').replaceAll('\\r\\n', '\\n'), ${JSON.stringify(expected)})`] }] });
+  const result = await runChecks({ workspace_path: workspace, feature });
+  assert.equal(result.verification.ready, true);
 }
 
 test('initializes a repository and creates independent feature lanes', async t => {
@@ -93,6 +100,7 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     feature: 'foundation',
     title: 'Playable foundation',
     outcome: 'Create the first executable project slice.',
+    spec: '# Foundation\n\napp.txt contains the working foundation.\n',
   });
   const repo = foundation.feature.checkoutPath;
   await git(repo, 'config', 'user.name', 'Feature Theater Test');
@@ -110,6 +118,8 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     revision: candidateRevision,
     passed: true,
   });
+  await assert.rejects(recordCandidate({ workspace_path: workspace, feature: 'foundation', summary: 'Report alone', checks: ['claimed'] }), error => error.code === 'COMPLETION_NOT_PROVEN');
+  await verifyFile(workspace, 'foundation', 'app.txt', 'atlas foundation\n');
   await recordCandidate({
     workspace_path: workspace,
     feature: 'foundation',
@@ -123,6 +133,7 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     feature: 'alternate-foundation',
     title: 'Alternate foundation',
     outcome: 'Exercise divergent-candidate protection.',
+    spec: '# Alternate\n\nalternate.txt contains the alternate foundation.\n',
   });
   await git(stale.feature.checkoutPath, 'config', 'user.name', 'Feature Theater Test');
   await git(stale.feature.checkoutPath, 'config', 'user.email', 'feature-theater@example.invalid');
@@ -139,6 +150,7 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     revision: staleRevision,
     passed: true,
   });
+  await verifyFile(workspace, 'alternate-foundation', 'alternate.txt', 'alternate foundation\n');
   await recordCandidate({
     workspace_path: workspace,
     feature: 'alternate-foundation',
@@ -215,7 +227,7 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
   await git(repo, 'add', 'app.js');
   await git(repo, 'commit', '-m', 'Implement alpha');
   const head = (await git(repo, 'rev-parse', 'HEAD')).stdout;
-  await updateWork({ workspace_path: workspace, feature: 'alpha', key: 'build', status: 'done', summary: 'Changed the exported value.', result_revision: head });
+  await updateWork({ workspace_path: workspace, feature: 'alpha', key: 'build', status: 'done', owner: 'astra', summary: 'Changed the exported value.', result_revision: head });
   await assert.rejects(
     planWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'build', title: 'Rewrite completed work', kind: 'build' }] }),
     error => error.code === 'INVALID_TRANSITION',
@@ -230,7 +242,8 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
 
   await updateWork({ workspace_path: workspace, feature: 'alpha', key: 'validate', status: 'running', owner: 'astra' });
   await recordEvidence({ workspace_path: workspace, feature: 'alpha', work_item: 'validate', kind: 'test', summary: 'Fixture assertion passed.', command: 'node --test', revision: head, passed: true });
-  await updateWork({ workspace_path: workspace, feature: 'alpha', key: 'validate', status: 'done', summary: 'Test passed.', result_revision: head });
+  await updateWork({ workspace_path: workspace, feature: 'alpha', key: 'validate', status: 'done', owner: 'astra', summary: 'Test passed.', result_revision: head });
+  await verifyFile(workspace, 'alpha', 'app.js', 'export const value = 2;\n');
   const candidate = await recordCandidate({ workspace_path: workspace, feature: 'alpha', summary: 'Alpha is ready.', checks: ['node --test: passed'] });
   assert.equal(candidate.revision, head);
   const done = await setFeatureStatus({ workspace_path: workspace, feature: 'alpha', status: 'done' });

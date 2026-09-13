@@ -1,28 +1,30 @@
 {
   "name": "feature-theater",
-  "version": "0.1.0+codex.20260913070523",
-  "description": "Native Codex feature lanes with isolated clones, durable specs, live agent steering, and evidence-backed progress.",
+  "version": "0.1.0+codex.20260913192735",
+  "description": "Native Astra feature lanes with isolated clones, durable specs, live steering, executed verification, and composable conversation state.",
   "author": {
     "name": "Harrison Pedrero"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Feature Theater",
-    "shortDescription": "Run isolated feature clones and agents from Codex.",
-    "longDescription": "Adopt a repository or begin a managed project from scratch, then develop it through durable, isolated feature lanes. GPT-6 Astra can refine specs, coordinate work, inspect safe progress, steer active Codex agents, checkpoint context, switch lanes without dragging every feature into one conversation, and fast-forward accepted scratch-project candidates into the next verified base. Feature Theater combines Diffmogger's work-graph discipline with Agent Diff Theater's live steering and safe event stream, entirely inside the Codex harness.",
+    "shortDescription": "Coordinate feature clones and compose state inside Codex.",
+    "longDescription": "Adopt a repository or begin a managed project from scratch, then develop it through isolated feature lanes. GPT-6 Astra refines specs, coordinates work, steers live agents, checkpoints context, and composes feature, work, evidence, activity, handoff, and spec views directly in the conversation. Required checks execute against exact commits and the current feature contract; reports alone cannot authorize completion. Feature Theater combines Diffmogger's durable work graph and evidence boundaries with Agent Diff Theater's live steering, entirely inside the Codex harness.",
     "developerName": "Harrison Pedrero",
     "category": "Productivity",
     "capabilities": [
       "Feature isolation",
       "Spec iteration",
       "Agent orchestration",
-      "Progress and steering"
+      "Progress and steering",
+      "Composable state",
+      "Executed verification"
     ],
     "defaultPrompt": [
       "Set up Feature Theater for this repository.",
       "Start a managed project from a product brief.",
       "Create a feature lane and refine its spec.",
-      "Show every active feature and what is next."
+      "Compose a view of active features and what is next."
     ],
     "brandColor": "#7C3AED"
   },

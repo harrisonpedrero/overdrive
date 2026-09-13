@@ -21,6 +21,14 @@ Switching lanes automatically compacts the outgoing feature task when it is idle
 
 If Codex restarted during an approval prompt, the old callback cannot safely be answered. Inspect the feature, resume or steer it, and let it issue a fresh request.
 
+An ended controller is detected by its persisted process owner; inspection clears stale activity and preserves the checkout. A running lane owned by another live coordinator cannot be started again from a competing session. Pausing requests interruption; switching focus alone preserves lifecycle state. The existing desktop coordinator still needs the explicit `/compact` command at substantial context boundaries.
+
+## Verification and state views
+
+Configure the relevant repository/feature commands, then have the runtime execute them against the idle, clean candidate commit. Every current required check needs a latest passing execution receipt for the current spec/work/check contract. A report, old spec, earlier pass followed by a failure, or a command that changes the checkout cannot authorize delivery. Individual receipt output is available on demand. Existing version-2 workspaces migrate automatically: historical evidence survives, but old manually authorized candidates need fresh verification.
+
+State components are embedded in the conversation. Ask for an overview, work dependencies, candidate evidence, recent activity, a checkpoint handoff, or the selected spec. Astra chooses an appropriate composition and can create a custom one from the same versioned snapshot. The timestamp identifies when state was observed; refresh and steering actions return through the coordinator and re-read current state. Only selected detail is loaded, and no separate server or dashboard is required.
+
 ## Failure handling
 
 Initialization and clone failures preserve partial directories for diagnosis. Feature Theater will not automatically delete, stash, reset, or overwrite a dirty checkout. A failed work item remains visible; add repair work with explicit acceptance criteria. A feature blocked on user input does not freeze independent lanes.

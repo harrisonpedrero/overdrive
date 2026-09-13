@@ -71,14 +71,14 @@ process.stdin.on('data', chunk => {
   }
 });
 
-process.stdin.on('end', () => {
-  shutdownAgentRuntime();
+process.stdin.on('end', async () => {
+  await shutdownAgentRuntime();
   process.exit(0);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    shutdownAgentRuntime();
+  process.once(signal, async () => {
+    await shutdownAgentRuntime();
     process.exit(0);
   });
 }

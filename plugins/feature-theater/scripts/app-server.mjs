@@ -107,10 +107,10 @@ export class CodexAppServer extends EventEmitter {
     this.stderrTail = '';
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => this.#receive(chunk));
+    child.stdout.on('data', chunk => { if (this.child === child) this.#receive(chunk); });
     child.stderr.on('data', chunk => { this.stderrTail = (this.stderrTail + chunk).slice(-16_000); });
-    child.once('error', error => this.#failed(new TheaterError(`Unable to launch Codex app-server: ${error.message}`, 'CODEX_LAUNCH_FAILED')));
-    child.once('exit', code => this.#failed(new TheaterError(`Codex app-server exited (${code}). ${this.stderrTail.trim()}`.trim(), 'CODEX_EXITED')));
+    child.once('error', error => { if (this.child === child) this.#failed(new TheaterError(`Unable to launch Codex app-server: ${error.message}`, 'CODEX_LAUNCH_FAILED')); });
+    child.once('exit', code => { if (this.child === child) this.#failed(new TheaterError(`Codex app-server exited (${code}). ${this.stderrTail.trim()}`.trim(), 'CODEX_EXITED')); });
     await new Promise((resolve, reject) => {
       child.once('spawn', resolve);
       child.once('error', reject);
@@ -130,6 +130,7 @@ export class CodexAppServer extends EventEmitter {
       reject(error);
     }
     this.pending.clear();
+    this.serverRequests.clear();
     this.emit('exit', error);
   }
 
@@ -267,8 +268,10 @@ export class CodexAppServer extends EventEmitter {
   }
 
   shutdown() {
-    if (this.child && !this.child.killed) this.child.kill();
-    this.child = null;
+    const child = this.child;
+    if (!child) return;
+    this.#failed(new TheaterError('Codex app-server connection closed.', 'CODEX_CLOSED'));
+    if (!child.killed) child.kill();
   }
 }
 

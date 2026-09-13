@@ -24,7 +24,10 @@ import {
   resolveFeatureAgentRequest,
   startFeatureAgent,
   steerFeatureAgent,
+  waitFeatureAgent,
 } from './agent-runtime.mjs';
+import { readEvidence, runChecks, updateChecks } from './verification.mjs';
+import { COMPONENTS, composeView, snapshotState } from './presentation.mjs';
 
 const string = (description, extra = {}) => ({ type: 'string', description, ...extra });
 const boolean = description => ({ type: 'boolean', description });
@@ -46,8 +49,33 @@ function tool(name, title, description, inputSchema, annotations = {}) {
 
 const workspace = { workspace_path: string('Absolute path to the Feature Theater control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
+const view = {
+  ...workspace, ...feature,
+  components: { type: 'array', minItems: 1, maxItems: 6, uniqueItems: true, items: string('Composable state component.', { enum: Object.keys(COMPONENTS) }), description: 'Choose components in display order. Defaults to features. Other components use the named or focused feature.' },
+  include_archived: boolean('Include archived feature lanes in the overview.'),
+};
 
 export const TOOLS = [
+  tool('theater_view_catalog', 'State component patterns', 'Discover composable conversation components and their data scope. Use the smallest composition that answers the user.', object({}), { readOnlyHint: true, idempotentHint: true }),
+  tool('theater_state', 'Observe scoped feature state', 'Read a versioned, bounded snapshot for native conversation composition. Only load the selected components; a feature overview never loads other specifications or raw logs.', object(view, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('theater_view', 'Compose state in conversation', 'Compose selected state components into an inline Codex conversation fragment. Returns its content reference and immutable snapshot. Buttons send follow-up requests through the meta agent; they never directly mutate runtime state.', object(view, ['workspace_path']), { destructiveHint: false }),
+  tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Changes invalidate earlier candidates; commands execute only through theater_checks_run.', object({
+    ...workspace, ...feature,
+    checks: { type: 'array', maxItems: 50, items: object({
+      key: string('Stable check key.'), purpose: string('Behavior this command verifies.'),
+      argv: { type: 'array', minItems: 1, items: string('Executable followed by its arguments; no implicit shell.') },
+      kind: string('Evidence kind, such as test, typecheck, browser, integration.'),
+      required: boolean('Whether a failure prevents completion; defaults to true.'),
+      timeout_seconds: integer('Command deadline; defaults to 300 seconds.', 1, 1800),
+    }, ['key', 'purpose', 'argv']) },
+  }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),
+
+  tool('theater_checks_run', 'Execute feature checks', 'Run the configured commands against a clean committed idle feature. Record actual exits, bounded output, and the current spec/contract. Dirty output and failures cannot authorize a candidate.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
+
+  tool('theater_evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks, context, or state views.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
+
+  tool('theater_agent_wait', 'Wait for a feature result', 'Wait up to 60 seconds for a feature completion or input request and return compact progress. Use after dispatch when the coordinator is continuing the work; no repeated model polling is needed.', object({ ...workspace, ...feature, timeout_seconds: integer('Bounded wait; defaults to 30 seconds.', 1, 60) }, ['workspace_path', 'feature']), { readOnlyHint: true, openWorldHint: true }),
+
   tool('theater_initialize', 'Initialize Feature Theater', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
@@ -159,7 +187,7 @@ export const TOOLS = [
     revision: string('Candidate commit; defaults to HEAD.'),
     summary: string('What the candidate changes and why it is ready.'),
     checks: { type: 'array', minItems: 1, maxItems: 100, items: string('Executed check and outcome.') },
-    allow_dirty: boolean('Permit a dirty checkout while recording; false by default and discouraged.'),
+    allow_dirty: boolean('Deprecated: true is refused because evidence must describe a clean commit.'),
   }, ['workspace_path', 'feature', 'summary', 'checks']), { destructiveHint: false }),
 
   tool('theater_candidate_promote', 'Promote managed-project candidate', 'Fast-forward a Feature Theater-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
@@ -211,6 +239,13 @@ export const TOOLS = [
 ];
 
 const handlers = {
+  theater_view_catalog: () => ({ schemaVersion: 1, components: COMPONENTS, patterns: { overview: ['features'], feature: ['work', 'handoff'], delivery: ['evidence', 'handoff'], refinement: ['spec', 'work'], progress: ['activity', 'handoff'] } }),
+  theater_state: snapshotState,
+  theater_view: composeView,
+  theater_checks_update: updateChecks,
+  theater_checks_run: runChecks,
+  theater_evidence_get: readEvidence,
+  theater_agent_wait: waitFeatureAgent,
   theater_initialize: initializeWorkspace,
   theater_project_create: initializeManagedProject,
   theater_doctor: doctorWorkspace,
@@ -221,7 +256,13 @@ const handlers = {
   theater_work_plan: planWork,
   theater_work_update: updateWork,
   theater_checkpoint: checkpointFeature,
-  theater_feature_status: setFeatureStatus,
+  async theater_feature_status(args) {
+    const result = await setFeatureStatus(args);
+    if (['paused', 'archived'].includes(args.status) && result.feature.agent.activeTurnId) {
+      result.interruption = await interruptFeatureAgent(args);
+    }
+    return result;
+  },
   theater_evidence_record: recordEvidence,
   theater_candidate_record: recordCandidate,
   theater_candidate_promote: promoteManagedCandidate,

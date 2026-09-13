@@ -70,7 +70,7 @@ test('MCP server advertises the native Feature Theater command surface', async t
   assert.equal(initialized.result.serverInfo.name, 'feature-theater');
   const listed = await request(2, 'tools/list');
   const names = listed.result.tools.map(tool => tool.name);
-  for (const expected of ['theater_initialize', 'theater_project_create', 'theater_feature_create', 'theater_spec_update', 'theater_feature_switch', 'theater_agent_start', 'theater_agent_steer', 'theater_candidate_promote']) assert.ok(names.includes(expected));
+  for (const expected of ['theater_initialize', 'theater_project_create', 'theater_feature_create', 'theater_spec_update', 'theater_feature_switch', 'theater_agent_start', 'theater_agent_steer', 'theater_candidate_promote', 'theater_checks_update', 'theater_checks_run', 'theater_state', 'theater_view', 'theater_agent_wait']) assert.ok(names.includes(expected));
   assert.equal(new Set(names).size, names.length);
   server.stdin.end();
 });
