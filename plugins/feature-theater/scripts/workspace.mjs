@@ -1110,7 +1110,7 @@ export async function pendingAgentRequest({ workspace_path, feature, request_id 
   });
 }
 
-export async function resolveAgentRequestRecord({ workspace_path, feature, request_id, summary, status = 'resolved' }) {
+export async function resolveAgentRequestRecord({ workspace_path, feature, request_id, summary, status = 'resolved', owner_token, thread_id, ignore_missing = false }) {
   if (!['resolved', 'orphaned'].includes(status)) throw new TheaterError('Request resolution status is invalid.', 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
@@ -1118,9 +1118,14 @@ export async function resolveAgentRequestRecord({ workspace_path, feature, reque
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      const result = ctx.db.prepare("UPDATE pending_agent_requests SET status = ?, resolved_at = ? WHERE feature_id = ? AND request_id = ? AND status = 'pending'").run(status, now(), row.id, String(request_id));
+      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
+      const result = ctx.db.prepare("UPDATE pending_agent_requests SET status = ?, resolved_at = ? WHERE feature_id = ? AND request_id = ? AND status = 'pending' AND (? IS NULL OR thread_id = ?)").run(status, now(), row.id, String(request_id), thread_id ?? null, thread_id ?? null);
+      if (!result.changes && ignore_missing) return { ignored: true };
       if (!result.changes) throw new TheaterError(`No pending request ${request_id} for ${slug}.`, 'REQUEST_NOT_FOUND');
-      ctx.db.prepare("UPDATE features SET agent_status = CASE WHEN active_turn_id IS NULL THEN 'idle' ELSE 'running' END, updated_at = ? WHERE id = ?").run(now(), row.id);
+      ctx.db.prepare(`UPDATE features SET agent_status = CASE
+        WHEN active_turn_id IS NULL AND agent_status <> 'waiting_for_user' THEN agent_status
+        WHEN EXISTS (SELECT 1 FROM pending_agent_requests WHERE feature_id = features.id AND status = 'pending') THEN 'waiting_for_user'
+        WHEN active_turn_id IS NULL THEN 'idle' ELSE 'running' END, updated_at = ? WHERE id = ?`).run(now(), row.id);
       await addEvent(ctx, { featureId: row.id, kind: status === 'resolved' ? 'agent.input_resolved' : 'agent.input_orphaned', summary: requiredText(summary, 'summary', { max: 20_000 }), details: { requestId: String(request_id) } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);

@@ -127,6 +127,10 @@ async function onNotification({ method, params }) {
   const registration = registrations.get(params.threadId);
   if (!registration) return;
   const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
+  if (method === 'serverRequest/resolved') {
+    await resolveAgentRequestRecord({ ...base, thread_id: params.threadId, request_id: params.requestId, ignore_missing: true, summary: 'Codex app-server resolved the pending request.' });
+    return;
+  }
   if (method === 'item/agentMessage/delta') {
     const key = params.turnId;
     turnMessages.set(key, redactString(clip((turnMessages.get(key) || '') + (params.delta || ''))));
@@ -462,7 +466,7 @@ async function resolveRequestOwned({ workspace_path, feature, request_id, action
     result = parseJsonObject(response, 'response') || {};
   }
   bridge.respondToServer(request_id, result);
-  await resolveAgentRequestRecord({ workspace_path, feature, request_id, summary: `Resolved ${request.method} with ${action}.` });
+  await resolveAgentRequestRecord({ workspace_path, feature, request_id, owner_token: ownerToken, thread_id: request.thread_id, ignore_missing: true, summary: `Resolved ${request.method} with ${action}.` });
   return { resolved: true, requestId: String(request_id), action, feature };
 }
 

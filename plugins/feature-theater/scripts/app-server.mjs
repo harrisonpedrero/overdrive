@@ -161,6 +161,10 @@ export class CodexAppServer extends EventEmitter {
         this.emit('serverRequest', { id: message.id, method: message.method, params: message.params ?? {} });
         continue;
       }
+      if (message.method === 'serverRequest/resolved') {
+        const key = String(message.params?.requestId);
+        if (this.serverRequests.get(key)?.params.threadId === message.params?.threadId) this.serverRequests.delete(key);
+      }
       if (message.method) this.emit('notification', { method: message.method, params: message.params ?? {} });
     }
   }
