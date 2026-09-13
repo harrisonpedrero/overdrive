@@ -36,6 +36,9 @@ function enqueueStateWork(work) {
 }
 
 function register(threadId, workspacePath, feature) {
+  for (const [registeredThreadId, registration] of registrations) {
+    if (registration.workspacePath === workspacePath && registration.feature === feature) registrations.delete(registeredThreadId);
+  }
   registrations.set(threadId, { workspacePath, feature });
 }
 
