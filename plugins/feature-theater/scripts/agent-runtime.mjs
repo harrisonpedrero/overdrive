@@ -210,7 +210,7 @@ bridge.on('exit', error => {
   for (const [threadId, registration] of registrations) {
     const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
     const runtime = await featureRuntime({ ...base, allow_inactive: true }).catch(() => null);
-    const interrupted = Boolean(runtime?.feature.active_turn_id);
+    const interrupted = Boolean(runtime?.feature.active_turn_id || runtime?.feature.agent_status === 'waiting_for_user');
     await saveAgentSession({ ...base, thread_id: threadId, turn_id: null, status: interrupted ? 'disconnected' : 'idle', ...(interrupted ? { summary: `Codex app-server disconnected: ${redactString(error.message)}` } : {}) }).catch(() => {});
   }
   registrations.clear();
@@ -437,7 +437,7 @@ async function interruptOwned({ workspace_path, feature }) {
   return { interrupted: true, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id };
 }
 
-async function resolveFeatureAgentRequest({ workspace_path, feature, request_id, action, response, scope = 'turn' }) {
+async function resolveRequestOwned({ workspace_path, feature, request_id, action, response, scope = 'turn' }) {
   if (!['accept', 'accept_session', 'decline', 'cancel', 'respond'].includes(action)) throw new TheaterError('Unknown request action.', 'INVALID_INPUT');
   if (!['turn', 'session'].includes(scope)) throw new TheaterError('scope must be turn or session.', 'INVALID_INPUT');
   const request = await pendingAgentRequest({ workspace_path, feature, request_id });
@@ -480,6 +480,7 @@ const startFeatureAgent = args => withAgentControl(args, ownerToken, () => start
 const steerFeatureAgent = args => withAgentControl(args, ownerToken, () => steerOwned(args));
 const compactFeatureAgent = args => withAgentControl(args, ownerToken, () => compactOwned(args));
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
+const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));
 return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime };
 }
 

@@ -1052,8 +1052,13 @@ export async function saveAgentSession({ workspace_path, feature, thread_id, tur
       if (!ownsAgent(ctx.db, row.id, owner_token) || (only_if_starting && row.agent_status !== 'starting')) return { ignored: true };
       const cleanSummary = summary ? requiredText(summary, 'summary', { max: 100_000 }) : undefined;
       const stamp = now();
-      ctx.db.prepare(`UPDATE features SET thread_id = ?, active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
-        .run(thread_id, turn_id, status, cleanSummary ?? null, compacted ? 1 : 0, stamp, row.id);
+      transaction(ctx.db, () => {
+        ctx.db.prepare(`UPDATE features SET thread_id = ?, active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
+          .run(thread_id, turn_id, status, cleanSummary ?? null, compacted ? 1 : 0, stamp, row.id);
+        if (status === 'disconnected') {
+          ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND thread_id = ? AND status = 'pending'").run(stamp, row.id, thread_id);
+        }
+      });
       if (cleanSummary) await addEvent(ctx, { featureId: row.id, kind: `agent.${status}`, summary: cleanSummary, details: { threadId: thread_id, turnId: turn_id } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
