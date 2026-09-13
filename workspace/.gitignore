@@ -1,0 +1,6 @@
+features/
+.theater/cache/
+.theater/locks/
+.theater/state.sqlite3*
+.theater/events.ndjson
+theater.json

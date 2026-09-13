@@ -1,0 +1,20 @@
+{
+  "name": "feature-theater-local",
+  "interface": {
+    "displayName": "Feature Theater Development"
+  },
+  "plugins": [
+    {
+      "name": "feature-theater",
+      "source": {
+        "source": "local",
+        "path": "./plugins/feature-theater"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

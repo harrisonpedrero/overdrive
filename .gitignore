@@ -1,0 +1,15 @@
+# Product development artifacts
+.scratch-*/
+node_modules/
+
+# Ready-workspace runtime state
+workspace/features/
+workspace/.theater/cache/
+workspace/.theater/locks/
+workspace/.theater/state.sqlite3*
+workspace/.theater/events.ndjson
+workspace/theater.json
+
+# Local test artifacts
+.tmp/
+*.log
