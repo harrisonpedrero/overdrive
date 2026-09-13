@@ -107,7 +107,7 @@ function markdownCell(value) {
   return String(value ?? '').replaceAll('|', '\\|').replace(/\s+/g, ' ').trim();
 }
 
-async function ensureWorkspaceFiles(root) {
+async function ensureWorkspaceFiles(root, config) {
   const ignoreFile = contained(root, '.gitignore');
   const required = [
     'features/',
@@ -116,6 +116,7 @@ async function ensureWorkspaceFiles(root) {
     '.theater/state.sqlite3*',
     '.theater/events.ndjson',
     'theater.json',
+    ...(config?.managedProject ? ['project/'] : []),
   ];
   let ignore = '';
   try { ignore = await fs.readFile(ignoreFile, 'utf8'); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
@@ -183,7 +184,20 @@ export async function writeIndex(ctx) {
     const progress = progressFor(ctx.db, feature.id);
     return `| ${feature.slug === focus ? '→' : ''} | ${markdownCell(feature.slug)} | ${markdownCell(feature.status)} | ${progress.done}/${progress.total || 0} | ${markdownCell(feature.agent_status)} | ${markdownCell(feature.next_action || '—')} |`;
   });
-  const body = `# Feature Theater index\n\nFocused feature: ${focus || 'none'}\nUpdated: ${now()}\n\n| Focus | Feature | State | Work done | Agent | Next action |\n| --- | --- | --- | ---: | --- | --- |\n${rows.length ? rows.join('\n') : '| | _No features yet_ | | | | |'}\n\nThis is a compact navigation projection. Load one feature's context packet instead of every spec.\n`;
+  const managedLine = ctx.config.managedProject
+    ? `Managed project: ${ctx.config.managedProject.name} · ${ctx.config.defaultBranch} @ ${ctx.config.defaultRevision.slice(0, 12)}\n`
+    : '';
+  const body = `# Feature Theater index
+
+Focused feature: ${focus || 'none'}
+${managedLine}Updated: ${now()}
+
+| Focus | Feature | State | Work done | Agent | Next action |
+| --- | --- | --- | ---: | --- | --- |
+${rows.length ? rows.join('\n') : '| | _No features yet_ | | | | |'}
+
+This is a compact navigation projection. Load one feature's context packet instead of every spec.
+`;
   await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'index.md'), body);
 }
 
@@ -207,54 +221,114 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   return { feature, work, checkpoint, evidence, pending, snapshot };
 }
 
+async function existingInitialization(root, normalized) {
+  return await withContext(root, async ctx => {
+    if (ctx.config.repository !== normalized.source) {
+      throw new TheaterError(`This workspace already tracks ${ctx.config.repository}; refusing to replace it with ${normalized.source}. Use a fresh workspace directory for a different repository.`, 'REPOSITORY_MISMATCH');
+    }
+    return { initialized: false, alreadyInitialized: true, workspace: overview(ctx) };
+  });
+}
+
+async function initializeSource(root, normalized, additions = {}) {
+  const existingConfig = contained(root, 'theater.json');
+  if (await exists(existingConfig)) return await existingInitialization(root, normalized);
+  await fs.mkdir(contained(root, '.theater', 'features'), { recursive: true });
+  const mirror = await initializeMirror(root, normalized.source);
+  const profile = await profileRepository(root, mirror.defaultRevision);
+  const config = {
+    formatVersion: 1,
+    workspaceId: randomUUID(),
+    repository: normalized.source,
+    repositoryKind: additions.managedProject ? 'managed' : normalized.kind,
+    defaultRevision: mirror.defaultRevision,
+    defaultBranch: mirror.defaultBranch,
+    model: 'gpt-6-astra',
+    createdAt: now(),
+    repositoryProfile: profile,
+    ...additions,
+  };
+  const db = initializeDatabase(root, config);
+  const ctx = { root, config, db };
+  try {
+    await addEvent(ctx, {
+      kind: additions.managedProject ? 'workspace.project_created' : 'workspace.initialized',
+      summary: `${additions.managedProject ? 'Created managed project' : 'Initialized Feature Theater'} at ${mirror.defaultRevision.slice(0, 12)}.`,
+      details: { defaultBranch: mirror.defaultBranch, ecosystems: profile.ecosystems },
+    });
+    await writeJson(root, existingConfig, config);
+    await ensureWorkspaceFiles(root, config);
+    await writeIndex(ctx);
+    return {
+      initialized: true,
+      workspace: overview(ctx),
+      repositoryProfile: profile,
+      ...(additions.managedProject ? { managedProject: overview(ctx).managedProject } : {}),
+      next: additions.managedProject
+        ? 'Create a foundation feature lane, refine its specification, and start its agent.'
+        : 'Create a feature lane, then refine and save its specification before starting its agent.',
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function partialInitializationError() {
+  return new TheaterError('A partial .theater directory already exists. Inspect it before retrying initialization.', 'PARTIAL_INITIALIZATION');
+}
+
 export async function initializeWorkspace({ workspace_path, repository }) {
   const root = await resolveWorkspace(workspace_path);
+  const normalized = await normalizeRepositorySource(repository);
+  const existingConfig = contained(root, 'theater.json');
+  if (await exists(existingConfig)) return await existingInitialization(root, normalized);
+  if (await exists(contained(root, '.theater'))) throw partialInitializationError();
+  return await withWorkspaceLock(root, 'initialize', () => initializeSource(root, normalized));
+}
+
+export async function initializeManagedProject({ workspace_path, project_name, description, default_branch = 'main' }) {
+  const root = await resolveWorkspace(workspace_path);
+  const name = requiredText(project_name, 'project_name', { max: 200 });
+  if (/\r|\n/.test(name)) throw new TheaterError('project_name must be one line.', 'INVALID_INPUT');
+  const brief = requiredText(description, 'description', { max: 50_000 });
+  const branch = requiredText(default_branch, 'default_branch', { max: 200 });
+  const project = await ensureManagedPath(root, contained(root, 'project'));
   const existingConfig = contained(root, 'theater.json');
   if (await exists(existingConfig)) {
-    const normalized = await normalizeRepositorySource(repository);
     return await withContext(root, async ctx => {
-      if (ctx.config.repository !== normalized.source) {
-        throw new TheaterError(`This workspace already tracks ${ctx.config.repository}; refusing to replace it with ${normalized.source}. Use a fresh workspace directory for a different repository.`, 'REPOSITORY_MISMATCH');
+      if (!ctx.config.managedProject
+        || ctx.config.managedProject.name !== name
+        || ctx.config.managedProject.description !== brief
+        || ctx.config.managedProject.defaultBranch !== branch) {
+        throw new TheaterError('This workspace is already initialized for a different repository or managed project.', 'ALREADY_INITIALIZED');
       }
-      return { initialized: false, alreadyInitialized: true, workspace: overview(ctx) };
+      const workspace = overview(ctx);
+      return { initialized: false, alreadyInitialized: true, workspace, managedProject: workspace.managedProject };
     });
   }
-  const theaterRoot = contained(root, '.theater');
-  if (await exists(theaterRoot)) {
-    throw new TheaterError('A partial .theater directory already exists. Inspect it before retrying initialization.', 'PARTIAL_INITIALIZATION');
-  }
-  const normalized = await normalizeRepositorySource(repository);
+  if (await exists(contained(root, '.theater'))) throw partialInitializationError();
+  if (await exists(project)) throw new TheaterError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
+  await run(['git', 'check-ref-format', '--branch', branch], { cwd: root });
   return await withWorkspaceLock(root, 'initialize', async () => {
-    await fs.mkdir(contained(root, '.theater', 'features'), { recursive: true });
-    const mirror = await initializeMirror(root, normalized.source);
-    const profile = await profileRepository(root, mirror.defaultRevision);
-    const config = {
-      formatVersion: 1,
-      workspaceId: randomUUID(),
-      repository: normalized.source,
-      repositoryKind: normalized.kind,
-      defaultRevision: mirror.defaultRevision,
-      defaultBranch: mirror.defaultBranch,
-      model: 'gpt-6-astra',
-      createdAt: now(),
-      repositoryProfile: profile,
-    };
-    const db = initializeDatabase(root, config);
-    const ctx = { root, config, db };
-    try {
-      await addEvent(ctx, { kind: 'workspace.initialized', summary: `Initialized Feature Theater at ${mirror.defaultRevision.slice(0, 12)}.`, details: { defaultBranch: mirror.defaultBranch, ecosystems: profile.ecosystems } });
-      await writeJson(root, existingConfig, config);
-      await ensureWorkspaceFiles(root);
-      await writeIndex(ctx);
-      return {
-        initialized: true,
-        workspace: overview(ctx),
-        repositoryProfile: profile,
-        next: 'Create a feature lane, then refine and save its specification before starting its agent.',
-      };
-    } finally {
-      db.close();
-    }
+    if (await exists(project)) throw new TheaterError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
+    await fs.mkdir(project);
+    await atomicWrite(root, contained(project, 'README.md'), `# ${name}\n\n${brief}\n`);
+    await atomicWrite(root, contained(project, 'AGENTS.md'), `# Project instructions\n\nThis is the canonical source repository for ${name}. Implement only the currently selected Feature Theater specification, preserve unrelated work, and report exact checks and revisions. Do not add orchestration state to application commits.\n`);
+    await run(['git', 'init', '-b', branch], { cwd: project });
+    await run(['git', 'add', '--', 'README.md', 'AGENTS.md'], { cwd: project });
+    await run([
+      'git',
+      '-c', `core.hooksPath=${contained(root, '.theater', 'disabled-hooks')}`,
+      '-c', 'commit.gpgSign=false',
+      '-c', 'user.name=Feature Theater',
+      '-c', 'user.email=feature-theater@local.invalid',
+      'commit', '-m', `Initialize ${name}`,
+    ], { cwd: project });
+    const normalized = await normalizeRepositorySource(project);
+    const result = await initializeSource(root, normalized, {
+      managedProject: { name, description: brief, path: project, defaultBranch: branch },
+    });
+    return result;
   });
 }
 
@@ -266,6 +340,13 @@ export function overview(ctx) {
     defaultBranch: ctx.config.defaultBranch,
     defaultRevision: ctx.config.defaultRevision,
     model: ctx.config.model,
+    managedProject: ctx.config.managedProject
+      ? {
+          name: ctx.config.managedProject.name,
+          path: ctx.config.managedProject.path,
+          defaultBranch: ctx.config.managedProject.defaultBranch,
+        }
+      : null,
     focus: meta(ctx.db, 'focus') || null,
     featureCount: Number(ctx.db.prepare('SELECT COUNT(*) AS count FROM features').get().count),
   };
@@ -285,6 +366,16 @@ export async function doctorWorkspace({ workspace_path }) {
       checks.push({ name: 'State database', ok: integrity === 'ok', detail: integrity });
       const mirror = await inspectMirror(root);
       checks.push({ name: 'Repository cache', ok: Boolean(mirror.defaultRevision), detail: `${mirror.defaultBranch || 'detached'} @ ${mirror.defaultRevision.slice(0, 12)}` });
+      if (ctx.config.managedProject) {
+        const project = await ensureManagedPath(root, contained(root, 'project'));
+        const snapshot = await repositorySnapshot(project);
+        const healthy = snapshot.clean && snapshot.branch === ctx.config.managedProject.defaultBranch;
+        checks.push({
+          name: 'Managed project',
+          ok: healthy,
+          detail: `${snapshot.branch || 'detached'} @ ${snapshot.head.slice(0, 12)} · ${snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`}`,
+        });
+      }
       checks.push({ name: 'Feature paths', ok: true, detail: `${listFeatureRows(ctx.db, { includeArchived: true }).length} registered lane(s)` });
     } finally { ctx.db.close(); }
   } catch (error) {
@@ -304,14 +395,18 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
     try {
       if (ctx.db.prepare('SELECT 1 FROM features WHERE slug = ?').get(slug)) throw new TheaterError(`Feature already exists: ${slug}`, 'FEATURE_EXISTS');
       const refreshed = await refreshMirror(root);
+      const profile = await profileRepository(root, refreshed.defaultRevision);
       ctx.config.defaultRevision = refreshed.defaultRevision;
       ctx.config.defaultBranch = refreshed.defaultBranch;
+      ctx.config.repositoryProfile = profile;
       const base = await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
       const clone = await createFeatureCheckout(root, ctx.config, slug, base);
       const created = now();
       const id = newId('feature');
       const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
       transaction(ctx.db, () => {
+        meta(ctx.db, 'default_revision', refreshed.defaultRevision);
+        meta(ctx.db, 'default_branch', refreshed.defaultBranch);
         ctx.db.prepare(`
           INSERT INTO features(id, slug, title, outcome, status, priority, base_revision, branch, checkout_path, spec_revision, summary, next_action, created_at, updated_at)
           VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -332,7 +427,7 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       await writeJson(root, contained(root, 'theater.json'), ctx.config);
       return {
         feature: summarizeFeature(ctx, row),
-        repositoryProfile: ctx.config.repositoryProfile,
+        repositoryProfile: profile,
         contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
         specPath: contained(root, '.theater', 'features', slug, 'spec.md'),
         next: initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call theater_spec_update.',
@@ -797,6 +892,101 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
       return { candidateId: id, revision: resolved, baseRevision: row.base_revision, checks: cleanChecks, changes, feature: summarizeFeature(ctx, current) };
+    } finally { ctx.db.close(); }
+  });
+}
+
+async function isGitAncestor(repository, ancestor, descendant) {
+  try {
+    await run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], { cwd: repository });
+    return true;
+  } catch (error) {
+    if (error?.code === 'COMMAND_FAILED') return false;
+    throw error;
+  }
+}
+
+export async function promoteManagedCandidate({ workspace_path, feature, revision, summary }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  const cleanSummary = optionalText(summary, 'summary', { max: 50_000 });
+  // Promotion changes the revision used by lane creation, so both operations share one lock.
+  return await withWorkspaceLock(root, 'features', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const managed = ctx.config.managedProject;
+      if (!managed) {
+        throw new TheaterError('Candidate promotion is built in only for projects created by Feature Theater. Use the repository\'s normal review and integration flow for an adopted repository.', 'NOT_MANAGED_PROJECT');
+      }
+      const project = await ensureManagedPath(root, contained(root, 'project'));
+      if (path.resolve(managed.path) !== project) throw new TheaterError('Managed project path does not match this workspace.', 'INVALID_STATE');
+      const row = featureBySlug(ctx.db, slug);
+      if (row.status !== 'done') throw new TheaterError('Complete the feature evidence and candidate gates before promotion.', 'PROMOTION_NOT_READY');
+      let resolved = optionalText(revision, 'revision', { max: 200 });
+      if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
+      const candidate = resolved
+        ? ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND revision = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id, resolved)
+        : ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id);
+      if (!candidate) throw new TheaterError('No accepted candidate matches this promotion request.', 'PROMOTION_NOT_READY');
+      const featureSnapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
+      if (!featureSnapshot.clean || featureSnapshot.head !== candidate.revision) {
+        throw new TheaterError('The accepted candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
+      }
+      const projectSnapshot = await repositorySnapshot(project);
+      if (!projectSnapshot.clean) throw new TheaterError('The managed project has uncommitted changes; preserve or resolve them before promotion.', 'DIRTY_MANAGED_PROJECT');
+      if (projectSnapshot.branch !== managed.defaultBranch) {
+        throw new TheaterError(`Managed project must be on ${managed.defaultBranch}, not ${projectSnapshot.branch || 'a detached HEAD'}.`, 'WRONG_MANAGED_BRANCH');
+      }
+      const candidateRef = `refs/feature-theater/candidates/${slug}/${candidate.revision}`;
+      await run(['git', 'fetch', '--no-tags', row.checkout_path, `${candidate.revision}:${candidateRef}`], { cwd: project });
+      const fetched = await verifyCheckoutRevision(project, candidateRef);
+      if (fetched !== candidate.revision) throw new TheaterError('Fetched candidate revision does not match the accepted candidate.', 'STALE_CANDIDATE');
+      const alreadyIncluded = await isGitAncestor(project, candidate.revision, projectSnapshot.head);
+      if (!alreadyIncluded) {
+        const canFastForward = await isGitAncestor(project, projectSnapshot.head, candidate.revision);
+        if (!canFastForward) {
+          throw new TheaterError('The managed project and candidate have diverged. Rebase or repair the feature lane; Feature Theater will not synthesize or resolve a merge silently.', 'PROMOTION_NOT_FAST_FORWARD');
+        }
+        await run(['git', '-c', `core.hooksPath=${contained(root, '.theater', 'disabled-hooks')}`, 'merge', '--ff-only', candidateRef], { cwd: project });
+      }
+      const promotedSnapshot = await repositorySnapshot(project);
+      if (!promotedSnapshot.clean || !await isGitAncestor(project, candidate.revision, promotedSnapshot.head)) {
+        throw new TheaterError('Managed project verification failed after promotion.', 'PROMOTION_FAILED');
+      }
+      const refreshed = await refreshMirror(root);
+      const profile = await profileRepository(root, refreshed.defaultRevision);
+      ctx.config.defaultRevision = refreshed.defaultRevision;
+      ctx.config.defaultBranch = refreshed.defaultBranch;
+      ctx.config.repositoryProfile = profile;
+      const stamp = now();
+      transaction(ctx.db, () => {
+        meta(ctx.db, 'default_revision', refreshed.defaultRevision);
+        meta(ctx.db, 'default_branch', refreshed.defaultBranch);
+        if (!alreadyIncluded) {
+          ctx.db.prepare('UPDATE features SET summary = ?, next_action = ?, updated_at = ? WHERE id = ?')
+            .run(cleanSummary || candidate.summary, 'Create the next feature lane from the promoted managed-project revision.', stamp, row.id);
+        }
+      });
+      await writeJson(root, contained(root, 'theater.json'), ctx.config);
+      if (!alreadyIncluded) {
+        await addEvent(ctx, {
+          featureId: row.id,
+          kind: 'candidate.promoted',
+          summary: cleanSummary || `Promoted ${candidate.revision.slice(0, 12)} to ${managed.defaultBranch}.`,
+          details: { revision: candidate.revision, project, branch: managed.defaultBranch },
+        });
+      }
+      await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
+      await writeIndex(ctx);
+      return {
+        promoted: !alreadyIncluded,
+        alreadyIncluded,
+        feature: slug,
+        candidateRevision: candidate.revision,
+        managedProject: { path: project, branch: managed.defaultBranch, head: promotedSnapshot.head },
+        repositoryProfile: profile,
+        next: 'New feature lanes now start from the refreshed managed-project revision.',
+      };
     } finally { ctx.db.close(); }
   });
 }

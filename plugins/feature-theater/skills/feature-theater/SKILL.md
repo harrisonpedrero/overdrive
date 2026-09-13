@@ -1,6 +1,6 @@
 ---
 name: feature-theater
-description: Coordinate multiple isolated feature clones inside Codex with GPT-6 Astra. Use when the user wants to initialize a repository workspace, create or switch feature lanes, iteratively develop feature specs, list or inspect feature progress, start/steer/interrupt feature agents, checkpoint context, record evidence, or prepare a tested candidate. Also use when the user says Feature Theater, Agent Diff Theater, Diffmogger, feature clone, or asks to avoid cross-feature context pollution. Do not use for an ordinary single-repository edit that does not need feature-lane orchestration.
+description: Coordinate multiple isolated feature clones inside Codex with GPT-6 Astra. Use when the user wants to adopt a repository or start a managed project from scratch, create or switch feature lanes, iteratively develop feature specs, list or inspect feature progress, start/steer/interrupt feature agents, checkpoint context, record evidence, prepare or promote a tested candidate, or avoid cross-feature context pollution. Also use when the user says Feature Theater, Agent Diff Theater, Diffmogger, or feature clone. Do not use for an ordinary single-repository edit that does not need feature-lane orchestration.
 ---
 
 # Feature Theater
@@ -11,7 +11,9 @@ Never expose or request private chain-of-thought. Safe progress consists of expl
 
 ## Establish the workspace
 
-Use the current control-workspace absolute path for every tool call. If `theater.json` is absent and the user supplied a repository URL/path, call `theater_initialize`. Initialization clones a private mirror and profiles the repository but deliberately does not execute setup scripts. If the repository is missing, ask only for that URL/path.
+Use the current control-workspace absolute path for every tool call. If `theater.json` is absent and the user supplied a repository URL/path, call `theater_initialize`. Initialization clones a private mirror and profiles the repository but deliberately does not execute setup scripts.
+
+If the user wants a new project rather than an existing repository, infer a concise project name and product brief from their request and call `theater_project_create`. It creates `project/` as the managed canonical Git repository with a minimal initial commit, then initializes the same lane workflow. Ask only for the missing product outcome when the request does not establish one; do not force the user to invent a repository first. If neither an existing source nor scratch-project intent is clear, ask whether to use a repository URL/path or start from a brief.
 
 Run `theater_doctor` after initialization or when Git, Codex, state, or the repository cache appears unhealthy. Do not work around a partial `.theater` directory by deleting it; inspect and preserve recoverable state.
 
@@ -62,11 +64,14 @@ Use `theater_candidate_record` only for the exact checkout HEAD after relevant c
 
 Mark a feature done only after its non-cancelled work is closed, a ready candidate still matches the clean checkout HEAD, and passing evidence exists at that exact revision. Archive only with a disposition that states what shipped and what remains.
 
+For a project created by `theater_project_create`, an explicit user request to accept or promote completed work may call `theater_candidate_promote`. Promotion is deliberately fast-forward-only: it updates the local managed `project/` repository and refreshes the source mirror, so the next lane starts from the accepted revision. If histories diverged or the canonical project is dirty, stop and resolve that state visibly; never synthesize a merge or discard work. Adopted repositories continue through their normal PR/integration flow.
+
 ## Natural command vocabulary
 
 Users do not need to memorize tools. Interpret requests such as these directly:
 
 - “Use Feature Theater with `<repo-url>`.”
+- “Start a new project called Atlas that helps teams triage incidents.”
 - “Clone a feature for team search and help me spec it.”
 - “List everything active and what is blocked.”
 - “Switch to billing recovery.”
@@ -74,5 +79,6 @@ Users do not need to memorize tools. Interpret requests such as these directly:
 - “Tell it to preserve the public API and skip the cache migration.”
 - “Checkpoint this, compact, and go back to onboarding.”
 - “Record the tested HEAD as the candidate.”
+- “Accept this candidate into the managed project and start the next feature from it.”
 
 Lead with the useful result in user-facing replies: current lane, material progress/change, blocker or decision, and next action. Keep tool mechanics secondary.

@@ -8,9 +8,11 @@ import {
   checkpointFeature,
   createFeature,
   getFeatureContext,
+  initializeManagedProject,
   initializeWorkspace,
   listFeatures,
   planWork,
+  promoteManagedCandidate,
   recordCandidate,
   recordEvidence,
   resolveAgentRequestRecord,
@@ -68,6 +70,113 @@ test('initializes a repository and creates independent feature lanes', async t =
   const listed = await listFeatures({ workspace_path: workspace, refresh_git: true });
   assert.equal(listed.workspace.focus, 'search-redesign');
   assert.equal(listed.features[0].git.clean, true);
+});
+
+test('starts from scratch and promotes an accepted candidate into the next lane base', async t => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-scratch-'));
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  const workspace = path.join(parent, 'workspace');
+  await fs.mkdir(workspace);
+  const initialized = await initializeManagedProject({
+    workspace_path: workspace,
+    project_name: 'Atlas',
+    description: 'Help teams triage incidents.',
+  });
+  assert.equal(initialized.initialized, true);
+  assert.equal(initialized.workspace.managedProject.name, 'Atlas');
+  const project = path.join(workspace, 'project');
+  assert.equal((await git(project, 'branch', '--show-current')).stdout, 'main');
+  assert.match(await fs.readFile(path.join(project, 'README.md'), 'utf8'), /triage incidents/);
+
+  const foundation = await createFeature({
+    workspace_path: workspace,
+    feature: 'foundation',
+    title: 'Playable foundation',
+    outcome: 'Create the first executable project slice.',
+  });
+  const repo = foundation.feature.checkoutPath;
+  await git(repo, 'config', 'user.name', 'Feature Theater Test');
+  await git(repo, 'config', 'user.email', 'feature-theater@example.invalid');
+  await fs.writeFile(path.join(repo, 'app.txt'), 'atlas foundation\n');
+  await git(repo, 'add', 'app.txt');
+  await git(repo, 'commit', '-m', 'Build foundation');
+  const candidateRevision = (await git(repo, 'rev-parse', 'HEAD')).stdout;
+  await recordEvidence({
+    workspace_path: workspace,
+    feature: 'foundation',
+    kind: 'test',
+    summary: 'Foundation fixture passed.',
+    command: 'fixture assertion',
+    revision: candidateRevision,
+    passed: true,
+  });
+  await recordCandidate({
+    workspace_path: workspace,
+    feature: 'foundation',
+    summary: 'Foundation is ready.',
+    checks: ['fixture assertion: passed'],
+  });
+  await setFeatureStatus({ workspace_path: workspace, feature: 'foundation', status: 'done' });
+
+  const stale = await createFeature({
+    workspace_path: workspace,
+    feature: 'alternate-foundation',
+    title: 'Alternate foundation',
+    outcome: 'Exercise divergent-candidate protection.',
+  });
+  await git(stale.feature.checkoutPath, 'config', 'user.name', 'Feature Theater Test');
+  await git(stale.feature.checkoutPath, 'config', 'user.email', 'feature-theater@example.invalid');
+  await fs.writeFile(path.join(stale.feature.checkoutPath, 'alternate.txt'), 'alternate foundation\n');
+  await git(stale.feature.checkoutPath, 'add', 'alternate.txt');
+  await git(stale.feature.checkoutPath, 'commit', '-m', 'Build alternate foundation');
+  const staleRevision = (await git(stale.feature.checkoutPath, 'rev-parse', 'HEAD')).stdout;
+  await recordEvidence({
+    workspace_path: workspace,
+    feature: 'alternate-foundation',
+    kind: 'test',
+    summary: 'Alternate fixture passed.',
+    command: 'fixture assertion',
+    revision: staleRevision,
+    passed: true,
+  });
+  await recordCandidate({
+    workspace_path: workspace,
+    feature: 'alternate-foundation',
+    summary: 'Alternate foundation is ready.',
+    checks: ['fixture assertion: passed'],
+  });
+  await setFeatureStatus({ workspace_path: workspace, feature: 'alternate-foundation', status: 'done' });
+
+  const initialProjectHead = (await git(project, 'rev-parse', 'HEAD')).stdout;
+  const localNote = path.join(project, 'local-note.txt');
+  await fs.writeFile(localNote, 'preserve me\n');
+  await assert.rejects(
+    promoteManagedCandidate({ workspace_path: workspace, feature: 'foundation' }),
+    error => error.code === 'DIRTY_MANAGED_PROJECT',
+  );
+  assert.equal((await git(project, 'rev-parse', 'HEAD')).stdout, initialProjectHead);
+  await fs.rm(localNote);
+
+  const promoted = await promoteManagedCandidate({ workspace_path: workspace, feature: 'foundation' });
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.managedProject.head, candidateRevision);
+  assert.equal((await git(project, 'rev-parse', 'HEAD')).stdout, candidateRevision);
+  assert.equal((await fs.readFile(path.join(project, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n'), 'atlas foundation\n');
+  assert.equal((await promoteManagedCandidate({ workspace_path: workspace, feature: 'foundation' })).alreadyIncluded, true);
+  await assert.rejects(
+    promoteManagedCandidate({ workspace_path: workspace, feature: 'alternate-foundation' }),
+    error => error.code === 'PROMOTION_NOT_FAST_FORWARD',
+  );
+  assert.equal((await git(project, 'rev-parse', 'HEAD')).stdout, candidateRevision);
+
+  const next = await createFeature({
+    workspace_path: workspace,
+    feature: 'second-slice',
+    title: 'Second slice',
+    outcome: 'Build on the accepted foundation.',
+  });
+  assert.equal(next.feature.baseRevision, candidateRevision);
+  assert.equal((await fs.readFile(path.join(next.feature.checkoutPath, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n'), 'atlas foundation\n');
 });
 
 test('versions specs, enforces the work DAG and records an exact candidate', async t => {
@@ -129,6 +238,10 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
   const completedContext = await getFeatureContext({ workspace_path: workspace, feature: 'alpha' });
   assert.equal(completedContext.candidates[0].status, 'accepted');
   assert.equal((await setFeatureStatus({ workspace_path: workspace, feature: 'alpha', status: 'done' })).unchanged, true);
+  await assert.rejects(
+    promoteManagedCandidate({ workspace_path: workspace, feature: 'alpha' }),
+    error => error.code === 'NOT_MANAGED_PROJECT',
+  );
 });
 
 async function planBELoop(workspace) {

@@ -14,6 +14,17 @@ export const mirrorPath = root => contained(root, '.theater', 'cache', 'reposito
 export const featureRoot = (root, slug) => contained(root, 'features', safeSlug(slug));
 export const checkoutPath = (root, slug) => contained(featureRoot(root, slug), 'repo');
 
+async function assertFullRepository(repository) {
+  for (const [target, label] of [[repository, 'repository'], [path.join(repository, '.git'), '.git directory']]) {
+    let stat;
+    try { stat = await fs.lstat(target); }
+    catch { throw new TheaterError(`Repository ${label} is missing: ${target}`, 'INVALID_CHECKOUT'); }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new TheaterError(`Repository ${label} must be a real directory: ${target}`, 'UNSAFE_CHECKOUT');
+    }
+  }
+}
+
 export async function initializeMirror(root, repository) {
   const mirror = await ensureManagedPath(root, mirrorPath(root));
   if (await exists(mirror)) throw new TheaterError('Repository cache already exists.', 'ALREADY_INITIALIZED');
@@ -139,6 +150,7 @@ export async function createFeatureCheckout(root, config, slug, baseRevision) {
 }
 
 export async function repositorySnapshot(repository, baseRevision = undefined) {
+  await assertFullRepository(repository);
   const head = (await git(repository, 'rev-parse', 'HEAD')).stdout;
   let branch = '';
   try { branch = (await git(repository, 'branch', '--show-current')).stdout; } catch { branch = ''; }
@@ -169,6 +181,7 @@ export async function repositorySnapshot(repository, baseRevision = undefined) {
 }
 
 export async function verifyCheckoutRevision(repository, revision) {
+  await assertFullRepository(repository);
   if (!revision || revision.startsWith('-') || revision.includes('\0')) throw new TheaterError('Candidate revision is invalid.', 'INVALID_REVISION');
   let resolved;
   try { resolved = (await git(repository, 'rev-parse', '--verify', `${revision}^{commit}`)).stdout; }
@@ -177,6 +190,7 @@ export async function verifyCheckoutRevision(repository, revision) {
 }
 
 export async function diffSummary(repository, fromRevision, toRevision = 'HEAD') {
+  await assertFullRepository(repository);
   const output = (await git(repository, 'diff', '--stat', '--summary', `${fromRevision}..${toRevision}`)).stdout;
   const names = (await git(repository, 'diff', '--name-status', `${fromRevision}..${toRevision}`)).stdout;
   return {

@@ -17,6 +17,8 @@ This replaces Diffmogger's Temporal control plane with Astra's adaptive coordina
 
 `theater.json` identifies the repository and exact default revision. `.theater/state.sqlite3` is canonical orchestration state. `.theater/index.md` is a compact cross-feature projection. `.theater/features/<slug>/spec.md` and `context.md` are feature-scoped recovery inputs. `.theater/events.ndjson` mirrors safe events for inspection and recovery. `features/<slug>/repo` is a full independent clone; it does not borrow objects from the hidden mirror.
 
+For a scratch project, `project/` is the managed canonical Git repository. Feature Theater seeds it with only a README, repository instructions, and an initial commit. A completed candidate may advance it only when the candidate contains its current HEAD, so promotion is an inspectable fast-forward rather than an automatic conflict resolution. The private mirror is refreshed afterward and new lanes start at the promoted revision.
+
 Specs and context projections are plain files so a fresh agent can recover without serializing a chat transcript. SQLite keeps uniqueness, graph, lifecycle, and evidence invariants inspectable.
 
 Planning cannot declare execution complete: work status changes go through lifecycle transitions, dependency readiness, and ownership leases. A candidate requires passing evidence at its exact revision, and completion additionally requires that candidate to remain the clean checkout HEAD.
@@ -43,4 +45,5 @@ Approval and user-input requests are persisted in sanitized form and surfaced to
 - Full clone creation, lifecycle writes, and agent-state writes use cross-process workspace locks plus SQLite transactions.
 - Setup commands are suggested from repository facts but never auto-executed during initialization.
 - Lane tasks use Codex's `:workspace` permission profile over the feature checkout and its context packet. Apps, hooks, plugins, browser/computer control, image generation, and configured external MCP servers are disabled in their app-server process; broader filesystem or network access still requires a surfaced approval.
-- Remote pushes, PRs, merges, and destructive cleanup are outside the runtime.
+- Remote pushes, PRs, conflict-producing merges, and destructive cleanup are outside the runtime.
+- The only built-in integration mutation is an explicitly requested, fast-forward-only promotion into a Feature Theater-created local `project/`; adopted repositories retain their normal review and integration path.

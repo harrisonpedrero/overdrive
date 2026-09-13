@@ -14,6 +14,9 @@
         "theater_initialize": {
           "approval_mode": "prompt"
         },
+        "theater_candidate_promote": {
+          "approval_mode": "prompt"
+        },
         "theater_agent_request_resolve": {
           "approval_mode": "prompt"
         }

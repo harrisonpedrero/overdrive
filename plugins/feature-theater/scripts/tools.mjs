@@ -3,9 +3,11 @@ import {
   createFeature,
   doctorWorkspace,
   getFeatureContext,
+  initializeManagedProject,
   initializeWorkspace,
   listFeatures,
   planWork,
+  promoteManagedCandidate,
   readTimeline,
   recordCandidate,
   recordEvidence,
@@ -50,6 +52,13 @@ export const TOOLS = [
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
   }, ['workspace_path', 'repository']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
+
+  tool('theater_project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize Feature Theater against it.', object({
+    ...workspace,
+    project_name: string('Human-readable project name.'),
+    description: string('Concrete product brief for the new project.'),
+    default_branch: string('Initial branch name; defaults to main.'),
+  }, ['workspace_path', 'project_name', 'description']), { destructiveHint: false, idempotentHint: true }),
 
   tool('theater_doctor', 'Check Feature Theater', 'Check the local Git, Node, Codex, state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
@@ -153,6 +162,13 @@ export const TOOLS = [
     allow_dirty: boolean('Permit a dirty checkout while recording; false by default and discouraged.'),
   }, ['workspace_path', 'feature', 'summary', 'checks']), { destructiveHint: false }),
 
+  tool('theater_candidate_promote', 'Promote managed-project candidate', 'Fast-forward a Feature Theater-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
+    ...workspace,
+    ...feature,
+    revision: string('Accepted candidate revision; defaults to the latest accepted candidate.'),
+    summary: string('Optional concise promotion disposition.'),
+  }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
+
   tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific GPT-6 Astra Codex task with only that feature context and the repository instructions.', object({
     ...workspace,
     ...feature,
@@ -196,6 +212,7 @@ export const TOOLS = [
 
 const handlers = {
   theater_initialize: initializeWorkspace,
+  theater_project_create: initializeManagedProject,
   theater_doctor: doctorWorkspace,
   theater_feature_create: createFeature,
   theater_feature_list: listFeatures,
@@ -207,6 +224,7 @@ const handlers = {
   theater_feature_status: setFeatureStatus,
   theater_evidence_record: recordEvidence,
   theater_candidate_record: recordCandidate,
+  theater_candidate_promote: promoteManagedCandidate,
   theater_agent_start: startFeatureAgent,
   theater_agent_inspect: inspectFeatureAgent,
   theater_agent_steer: steerFeatureAgent,

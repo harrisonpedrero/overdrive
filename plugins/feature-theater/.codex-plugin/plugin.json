@@ -1,6 +1,6 @@
 {
   "name": "feature-theater",
-  "version": "0.1.0+codex.20260913064844",
+  "version": "0.1.0+codex.20260913070523",
   "description": "Native Codex feature lanes with isolated clones, durable specs, live agent steering, and evidence-backed progress.",
   "author": {
     "name": "Harrison Pedrero"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Feature Theater",
     "shortDescription": "Run isolated feature clones and agents from Codex.",
-    "longDescription": "Turn a repository into durable, isolated feature lanes. GPT-6 Astra can refine specs, coordinate work, inspect safe progress, steer active Codex agents, checkpoint context, and switch lanes without dragging every feature into one conversation. Feature Theater combines Diffmogger's work-graph discipline with Agent Diff Theater's live steering and safe event stream, entirely inside the Codex harness.",
+    "longDescription": "Adopt a repository or begin a managed project from scratch, then develop it through durable, isolated feature lanes. GPT-6 Astra can refine specs, coordinate work, inspect safe progress, steer active Codex agents, checkpoint context, switch lanes without dragging every feature into one conversation, and fast-forward accepted scratch-project candidates into the next verified base. Feature Theater combines Diffmogger's work-graph discipline with Agent Diff Theater's live steering and safe event stream, entirely inside the Codex harness.",
     "developerName": "Harrison Pedrero",
     "category": "Productivity",
     "capabilities": [
@@ -20,6 +20,7 @@
     ],
     "defaultPrompt": [
       "Set up Feature Theater for this repository.",
+      "Start a managed project from a product brief.",
       "Create a feature lane and refine its spec.",
       "Show every active feature and what is next."
     ],

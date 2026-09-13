@@ -4,11 +4,9 @@ node_modules/
 
 # Ready-workspace runtime state
 workspace/features/
-workspace/.theater/cache/
-workspace/.theater/locks/
-workspace/.theater/state.sqlite3*
-workspace/.theater/events.ndjson
+workspace/.theater/
 workspace/theater.json
+workspace/project/
 
 # Local test artifacts
 .tmp/
