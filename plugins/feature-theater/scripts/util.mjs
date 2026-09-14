@@ -101,7 +101,14 @@ export async function atomicWrite(root, file, content) {
   await ensureManagedPath(root, temp);
   try {
     await fs.writeFile(temp, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    await fs.rename(temp, file);
+    for (let attempt = 0; ; attempt++) {
+      try { await fs.rename(temp, file); break; }
+      catch (error) {
+        // Windows can briefly deny replacement while another writer holds the destination.
+        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt === 5) throw error;
+        await sleep(10 * 2 ** attempt);
+      }
+    }
   } finally {
     await fs.rm(temp, { force: true });
   }
