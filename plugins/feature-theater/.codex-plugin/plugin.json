@@ -1,6 +1,6 @@
 {
   "name": "feature-theater",
-  "version": "0.1.0+codex.20260914041431",
+  "version": "0.1.0+codex.20260914233704",
   "description": "Native Astra feature lanes with isolated clones, durable specs, live steering, executed verification, and an inline work graph.",
   "author": {
     "name": "Harrison Pedrero"
