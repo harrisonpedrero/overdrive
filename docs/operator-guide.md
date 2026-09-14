@@ -57,4 +57,14 @@ Start with cheap environment readiness and focused behavior checks before broad 
 
 ## Updating the development install
 
+If an existing task still advertises an old schema, a necessary selective retry can use a fresh installed MCP controller without restarting that task:
+
+```powershell
+node C:\path\to\feature-theater\tools\run-installed-checks.mjs `
+  C:\path\to\codex-home\plugins\cache\feature-theater-local\feature-theater\0.1.0+codex.20260914041431 `
+  C:\path\to\control-workspace <feature> <exact-check-key> [additional-check-key]
+```
+
+Replace the angle/bracket placeholders with actual arguments. The client requires a nonempty selection, initializes the installed server, checks its advertised schema, and calls normal `theater_checks_run`. It refuses older schemas before execution. Normal clone locks, idle/clean checks, interruption reservations, receipt persistence and the full acceptance contract still apply. It keeps stdin open until the tool finishes under the configured check deadlines; do not pipe a one-shot request directly into `server.mjs`. No game command is executed merely by installing this helper. The installed path above pins the verified package; use a newly verified installed path after a future update.
+
 Validate the plugin, update its Codex cachebuster, and reinstall it from the `feature-theater-local` marketplace. Test changed tools in a fresh Codex task so the task receives the new manifest, skill, and MCP process.
