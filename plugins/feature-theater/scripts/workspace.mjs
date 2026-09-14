@@ -398,23 +398,33 @@ export async function doctorWorkspace({ workspace_path }) {
   return { root, ok: checks.every(check => check.ok), checks };
 }
 
-export async function createFeature({ workspace_path, feature, title, outcome, base_revision, priority = 0, spec }) {
+export async function createFeature({ workspace_path, feature, title, outcome, base_revision, base_feature, priority = 0, spec }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   const cleanTitle = requiredText(title || slug.replaceAll('-', ' '), 'title', { max: 200 });
   const cleanOutcome = requiredText(outcome, 'outcome', { max: 10_000 });
+  const baseSlug = base_feature === undefined ? null : safeSlug(base_feature, 'base feature');
+  if (baseSlug && (typeof base_revision !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(base_revision))) {
+    throw new TheaterError('base_feature requires an explicitly selected full commit ID in base_revision.', 'INVALID_REVISION');
+  }
   if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new TheaterError('priority must be an integer from -100 to 100.', 'INVALID_INPUT');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
       if (ctx.db.prepare('SELECT 1 FROM features WHERE slug = ?').get(slug)) throw new TheaterError(`Feature already exists: ${slug}`, 'FEATURE_EXISTS');
+      const baseSource = baseSlug ? featureBySlug(ctx.db, baseSlug) : null;
+      const baseRepository = baseSource ? await ensureManagedPath(root, baseSource.checkout_path) : mirrorPath(root);
+      const selectedBase = baseSource ? await verifyCheckoutRevision(baseRepository, base_revision) : null;
+      if (selectedBase && selectedBase.toLowerCase() !== base_revision.toLowerCase()) {
+        throw new TheaterError('base_revision must identify the exact source commit, not a hexadecimal ref name.', 'INVALID_REVISION');
+      }
       const refreshed = await refreshMirror(root);
       const profile = await profileRepository(root, refreshed.defaultRevision);
       ctx.config.defaultRevision = refreshed.defaultRevision;
       ctx.config.defaultBranch = refreshed.defaultBranch;
       ctx.config.repositoryProfile = profile;
-      const base = await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
-      const clone = await createFeatureCheckout(root, ctx.config, slug, base);
+      const base = selectedBase || await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
+      const clone = await createFeatureCheckout(root, ctx.config, slug, base, baseRepository);
       const created = now();
       const id = newId('feature');
       const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
@@ -435,12 +445,13 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const specBody = initialSpec || `# ${cleanTitle}\n\n## Outcome\n\n${cleanOutcome}\n\n## User-visible behavior\n\n## Constraints and compatibility\n\n## Acceptance criteria\n\n## Out of scope\n\n## Open decisions\n`;
       await atomicWrite(root, contained(root, '.theater', 'features', slug, 'spec.md'), `${specBody.trim()}\n`);
       await writeFeatureAgentFile(ctx, row);
-      await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination } });
+      await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination, baseFeature: baseSlug, baseRevision: base } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
       await writeJson(root, contained(root, 'theater.json'), ctx.config);
       return {
         feature: summarizeFeature(ctx, row),
+        baseFeature: baseSlug,
         repositoryProfile: profile,
         contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
         specPath: contained(root, '.theater', 'features', slug, 'spec.md'),

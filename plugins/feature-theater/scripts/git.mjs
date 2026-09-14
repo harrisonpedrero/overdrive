@@ -133,22 +133,29 @@ export async function profileRepository(root, revision) {
   return profile;
 }
 
-export async function createFeatureCheckout(root, config, slug, baseRevision) {
+export async function createFeatureCheckout(root, config, slug, baseRevision, baseRepository = mirrorPath(root)) {
   const destinationRoot = await ensureManagedPath(root, featureRoot(root, slug));
   const destination = await ensureManagedPath(root, checkoutPath(root, slug));
   if (await exists(destinationRoot)) throw new TheaterError(`Feature directory is occupied: ${destinationRoot}`, 'FEATURE_PATH_OCCUPIED');
   await fs.mkdir(destinationRoot, { recursive: true });
-  // --no-local makes every feature self-contained instead of depending on the cache's object store.
-  await run(['git', 'clone', '--no-local', '--no-checkout', '--', mirrorPath(root), destination], { cwd: root });
-  // An explicit base can remain in the cache after its private ref is pruned, so clone may omit it.
-  await git(destination, 'fetch', '--no-tags', '--no-write-fetch-head', mirrorPath(root), baseRevision);
-  const branch = `feature/${slug}`;
-  await git(destination, 'check-ref-format', '--branch', branch);
-  await git(destination, 'checkout', '-b', branch, baseRevision);
-  await git(destination, 'remote', 'set-url', 'origin', config.repository);
-  await git(destination, 'config', 'fetch.prune', 'true');
-  await fs.appendFile(path.join(destination, '.git', 'info', 'exclude'), '\n/.theater/\n', 'utf8');
-  return { destination, branch };
+  try {
+    // --no-local makes every feature self-contained instead of depending on the cache's object store.
+    await run(['git', 'clone', '--no-local', '--no-checkout', '--', mirrorPath(root), destination], { cwd: root });
+    // The selected commit may exist only in a sibling clone or outside the cache's advertised refs.
+    await git(destination, 'fetch', '--no-tags', '--no-write-fetch-head', baseRepository, baseRevision);
+    const branch = `feature/${slug}`;
+    await git(destination, 'check-ref-format', '--branch', branch);
+    await git(destination, 'checkout', '-b', branch, baseRevision);
+    await git(destination, 'remote', 'set-url', 'origin', config.repository);
+    await git(destination, 'config', 'fetch.prune', 'true');
+    await fs.appendFile(path.join(destination, '.git', 'info', 'exclude'), '\n/.theater/\n', 'utf8');
+    return { destination, branch };
+  } catch (error) {
+    throw new TheaterError(error.message, error.code || 'CHECKOUT_FAILED', {
+      checkoutPath: destination, featurePath: destinationRoot, baseRevision,
+      recovery: 'Checkout creation stopped before feature registration. Preserve and inspect this partial directory before an authorized recovery; an occupied path is never overwritten automatically.',
+    });
+  }
 }
 
 export async function repositorySnapshot(repository, baseRevision = undefined) {

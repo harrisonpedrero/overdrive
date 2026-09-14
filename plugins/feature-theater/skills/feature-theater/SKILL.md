@@ -34,7 +34,7 @@ At each handoff, advance the nearest useful result: integrate a coherent reviewe
 For a new idea:
 
 1. Translate the desired outcome into a short slug, title, and concrete outcome. Resolve routine naming yourself.
-2. Call `theater_feature_create`. This creates a self-contained clone at an exact refreshed commit.
+2. Call `theater_feature_create`. This creates a self-contained clone at an exact commit. For an explicitly selected sibling revision, use `base_feature` plus its full frozen `base_revision` after confirming the callable schema supports that field; the runtime fetches committed objects directly from that lane without publishing to canonical source or copying dirty files. This supplies source provenance, not acceptance proof; omitted bases use refreshed canonical default HEAD. Preserve and inspect any partial checkout after failure before an authorized recovery; do not retry an occupied path blindly.
 3. Develop the specification conversationally. Cover user-visible behavior, constraints/compatibility, acceptance criteria, non-goals, and genuinely unresolved decisions. Avoid implementation detail that does not constrain the result.
 4. Call `theater_spec_update` with the complete revised Markdown. Each call is a durable revision, so do not save cosmetic churn.
 5. For work needing independent stages or evidence gates, call `theater_work_plan` with a small DAG. Use scope/design/build/review/validate/repair/integrate only where those boundaries are meaningful. Skip elaborate decomposition for a single coherent change.
