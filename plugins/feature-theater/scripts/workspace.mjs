@@ -725,14 +725,7 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
         ctx.db.prepare(`UPDATE work_items SET status = ?, owner = ?, result_summary = ?, blocker = ?, result_revision = CASE WHEN ? THEN NULL ELSE COALESCE(?, result_revision) END, lease_expires_at = ?, updated_at = ? WHERE id = ?`)
           .run(status, status === 'running' ? cleanOwner : item.owner, cleanSummary, cleanBlocker, clearResultRevision ? 1 : 0, revision ?? null, lease, stamp, item.id);
         reconcileReady(ctx.db, row.id);
-        const nextAction = status === 'running'
-          ? `Complete ${itemKey} and report the verified result.`
-          : status === 'review'
-            ? `Review ${itemKey} against its acceptance criteria.`
-            : ['blocked', 'failed'].includes(status)
-              ? `Resolve ${itemKey}: ${cleanBlocker}`
-              : 'Continue the highest-priority ready work or validate the completed change.';
-        ctx.db.prepare('UPDATE features SET next_action = ?, updated_at = ? WHERE id = ?').run(nextAction, stamp, row.id);
+        ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(stamp, row.id);
       });
       await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${cleanSummary ? `: ${cleanSummary}` : cleanBlocker ? `: ${cleanBlocker}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease } });
       const current = featureBySlug(ctx.db, slug);
