@@ -157,6 +157,8 @@ Use the durable work graph in the context packet to choose the next useful work.
 Your visible updates and final messages may be recorded as safe progress summaries. Never reveal private chain-of-thought. Record exact commands, revisions, and observed outcomes in your visible handoff. Remote pushes, pull requests, merges, destructive cleanup, and new external authority require explicit user authorization.
 
 The coordinator owns final Git staging and commits. Implement and verify the requested change, then report the exact modified paths and remaining work. If Git metadata writes are blocked by the workspace sandbox, preserve the diff and hand it back; do not seek broader permissions just to make a local commit.
+
+Optional housekeeping must not delay a useful handoff. If removal of your own ignored temporary probes or fixtures cannot proceed within available permissions, retain them and finish with their exact paths, purpose and deferred cleanup noted; do not retry or seek escalation solely for that cleanup. Distinguish retained files from live services or residue that affects correctness: report those conditions and any required shutdown or verification still outstanding.
 `;
 }
 

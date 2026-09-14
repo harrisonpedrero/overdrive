@@ -67,6 +67,8 @@ Treat `selectedCheckKeys` as a request, not a list of running work. A completed 
 
 Initialization and clone failures preserve partial directories for diagnosis. Feature Theater will not automatically delete, stash, reset, or overwrite a dirty checkout. A failed work item remains visible; add repair work with explicit acceptance criteria. A feature blocked on user input does not freeze independent lanes.
 
+Optional cleanup must not delay completed useful work. A worker unable to remove its own ignored temporary probes or fixtures within available permissions should retain them and finish its handoff with exact paths, purpose and deferred cleanup, without repeated attempts or escalation solely for housekeeping. Live services and residue affecting correctness still need explicit disposition. Theater waits already return pending request summaries, payloads and creation times; reconcile them promptly and distinguish optional housekeeping from decisions blocking the requested behavior. Preserve request ownership and authorization, and let the worker finish its actual turn rather than synthesizing completion.
+
 Start with cheap environment readiness and focused behavior checks before broad suites. Inspect the actual failed command output to distinguish environment/setup, test-harness, resource contention and product failures. Address the demonstrated cause before explicitly retrying the affected queue job. Preserve unrelated current passes; do not rerun an unchanged broad suite merely because one command failed.
 
 ## Updating the development install
