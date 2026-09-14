@@ -1,4 +1,4 @@
-import { loadWorkspace, featureBySlug, meta, parseJson, recordEvent, transaction } from './state.mjs';
+import { assertCheckReservation, loadWorkspace, featureBySlug, meta, parseJson, recordEvent, transaction } from './state.mjs';
 import { TheaterError, now, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function ownerAlive(owner) {
@@ -34,6 +34,7 @@ export async function withAgentControl(args, token, fn) {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      assertCheckReservation(ctx.db, row.id);
       const previous = agentOwner(ctx.db, row.id);
       const busy = row.active_turn_id || ['starting', 'compacting', 'waiting_for_user'].includes(row.agent_status);
       if (previous?.token !== token && busy && ownerAlive(previous)) {

@@ -5,6 +5,17 @@ import { DatabaseSync } from 'node:sqlite';
 import { TheaterError, contained, ensureManagedPath, now, readJson } from './util.mjs';
 
 const SCHEMA_VERSION = 3;
+export const CHECK_QUEUE_META = 'checks:queue';
+
+export function assertCheckReservation(db, featureId, receiptId = null) {
+  const raw = meta(db, CHECK_QUEUE_META);
+  if (!raw) return;
+  const queue = JSON.parse(raw);
+  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new TheaterError('Unsupported verification queue state.', 'INVALID_STATE');
+  const reserved = queue.jobs.find(job => job.featureId === featureId && ['running', 'interrupted'].includes(job.status)
+    && !(job.status === 'running' && receiptId && job.attempts.at(-1)?.receiptId === receiptId));
+  if (reserved) throw new TheaterError(`Verification job ${reserved.key} reserves this clone. Inspect the queue and resolve uncertain execution before reusing it.`, 'CHECK_EXECUTION_RESERVED');
+}
 
 function schema(db) {
   db.exec(`

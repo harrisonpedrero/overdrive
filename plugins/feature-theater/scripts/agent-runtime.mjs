@@ -384,25 +384,43 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
 }
 
 async function waitFeatureAgent({ workspace_path, feature, timeout_seconds = 30 }) {
+  const result = await waitFeatureAgents({ workspace_path, features: [feature], timeout_seconds });
+  return { timedOut: result.timedOut, ...result.handoffs[0] };
+}
+
+async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 30 }) {
   if (!Number.isInteger(timeout_seconds) || timeout_seconds < 1 || timeout_seconds > 60) throw new TheaterError('Wait duration must be 1–60 seconds.', 'INVALID_INPUT');
-  const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true });
+  if (!Array.isArray(features) || !features.length || features.length > 8 || features.some(feature => typeof feature !== 'string') || new Set(features).size !== features.length) throw new TheaterError('Supply 1–8 unique feature slugs.', 'INVALID_INPUT');
+  const runtimes = await Promise.all(features.map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true })));
+  const signalled = new Set();
   let timer;
   let finish;
   const changed = new Promise(resolve => { finish = resolve; });
-  const notification = message => {
-    if (message.params?.threadId === runtime.feature.thread_id && ['turn/completed', 'thread/status/changed'].includes(message.method)) finish(true);
+  const signalThread = threadId => {
+    const runtime = runtimes.find(runtime => runtime.feature.thread_id && runtime.feature.thread_id === threadId);
+    if (runtime) { signalled.add(runtime.feature.slug); finish(true); }
   };
-  const request = message => { if (message.params?.threadId === runtime.feature.thread_id) finish(true); };
+  const notification = message => {
+    if (['turn/completed', 'thread/status/changed'].includes(message.method)) signalThread(message.params?.threadId);
+  };
+  const request = message => signalThread(message.params?.threadId);
   bridge.on('notification', notification);
   bridge.on('serverRequest', request);
   timer = setTimeout(() => finish(false), timeout_seconds * 1000);
   try {
     await notificationQueue;
-    const initial = await getFeatureContext({ workspace_path, feature, timeline_limit: 1 });
-    const signal = !initial.feature.agent.activeTurnId || initial.pendingAgentRequests.length ? true : await changed;
+    const initial = await Promise.all(runtimes.map(runtime => getFeatureContext({ workspace_path, feature: runtime.feature.slug, timeline_limit: 1 })));
+    for (const state of initial) {
+      if (!state.feature.agent.activeTurnId || state.pendingAgentRequests.length) signalled.add(state.feature.slug);
+    }
+    const signal = signalled.size ? true : await changed;
     await notificationQueue;
-    const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true });
-    return { timedOut: !signal, feature: state.feature, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
+    const selected = signal ? [...signalled] : runtimes.map(runtime => runtime.feature.slug);
+    const handoffs = await Promise.all(selected.map(async feature => {
+      const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true });
+      return { feature: state.feature, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
+    }));
+    return { timedOut: !signal, handoffs, nextAction: 'Reconcile completed or decision-ready handoffs now, advance authorized next actions, and wait only on remaining unreconciled work. This wait does not wake an ended coordinator turn.' };
   } finally {
     clearTimeout(timer);
     bridge.off('notification', notification);
@@ -488,7 +506,7 @@ const steerFeatureAgent = args => withAgentControl(args, ownerToken, () => steer
 const compactFeatureAgent = args => withAgentControl(args, ownerToken, () => compactOwned(args));
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
 const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));
-return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime };
+return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime };
 }
 
-export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime } = createAgentRuntime();
+export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime } = createAgentRuntime();

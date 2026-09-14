@@ -224,7 +224,7 @@ export async function normalizeRepositorySource(value) {
   return { source: real, kind: 'local' };
 }
 
-export async function withWorkspaceLock(root, operation, fn) {
+export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_000 } = {}) {
   if (typeof operation !== 'string' || !/^[a-z][a-z0-9-]{0,62}$/.test(operation)) {
     throw new TheaterError('Workspace lock name is invalid.', 'INVALID_LOCK');
   }
@@ -232,7 +232,7 @@ export async function withWorkspaceLock(root, operation, fn) {
   await fs.mkdir(lockDirectory, { recursive: true });
   const lockFile = await ensureManagedPath(root, path.join(lockDirectory, `${operation}.lock`));
   const token = randomUUID();
-  const deadline = Date.now() + 120_000;
+  const deadline = Date.now() + timeoutMs;
   let handle;
   while (!handle) {
     try {

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
+import { assertCheckReservation, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
 
@@ -52,13 +52,13 @@ export function assertVerified(ctx, feature, revision, candidate = null) {
   return verification;
 }
 
-async function withFeature(args, fn) {
+async function withFeature(args, fn, lockOptions) {
   const root = await resolveWorkspace(args.workspace_path);
   return withWorkspaceLock(root, `control-${safeSlug(args.feature)}`, async () => {
     const ctx = await loadWorkspace(root);
     try { return await fn(ctx, featureBySlug(ctx.db, safeSlug(args.feature))); }
     finally { ctx.db.close(); }
-  });
+  }, lockOptions);
 }
 
 function artifactPaths(value = []) {
@@ -125,8 +125,9 @@ export async function updateChecks(args) {
   });
 }
 
-export async function runChecks(args) {
+export async function runChecks(args, execution = {}) {
   return withFeature(args, async (ctx, feature) => {
+    assertCheckReservation(ctx.db, feature.id, execution.receiptId);
     assertAgentIdle(feature);
     const checks = featureChecks(ctx.db, feature.id);
     if (!checks.length) throw new TheaterError('Configure meaningful verification commands first.', 'CHECKS_REQUIRED');
@@ -142,12 +143,15 @@ export async function runChecks(args) {
     const before = await repositorySnapshot(feature.checkout_path);
     if (!before.clean) throw new TheaterError('Commit the candidate before running recorded checks.', 'DIRTY_CANDIDATE');
     const contract = featureContract(ctx.db, feature);
+    if (execution.receiptId && (selectedChecks.length !== 1 || before.head !== execution.revision || contract !== execution.contractHash)) {
+      throw new TheaterError('Queued verification no longer matches the exact commit and full contract.', 'STALE_QUEUE_JOB');
+    }
     const receipts = [];
     for (const check of selectedChecks) {
       let result;
       try { result = await run(check.argv, { cwd: feature.checkout_path, timeoutMs: check.timeout_seconds * 1000, maxOutput: 500_000, allowFailure: true }); }
       catch (error) { result = { exitCode: null, stderr: error.message, stdout: '', durationMs: 0 }; }
-      const id = newId('evidence');
+      const id = execution.receiptId ?? newId('evidence');
       let artifact = null;
       let artifactError = null;
       try { artifact = await archiveCheckArtifacts(ctx, feature, check, id, before.head); }
@@ -163,14 +167,14 @@ export async function runChecks(args) {
         redactString(`${result.stdout}\n${result.stderr}${artifactError ? `\nArtifact collection failed: ${artifactError}` : ''}`).slice(-24_000), result.durationMs, artifact,
       );
       receipts.push({ id, key: check.key, passed, summary, exitCode: result.exitCode, durationMs: result.durationMs, artifact });
-      if (!unchanged || artifactError) break;
+      if (!passed) break;
     }
     const verification = verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head);
     if (!verification.ready) invalidateCandidates(ctx.db, feature.id);
     const selectedCheckKeys = selectedChecks.map(check => check.key);
     recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `${receipts.filter(item => item.passed).length}/${receipts.length} command(s) passed at ${before.head.slice(0, 12)}.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys } });
     return { feature: feature.slug, selectedCheckKeys, receipts, verification, git: await repositorySnapshot(feature.checkout_path) };
-  });
+  }, execution.receiptId ? { timeoutMs: 0 } : undefined);
 }
 
 export async function readEvidence(args) {

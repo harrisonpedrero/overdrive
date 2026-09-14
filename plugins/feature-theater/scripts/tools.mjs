@@ -25,8 +25,10 @@ import {
   startFeatureAgent,
   steerFeatureAgent,
   waitFeatureAgent,
+  waitFeatureAgents,
 } from './agent-runtime.mjs';
 import { readEvidence, runChecks, updateChecks } from './verification.mjs';
+import { enqueueChecks, inspectCheckQueue, drainCheckQueue, resolveCheckJob } from './check-queue.mjs';
 import { STATE_SECTIONS, composeView, snapshotState } from './presentation.mjs';
 
 const string = (description, extra = {}) => ({ type: 'string', description, ...extra });
@@ -56,13 +58,39 @@ const state = {
 };
 
 export const TOOLS = [
+  tool('theater_agents_wait', 'Receive the next feature handoff', 'Wait on up to eight unreconciled feature workers together. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
+    ...workspace,
+    features: { type: 'array', minItems: 1, maxItems: 8, uniqueItems: true, items: string('Feature slug still awaiting reconciliation; omit already handled idle lanes.') },
+    timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
+  }, ['workspace_path', 'features']), { readOnlyHint: true, openWorldHint: true }),
+  tool('theater_checks_enqueue', 'Queue authorized verification', 'Bind reviewed configured checks to their current clean commit and full contract. One check per job; stable keys make identical enqueue requests idempotent. Dependencies stop on failure; the same clone and named shared resources serialize. Up to 500 retained jobs per workspace.', object({
+    ...workspace,
+    jobs: { type: 'array', minItems: 1, maxItems: 50, items: object({
+      key: string('Unique durable job key. Use a new key for a changed revision or plan.'), ...feature,
+      check_key: string('Exact configured check key.'),
+      depends_on: { type: 'array', maxItems: 50, uniqueItems: true, items: string('Prerequisite job key in this queue or batch.') },
+      resources: { type: 'array', maxItems: 20, uniqueItems: true, items: string('Shared exclusive resource key, such as port-4200 or gpu-benchmark. External commands must be coordinated separately.') },
+    }, ['key', 'feature', 'check_key']) },
+  }, ['workspace_path', 'jobs']), { destructiveHint: false, idempotentHint: true }),
+  tool('theater_checks_queue', 'Inspect verification queue', 'Read durable jobs, timings, receipts and blockers; reconcile a dead controller with exact completed receipts or quarantine uncertain execution. Does not execute checks.', object(workspace, ['workspace_path']), { destructiveHint: false, idempotentHint: true }),
+  tool('theater_checks_drain', 'Advance ready verification', 'Execute eligible jobs and immediately release successors. Failures stop dependents, while disjoint ready jobs continue. Returns completion and decision handoffs for prompt coordinator reconciliation; never launches feature workers or accepts candidates.', object({
+    ...workspace,
+    max_parallel: integer('Concurrent jobs; defaults to 2. Same-clone and shared-resource exclusion always applies.', 1, 4),
+    max_checks: integer('Maximum admissions in this call; defaults to 10.', 1, 50),
+    admission_seconds: integer('Stop admitting new jobs after this many seconds, default 60. Already admitted checks finish under their configured deadlines; this is not a call timeout.', 1, 300),
+  }, ['workspace_path']), { destructiveHint: false, openWorldHint: true }),
+  tool('theater_checks_resolve', 'Resolve stopped verification', 'After inspecting a failure or interrupted command, explicitly retry its unchanged binding or cancel it. Changed commits/contracts require new jobs. Interrupted execution retains resources until command termination is established.', object({
+    ...workspace, job_key: string('Queue job key.'), action: string('Resolution.', { enum: ['retry', 'cancel'] }),
+    reason: string('Observed cause and resolution; for interruption, include how command and child-process termination was established.'),
+    execution_stopped: boolean('Required true for interrupted jobs, only after verifying the old command and children stopped.'),
+  }, ['workspace_path', 'job_key', 'action', 'reason']), { destructiveHint: false }),
   tool('theater_view_catalog', 'Work graph pattern', 'Describe the built-in work graph. Other state is answered in normal conversation, not separate panels or controls.', object({}), { readOnlyHint: true, idempotentHint: true }),
   tool('theater_state', 'Observe scoped feature state', 'Read a versioned, bounded data snapshot for a normal conversational reply. Only load selected sections; an overview never loads other specifications or raw logs.', object(state, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
   tool('theater_view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
     ...workspace, ...feature,
     work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items.' },
   }, ['workspace_path']), { destructiveHint: false }),
-  tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Changes invalidate earlier candidates; commands execute only through theater_checks_run.', object({
+  tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Changes invalidate earlier candidates; execute through theater_checks_run or the verification queue.', object({
     ...workspace, ...feature,
     checks: { type: 'array', maxItems: 50, items: object({
       key: string('Stable check key.'), purpose: string('Behavior this command verifies.'),
@@ -74,7 +102,7 @@ export const TOOLS = [
     }, ['key', 'purpose', 'argv']) },
   }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),
 
-  tool('theater_checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract.', object({
+  tool('theater_checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature, stopping at the first failure for inspection. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract.', object({
     ...workspace, ...feature,
     check_keys: { type: 'array', minItems: 1, maxItems: 50, uniqueItems: true, items: string('Exact configured check key.'), description: 'Optional nonempty selection of known checks, executed in saved order. Omit to run all. Does not edit the contract or create receipts for omitted checks.' },
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
@@ -251,8 +279,13 @@ const handlers = {
   theater_view: composeView,
   theater_checks_update: updateChecks,
   theater_checks_run: runChecks,
+  theater_checks_enqueue: enqueueChecks,
+  theater_checks_queue: inspectCheckQueue,
+  theater_checks_drain: drainCheckQueue,
+  theater_checks_resolve: resolveCheckJob,
   theater_evidence_get: readEvidence,
   theater_agent_wait: waitFeatureAgent,
+  theater_agents_wait: waitFeatureAgents,
   theater_initialize: initializeWorkspace,
   theater_project_create: initializeManagedProject,
   theater_doctor: doctorWorkspace,
