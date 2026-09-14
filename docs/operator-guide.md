@@ -51,6 +51,8 @@ Ask for the work graph to see dependencies, task states, and blockers as a nativ
 
 ## Failure handling
 
+Treat `selectedCheckKeys` as a request, not a list of running work. A completed run's `completion` separates selected, executed, passed, failed and `notRunCheckKeys`; omitted execution does not create or alter receipts. On `checks.finished`, close that invocation's work and join its shell/controller rather than waiting for selected-but-unrun commands. Inspect the failed receipt, then explicitly run independent needed checks or admit them through the existing queue. The local selective client prints requested/finished events with its controller PID to stderr as well as completion in the JSON result, including when it uses the currently installed older response format. If no complete handoff arrives, it reports `checks.unconfirmed`: inspect the owned process and durable receipts before retrying. No additional polling loop is required.
+
 Initialization and clone failures preserve partial directories for diagnosis. Feature Theater will not automatically delete, stash, reset, or overwrite a dirty checkout. A failed work item remains visible; add repair work with explicit acceptance criteria. A feature blocked on user input does not freeze independent lanes.
 
 Start with cheap environment readiness and focused behavior checks before broad suites. Inspect the actual failed command output to distinguish environment/setup, test-harness, resource contention and product failures. Address the demonstrated cause before explicitly retrying the affected queue job. Preserve unrelated current passes; do not rerun an unchanged broad suite merely because one command failed.

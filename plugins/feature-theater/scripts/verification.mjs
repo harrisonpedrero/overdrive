@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { checkOutcome } from './check-outcome.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { assertCheckReservation, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
@@ -173,8 +174,9 @@ export async function runChecks(args, execution = {}) {
     const verification = verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head);
     if (!verification.ready) invalidateCandidates(ctx.db, feature.id);
     const selectedCheckKeys = selectedChecks.map(check => check.key);
-    recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `${receipts.filter(item => item.passed).length}/${receipts.length} command(s) passed at ${before.head.slice(0, 12)}.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys } });
-    return { feature: feature.slug, selectedCheckKeys, receipts, verification, git: await repositorySnapshot(feature.checkout_path) };
+    const completion = checkOutcome(selectedCheckKeys, receipts);
+    recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `Run finished at ${before.head.slice(0, 12)}: ${receipts.length} executed, ${completion.failedCheckKeys.length} failed, ${completion.notRunCheckKeys.length} not run.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys, completion } });
+    return { feature: feature.slug, selectedCheckKeys, receipts, completion, verification, git: await repositorySnapshot(feature.checkout_path) };
   }, execution.receiptId ? { timeoutMs: 0 } : undefined);
 }
 
