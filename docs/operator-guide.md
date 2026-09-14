@@ -14,6 +14,12 @@ During active coordination, reconcile completed workers and checks promptly and 
 
 Use `theater_agents_wait` to receive the first handoff among up to eight unreconciled workers, then review the returned lane and advance its authorized next action. Remove handled idle lanes from the wait set. On a verification drain's completion, reconcile its `completed` and `needsAttention` results immediately, including candidate preparation when the complete gate passes. These calls drive an active coordinator; they cannot wake an ended host turn or perform source review and candidate judgment themselves. Scheduled follow-up remains necessary for that host boundary.
 
+## Deliver progressively
+
+For multi-feature work, use the integration lane as an evolving deliverable. Start with the smallest coherent reviewed set of exact inputs and add later inputs as they become ready. A missing input blocks only behavior that depends on it; retain the complete final acceptance gate. An intermediate combined preview is not a release-ready candidate.
+
+Give independent bounded reviews one owner each, exact revisions and concrete behavior/integration questions. Feature workers own implementation and focused checks; reviewers assess source; the coordinator prepares authorized setup/Git work, reconciles evidence and makes delivery decisions. Keep included revisions, owners/results and pending-input blockers in the existing integration checkpoint and work items. Reuse unchanged valid reviews and current receipts, but verify each resulting integration revision. Do not serialize all reviews through the coordinator or add a second orchestration graph merely to track the same work.
+
 ## Recovery
 
 After a new coordinator task or compaction:

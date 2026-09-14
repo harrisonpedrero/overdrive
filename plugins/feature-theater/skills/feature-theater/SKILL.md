@@ -17,6 +17,16 @@ If the user wants a new project rather than an existing repository, infer a conc
 
 Run `theater_doctor` after initialization or when Git, Codex, state, or the repository cache appears unhealthy. Do not work around a partial `.theater` directory by deleting it; inspect and preserve recoverable state.
 
+## Coordinate the deliverable
+
+For a multi-feature outcome, organize work around the next coherent result the user can inspect or use. Keep an integration lane within the authorized repository workflow and advance it from reviewed exact inputs as they become available. Wait for another lane only when its result is necessary for the behavior being integrated; an unrelated unfinished lane does not block an intermediate combined preview. Preserve the complete final acceptance gate and make pending behavior explicit.
+
+Keep the division of work clear: feature workers implement and run focused checks; bounded reviewers assess the changed behavior and integration risks; the coordinator owns intake, authorized dependency/Git preparation, recorded verification and delivery decisions. Assign independent reviews concurrently when useful, with one owner, exact input revisions and concrete questions per review. Do not turn the coordinator into the serial reviewer of every diff or create more implementation lanes to compensate for a review backlog. Review reports remain claims to reconcile with source and actual evidence.
+
+Use the integration lane's existing work items and checkpoint to retain the exact inputs included, review owners/results, pending inputs and the specific behavior each pending input blocks. Update that compact record as inputs arrive; do not create a second project graph or replay completed reviews merely to reconstruct state. Before dispatching a follow-up, compare its inputs and dependencies with the previous result. Reuse valid reviews and current receipts when they still apply. A new integration commit needs evidence for that resulting revision; a source-lane pass does not become integration proof.
+
+At each handoff, advance the nearest useful result: integrate a coherent reviewed subset, run the relevant verification, or resolve a demonstrated blocker. Keep review/decision waiting separate from command execution when reporting delays. A broken harness or missing service blocks the checks that require it; preserve completed source work and unaffected evidence while repairing that setup. Broaden validation when changed inputs or unresolved risks justify it, rather than imposing a barrier that every lane must finish every check before integration can begin.
+
 ## Create and specify a feature
 
 For a new idea:
