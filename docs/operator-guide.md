@@ -26,6 +26,12 @@ For multi-feature work, use the integration lane as an evolving deliverable. Sta
 
 Give independent bounded reviews one owner each, exact revisions and concrete behavior/integration questions. Feature workers own implementation and focused checks; reviewers assess source; the coordinator prepares authorized setup/Git work, reconciles evidence and makes delivery decisions. Keep included revisions, owners/results and pending-input blockers in the existing integration checkpoint and work items. Reuse unchanged valid reviews and current receipts, but verify each resulting integration revision. Do not serialize all reviews through the coordinator or add a second orchestration graph merely to track the same work.
 
+## Deliver selected peer inputs
+
+A sibling commit ID identifies source; it does not make that commit readable in another isolated clone. Before assigning work that depends on it, the coordinator delivers the deliberately selected peer input and verifies access from the receiving checkout. For an authorized Git intake, fetch the frozen full commit ID from its owning clone into a named destination ref, then confirm `git cat-file -e <commit>^{commit}` and the required paths in the destination. Coordinate destination Git writes with its owner; preserve its HEAD and working files. Tell the worker the exact input revision, relevant paths and integration question rather than asking it to discover or fetch sibling context.
+
+When destination Git writes are unsuitable, export selected committed files with `git archive` and, if needed, a binary/full-index patch between explicit base and target commits. Write a fresh bundle under the receiver's ignored `.theater/source-intake/` directory. Record the source clone, full base/target IDs, selected paths, additions/deletions or mode changes, and SHA256 hashes of the delivered artifacts in a manifest. Read committed Git objects rather than mutable working files, preserve earlier bundles, and publish the handoff only after verifying the files and manifest. This is source input, not applied code or acceptance evidence; the receiving owner decides how to compose it. Once actual peer inputs exist, use cheap checks against those modules for the relevant interface seam instead of continuing to infer compatibility from adapter stubs. Keep unrelated work moving while a missing input is delivered.
+
 ## Recovery
 
 After a new coordinator task or compaction:
