@@ -16,6 +16,8 @@ During active coordination, reconcile completed workers and checks promptly and 
 
 Use `theater_agents_wait` to receive the first handoff among up to eight unreconciled workers, then review the returned lane and advance its authorized next action. Remove handled idle lanes from the wait set. On a verification drain's completion, reconcile its `completed` and `needsAttention` results immediately, including candidate preparation when the complete gate passes. These calls drive an active coordinator; they cannot wake an ended host turn or perform source review and candidate judgment themselves. Scheduled follow-up remains necessary for that host boundary.
 
+For Theater-owned workers, reconcile liveness through their owning Theater controller. An app task view reporting `notLoaded` or `interrupted` does not by itself establish that this controller's active turn stopped; compare the exact turn and controller state before recovery or redispatch. If refresh fails, preserve that uncertainty instead of declaring completion or starting a competing worker.
+
 ## Deliver progressively
 
 For multi-feature work, use the integration lane as an evolving deliverable. Start with the smallest coherent reviewed set of exact inputs and add later inputs as they become ready. A missing input blocks only behavior that depends on it; retain the complete final acceptance gate. An intermediate combined preview is not a release-ready candidate.
