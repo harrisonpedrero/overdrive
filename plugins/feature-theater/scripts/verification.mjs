@@ -42,6 +42,7 @@ export function verificationStatus(ctx, feature, revision) {
 }
 
 export function assertVerified(ctx, feature, revision, candidate = null) {
+  assertCheckReservation(ctx.db, feature.id);
   const verification = verificationStatus(ctx, feature, revision);
   if (candidate && (candidate.contract_hash !== verification.contractHash || candidate.spec_revision !== feature.spec_revision)) {
     throw new TheaterError('Candidate was verified against an older feature contract. Run current checks and record a fresh candidate.', 'STALE_CONTRACT');
