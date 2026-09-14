@@ -130,11 +130,20 @@ export async function runChecks(args) {
     assertAgentIdle(feature);
     const checks = featureChecks(ctx.db, feature.id);
     if (!checks.length) throw new TheaterError('Configure meaningful verification commands first.', 'CHECKS_REQUIRED');
+    let selectedChecks = checks;
+    if (args.check_keys !== undefined) {
+      if (!Array.isArray(args.check_keys) || !args.check_keys.length || args.check_keys.length > 50
+        || new Set(args.check_keys).size !== args.check_keys.length
+        || args.check_keys.some(key => typeof key !== 'string' || !checks.some(check => check.key === key))) {
+        throw new TheaterError('check_keys must be a nonempty array of unique configured check keys.', 'INVALID_INPUT');
+      }
+      selectedChecks = checks.filter(check => args.check_keys.includes(check.key));
+    }
     const before = await repositorySnapshot(feature.checkout_path);
     if (!before.clean) throw new TheaterError('Commit the candidate before running recorded checks.', 'DIRTY_CANDIDATE');
     const contract = featureContract(ctx.db, feature);
     const receipts = [];
-    for (const check of checks) {
+    for (const check of selectedChecks) {
       let result;
       try { result = await run(check.argv, { cwd: feature.checkout_path, timeoutMs: check.timeout_seconds * 1000, maxOutput: 500_000, allowFailure: true }); }
       catch (error) { result = { exitCode: null, stderr: error.message, stdout: '', durationMs: 0 }; }
@@ -158,8 +167,9 @@ export async function runChecks(args) {
     }
     const verification = verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head);
     if (!verification.ready) invalidateCandidates(ctx.db, feature.id);
-    recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `${receipts.filter(item => item.passed).length}/${receipts.length} command(s) passed at ${before.head.slice(0, 12)}.`, details: { receipts: receipts.map(item => item.id) } });
-    return { feature: feature.slug, receipts, verification, git: await repositorySnapshot(feature.checkout_path) };
+    const selectedCheckKeys = selectedChecks.map(check => check.key);
+    recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `${receipts.filter(item => item.passed).length}/${receipts.length} command(s) passed at ${before.head.slice(0, 12)}.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys } });
+    return { feature: feature.slug, selectedCheckKeys, receipts, verification, git: await repositorySnapshot(feature.checkout_path) };
   });
 }
 

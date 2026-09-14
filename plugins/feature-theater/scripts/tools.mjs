@@ -74,7 +74,10 @@ export const TOOLS = [
     }, ['key', 'purpose', 'argv']) },
   }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),
 
-  tool('theater_checks_run', 'Execute feature checks', 'Run the configured commands against a clean committed idle feature. Record actual exits, bounded output, and the current spec/contract. Dirty output and failures cannot authorize a candidate.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
+  tool('theater_checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract.', object({
+    ...workspace, ...feature,
+    check_keys: { type: 'array', minItems: 1, maxItems: 50, uniqueItems: true, items: string('Exact configured check key.'), description: 'Optional nonempty selection of known checks, executed in saved order. Omit to run all. Does not edit the contract or create receipts for omitted checks.' },
+  }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
   tool('theater_evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks, context, or state views.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
 
