@@ -140,6 +140,8 @@ export async function createFeatureCheckout(root, config, slug, baseRevision) {
   await fs.mkdir(destinationRoot, { recursive: true });
   // --no-local makes every feature self-contained instead of depending on the cache's object store.
   await run(['git', 'clone', '--no-local', '--no-checkout', '--', mirrorPath(root), destination], { cwd: root });
+  // An explicit base can remain in the cache after its private ref is pruned, so clone may omit it.
+  await git(destination, 'fetch', '--no-tags', '--no-write-fetch-head', mirrorPath(root), baseRevision);
   const branch = `feature/${slug}`;
   await git(destination, 'check-ref-format', '--branch', branch);
   await git(destination, 'checkout', '-b', branch, baseRevision);
