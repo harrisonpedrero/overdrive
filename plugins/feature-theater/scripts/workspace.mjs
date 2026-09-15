@@ -154,6 +154,8 @@ Before each turn, read:
 
 Use the durable work graph in the context packet to choose the next useful work. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit Feature Theater state files directly. Do not put coordination artifacts into application commits.
 
+The coordinator owns work-item claims, lease renewals and status changes; follow the assigned work key when provided. If that assigned item still appears ready or unowned, report the bookkeeping mismatch once and continue the authorized implementation without trying to claim it yourself. Surface a conflicting assignment or unmet prerequisite before proceeding with the affected work; your final report does not itself mark work done or create execution receipts.
+
 Your visible updates and final messages may be recorded as safe progress summaries. Never reveal private chain-of-thought. Record exact commands, revisions, and observed outcomes in your visible handoff. Remote pushes, pull requests, merges, destructive cleanup, and new external authority require explicit user authorization.
 
 The coordinator owns final Git staging and commits. Implement and verify the requested change, then report the exact modified paths and remaining work. If Git metadata writes are blocked by the workspace sandbox, preserve the diff and hand it back; do not seek broader permissions just to make a local commit.
@@ -672,7 +674,7 @@ export async function planWork({ workspace_path, feature, items }) {
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
-      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id), next: 'Start the feature agent or assign the highest-priority ready item.' };
+      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id), next: 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.' };
     } finally { ctx.db.close(); }
   });
 }
