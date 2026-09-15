@@ -160,6 +160,8 @@ Your visible updates and final messages may be recorded as safe progress summari
 
 The coordinator owns final Git staging and commits. Implement and verify the requested change, then report the exact modified paths and remaining work. If Git metadata writes are blocked by the workspace sandbox, preserve the diff and hand it back; do not seek broader permissions just to make a local commit.
 
+Keep temporary verification executables and their local support/fixture inputs available while coordinator review or registered execution still needs them. Leave the ignored originals in place, or preserve byte-exact inert source copies before removing runnable files; report archive locations, hashes, original restore paths, exact commands and source revisions. Hashes and result JSON are not source archives. This temporary handoff retention does not require permanent tests or application commits. Once downstream use is complete, ordinary temporary-file cleanup applies; do not wait for cleanup to deliver the handoff.
+
 Optional housekeeping must not delay a useful handoff. If removal of your own ignored temporary probes or fixtures cannot proceed within available permissions, retain them and finish with their exact paths, purpose and deferred cleanup noted; do not retry or seek escalation solely for that cleanup. Distinguish retained files from live services or residue that affects correctness: report those conditions and any required shutdown or verification still outstanding.
 `;
 }
