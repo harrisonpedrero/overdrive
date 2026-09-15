@@ -99,6 +99,7 @@ export const TOOLS = [
       required: boolean('Whether a failure prevents completion; defaults to true.'),
       timeout_seconds: integer('Command deadline; defaults to 300 seconds.', 1, 1800),
       reuse_same_revision: boolean('Opt in only for a standalone check whose non-Git inputs are immutable and bound by its command or spec/work contract. Preserve exact same-revision proof across unrelated check changes. Do not enable for mutable shared setup or opaque external inputs.'),
+      work_scope: { type: 'array', minItems: 1, maxItems: 200, uniqueItems: true, items: string('Exact existing work item key.'), description: 'Optional prospective work binding for an independent reuse_same_revision check: selected definitions plus all transitive prerequisites. Omit to bind all work. Adding or changing scope requires new proof; unrelated work cannot inherit its receipt. Full spec and exact source binding remain required.' },
       artifact_paths: { type: 'array', maxItems: 20, items: string('Existing output file or directory to retain after this check, relative to its checkout. No globs, overlapping paths, Git metadata, or symlinks.'), description: 'Optional artifact collection contract. Copy these paths into the receipt archive before the next check. Missing paths or copy errors fail the receipt and stop remaining checks.' },
     }, ['key', 'purpose', 'argv']) },
   }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),

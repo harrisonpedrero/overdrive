@@ -28,7 +28,23 @@ export function featureContract(db, feature) {
 
 function checkBindings(definition) {
   const { checks, ...inputs } = definition;
-  return Object.fromEntries(checks.map(({ reuse_same_revision: _policy, ...check }) => [check.key, fingerprint({ version: 1, ...inputs, check })]));
+  return Object.fromEntries(checks.map(({ reuse_same_revision: _policy, ...check }) => [check.key, fingerprint({ version: 1, ...inputs, work: scopedWork(inputs.work, check.work_scope), check })]));
+}
+
+function scopedWork(work, scope) {
+  if (scope === undefined) return work;
+  const byKey = new Map(work.map(item => [item.key, item]));
+  const selected = new Set();
+  const pending = [...scope];
+  while (pending.length) {
+    const key = pending.pop();
+    if (selected.has(key)) continue;
+    const item = byKey.get(key);
+    if (!item) throw new TheaterError(`Unknown work scope item: ${key}`, 'WORK_ITEM_NOT_FOUND');
+    selected.add(key);
+    pending.push(...item.dependencies);
+  }
+  return work.filter(item => selected.has(item.key));
 }
 
 function captureContract(db, feature, definition) {
@@ -75,7 +91,9 @@ export function verificationStatus(ctx, feature, revision) {
     return { ...check, status: receipt ? receipt.passed ? 'passed' : 'failed' : 'missing', receipt, ...(receipt ? { reused: receipt.contract_hash !== contract } : {}), ...(reuseBlockedBy ? { reuseBlockedBy } : {}) };
   });
   const required = checks.filter(check => check.required);
-  return { contractHash: contract, specRevision: feature.spec_revision, revision, ready: feature.spec_revision > 0 && required.length > 0 && required.every(check => check.status === 'passed'), checks };
+  const ready = feature.spec_revision > 0 && required.length > 0 && required.every(check => check.status === 'passed');
+  const openWork = workItems(ctx.db, feature.id).filter(item => !['done', 'cancelled'].includes(item.status)).map(item => item.item_key).sort();
+  return { contractHash: contract, specRevision: feature.spec_revision, revision, ready, completionReady: ready && !openWork.length, openWork, checks };
 }
 
 export function assertVerified(ctx, feature, revision, candidate = null) {
@@ -147,15 +165,26 @@ export async function updateChecks(args) {
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1800) throw new TheaterError('Check timeout must be 1–1800 seconds.', 'INVALID_INPUT');
     if (check.required !== undefined && typeof check.required !== 'boolean') throw new TheaterError('required must be a boolean.', 'INVALID_INPUT');
     if (check.reuse_same_revision !== undefined && typeof check.reuse_same_revision !== 'boolean') throw new TheaterError('reuse_same_revision must be a boolean.', 'INVALID_INPUT');
+    let scope;
+    if (check.work_scope !== undefined) {
+      if (!check.reuse_same_revision || !Array.isArray(check.work_scope) || !check.work_scope.length || check.work_scope.length > 200
+        || check.work_scope.some(key => typeof key !== 'string' || !/^[A-Za-z][A-Za-z0-9._-]{0,62}$/.test(key))
+        || new Set(check.work_scope).size !== check.work_scope.length) {
+        throw new TheaterError('work_scope requires reuse_same_revision and 1–200 unique exact work item keys.', 'INVALID_INPUT');
+      }
+      scope = [...check.work_scope].sort();
+    }
     const paths = artifactPaths(check.artifact_paths);
-    return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}), ...(check.reuse_same_revision ? { reuse_same_revision: true } : {}) };
+    return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}), ...(check.reuse_same_revision ? { reuse_same_revision: true } : {}), ...(scope ? { work_scope: scope } : {}) };
   }).sort((a, b) => a.key.localeCompare(b.key));
   if (new Set(checks.map(check => check.key)).size !== checks.length) throw new TheaterError('Check keys must be unique.', 'INVALID_INPUT');
   return withFeature(args, async (ctx, feature) => {
     assertAgentIdle(feature);
+    const definition = contractDefinition(ctx.db, feature);
+    for (const check of checks) scopedWork(definition.work, check.work_scope);
     const changed = JSON.stringify(featureChecks(ctx.db, feature.id)) !== JSON.stringify(checks);
     if (changed) transaction(ctx.db, () => {
-      captureContract(ctx.db, feature, contractDefinition(ctx.db, feature));
+      captureContract(ctx.db, feature, definition);
       meta(ctx.db, `checks:${feature.id}`, JSON.stringify(checks));
       invalidateCandidates(ctx.db, feature.id);
       ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(now(), feature.id);
