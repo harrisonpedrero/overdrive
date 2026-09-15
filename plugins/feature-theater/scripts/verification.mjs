@@ -10,13 +10,33 @@ export function featureChecks(db, featureId) {
   return parseJson(meta(db, `checks:${featureId}`), []);
 }
 
-export function featureContract(db, feature) {
+function contractDefinition(db, feature) {
   const work = workItems(db, feature.id).map(item => ({
     key: item.item_key, title: item.title, description: item.description,
     acceptance: item.acceptance, kind: item.kind, dependencies: item.dependencies,
   })).sort((a, b) => a.key.localeCompare(b.key));
   const spec = db.prepare('SELECT content FROM spec_revisions WHERE feature_id = ? AND revision = ?').get(feature.id, feature.spec_revision)?.content ?? '';
-  return createHash('sha256').update(JSON.stringify({ specRevision: feature.spec_revision, spec, work, checks: featureChecks(db, feature.id) })).digest('hex');
+  return { specRevision: feature.spec_revision, spec, work, checks: featureChecks(db, feature.id) };
+}
+
+const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const bindingKey = (featureId, contract) => `verification-contract:${featureId}:${contract}`;
+
+export function featureContract(db, feature) {
+  return fingerprint(contractDefinition(db, feature));
+}
+
+function checkBindings(definition) {
+  const { checks, ...inputs } = definition;
+  return Object.fromEntries(checks.map(({ reuse_same_revision: _policy, ...check }) => [check.key, fingerprint({ version: 1, ...inputs, check })]));
+}
+
+function captureContract(db, feature, definition) {
+  const contract = fingerprint(definition);
+  const key = bindingKey(feature.id, contract);
+  // The exact full hash binds legacy receipts to this snapshot without rewriting their evidence.
+  if (!meta(db, key)) meta(db, key, JSON.stringify({ version: 1, checks: checkBindings(definition) }));
+  return contract;
 }
 
 export function assertAgentIdle(feature) {
@@ -31,12 +51,28 @@ export function invalidateCandidates(db, featureId) {
 }
 
 export function verificationStatus(ctx, feature, revision) {
-  const contract = featureContract(ctx.db, feature);
-  const checks = featureChecks(ctx.db, feature.id).map(check => {
-    const receipt = ctx.db.prepare(`SELECT id, passed, summary, created_at, exit_code, duration_ms FROM evidence
-      WHERE feature_id = ? AND source = 'executed' AND check_key = ? AND revision = ? AND contract_hash = ?
-      ORDER BY rowid DESC LIMIT 1`).get(feature.id, check.key, revision ?? '', contract);
-    return { ...check, status: receipt ? receipt.passed ? 'passed' : 'failed' : 'missing', receipt: receipt ?? null };
+  const definition = contractDefinition(ctx.db, feature);
+  const contract = fingerprint(definition);
+  const bindings = checkBindings(definition);
+  const savedBindings = new Map();
+  const checks = definition.checks.map(check => {
+    let receipt = null, reuseBlockedBy = null;
+    const rows = ctx.db.prepare(`SELECT id, passed, summary, created_at, exit_code, duration_ms, contract_hash, spec_revision FROM evidence
+      WHERE feature_id = ? AND source = 'executed' AND check_key = ? AND revision = ?
+      ORDER BY rowid DESC`).iterate(feature.id, check.key, revision ?? '');
+    for (const row of rows) {
+      if (row.contract_hash === contract) { receipt = row; break; }
+      if (row.spec_revision !== feature.spec_revision) continue;
+      if (!savedBindings.has(row.contract_hash)) savedBindings.set(row.contract_hash, parseJson(meta(ctx.db, bindingKey(feature.id, row.contract_hash)), null));
+      const saved = savedBindings.get(row.contract_hash);
+      const known = saved?.version === 1 && /^[a-f0-9]{64}$/.test(saved.checks?.[check.key] ?? '');
+      if (known && saved.checks[check.key] === bindings[check.key]) {
+        if (check.reuse_same_revision || !row.passed) receipt = row;
+        break;
+      }
+      if (!known && !row.passed && check.reuse_same_revision) { reuseBlockedBy = row.id; break; }
+    }
+    return { ...check, status: receipt ? receipt.passed ? 'passed' : 'failed' : 'missing', receipt, ...(receipt ? { reused: receipt.contract_hash !== contract } : {}), ...(reuseBlockedBy ? { reuseBlockedBy } : {}) };
   });
   const required = checks.filter(check => check.required);
   return { contractHash: contract, specRevision: feature.spec_revision, revision, ready: feature.spec_revision > 0 && required.length > 0 && required.every(check => check.status === 'passed'), checks };
@@ -110,14 +146,16 @@ export async function updateChecks(args) {
     const timeout = check.timeout_seconds ?? 300;
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1800) throw new TheaterError('Check timeout must be 1–1800 seconds.', 'INVALID_INPUT');
     if (check.required !== undefined && typeof check.required !== 'boolean') throw new TheaterError('required must be a boolean.', 'INVALID_INPUT');
+    if (check.reuse_same_revision !== undefined && typeof check.reuse_same_revision !== 'boolean') throw new TheaterError('reuse_same_revision must be a boolean.', 'INVALID_INPUT');
     const paths = artifactPaths(check.artifact_paths);
-    return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}) };
+    return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}), ...(check.reuse_same_revision ? { reuse_same_revision: true } : {}) };
   }).sort((a, b) => a.key.localeCompare(b.key));
   if (new Set(checks.map(check => check.key)).size !== checks.length) throw new TheaterError('Check keys must be unique.', 'INVALID_INPUT');
   return withFeature(args, async (ctx, feature) => {
     assertAgentIdle(feature);
     const changed = JSON.stringify(featureChecks(ctx.db, feature.id)) !== JSON.stringify(checks);
     if (changed) transaction(ctx.db, () => {
+      captureContract(ctx.db, feature, contractDefinition(ctx.db, feature));
       meta(ctx.db, `checks:${feature.id}`, JSON.stringify(checks));
       invalidateCandidates(ctx.db, feature.id);
       ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(now(), feature.id);
@@ -144,10 +182,12 @@ export async function runChecks(args, execution = {}) {
     }
     const before = await repositorySnapshot(feature.checkout_path);
     if (!before.clean) throw new TheaterError('Commit the candidate before running recorded checks.', 'DIRTY_CANDIDATE');
-    const contract = featureContract(ctx.db, feature);
+    const definition = contractDefinition(ctx.db, feature);
+    const contract = fingerprint(definition);
     if (execution.receiptId && (selectedChecks.length !== 1 || before.head !== execution.revision || contract !== execution.contractHash)) {
       throw new TheaterError('Queued verification no longer matches the exact commit and full contract.', 'STALE_QUEUE_JOB');
     }
+    captureContract(ctx.db, feature, definition);
     const receipts = [];
     for (const check of selectedChecks) {
       let result;

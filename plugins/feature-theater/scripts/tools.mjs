@@ -98,6 +98,7 @@ export const TOOLS = [
       kind: string('Evidence kind, such as test, typecheck, browser, integration.'),
       required: boolean('Whether a failure prevents completion; defaults to true.'),
       timeout_seconds: integer('Command deadline; defaults to 300 seconds.', 1, 1800),
+      reuse_same_revision: boolean('Opt in only for a standalone check whose non-Git inputs are immutable and bound by its command or spec/work contract. Preserve exact same-revision proof across unrelated check changes. Do not enable for mutable shared setup or opaque external inputs.'),
       artifact_paths: { type: 'array', maxItems: 20, items: string('Existing output file or directory to retain after this check, relative to its checkout. No globs, overlapping paths, Git metadata, or symlinks.'), description: 'Optional artifact collection contract. Copy these paths into the receipt archive before the next check. Missing paths or copy errors fail the receipt and stop remaining checks.' },
     }, ['key', 'purpose', 'argv']) },
   }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),

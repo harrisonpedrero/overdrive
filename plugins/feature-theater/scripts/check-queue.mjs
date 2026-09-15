@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { CHECK_QUEUE_META, featureBySlug, loadWorkspace, meta, newId, recordEvent } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
-import { assertAgentIdle, featureChecks, featureContract, runChecks } from './verification.mjs';
+import { assertAgentIdle, featureChecks, featureContract, runChecks, verificationStatus } from './verification.mjs';
 import { TheaterError, now, requiredText, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 const activeRunners = new Set();
@@ -180,12 +180,9 @@ export async function drainCheckQueue(args) {
           }
           try {
             for (const dependency of dependencies) {
-              await binding(ctx, dependency);
-              const latest = ctx.db.prepare(`SELECT id, passed FROM evidence WHERE feature_id = ? AND source = 'executed'
-                AND check_key = ? AND revision = ? AND contract_hash = ? ORDER BY rowid DESC LIMIT 1`).get(
-                dependency.featureId, dependency.checkKey, dependency.revision, dependency.contractHash,
-              );
-              if (!latest?.passed) throw new TheaterError(`Dependency lacks current passing evidence: ${dependency.key}; review and replan.`, 'STALE_QUEUE_JOB');
+              const dependencyFeature = await binding(ctx, dependency);
+              const latest = verificationStatus(ctx, dependencyFeature, dependency.revision).checks.find(check => check.key === dependency.checkKey);
+              if (latest?.status !== 'passed') throw new TheaterError(`Dependency lacks current passing evidence: ${dependency.key}; review and replan.`, 'STALE_QUEUE_JOB');
             }
             const feature = await binding(ctx, job);
             assertAgentIdle(feature);
