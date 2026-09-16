@@ -6,6 +6,27 @@ Open `C:\path\to\feature-theater\workspace` in a fresh Codex task using GPT-6 As
 
 To begin from nothing, say `Start a new Feature Theater project called <name> that <product brief>`. The plugin creates a minimal canonical repository at `project/`, then uses the same spec, lane, agent, and evidence workflow. After a feature is completed through the candidate gate, an explicit promotion request fast-forwards that canonical repository and refreshes the mirror. A divergent or dirty canonical project is refused rather than merged or reset.
 
+## Worker harness
+
+Lane workers run under Codex by default. To run them as Claude Code sessions instead, pass `harness: "claude"` to `theater_initialize` or `theater_project_create`, or set `"harness": "claude"` in an existing `theater.json`; the change applies to the next agent start. An optional `claude` object configures the workers:
+
+```json
+{
+  "harness": "claude",
+  "claude": {
+    "model": "opus",
+    "laneModels": { "search-redesign": "sonnet" },
+    "permissionMode": "acceptEdits",
+    "allowedTools": ["Bash", "PowerShell"],
+    "disallowedTools": ["Bash(git push:*)", "Bash(gh pr:*)", "WebFetch", "WebSearch"]
+  }
+}
+```
+
+Omitted fields use the values shown, except `model`, which defaults to the CLI's configured model. Each turn is one `claude -p` process in the feature clone, resumed by session ID, with the feature contract appended to the system prompt and the context packet directory added as a readable root. Workers run with `--strict-mcp-config` and an empty MCP configuration, no settings files, no skills and no browser integration, so a lane cannot call Theater, hooks or the coordinator's integrations. A mid-turn steer is queued as the next user message of the same process; an interrupt terminates the process tree. Compaction requests are acknowledged without a model call because Claude Code compacts its own context; the saved checkpoint remains the semantic boundary.
+
+Permission prompts cannot be relayed from a non-interactive Claude worker: anything outside the permission mode and allow list is denied automatically and the denied tool names are appended to the turn's handoff. The default policy therefore allows shell commands, confines file edits to the clone and packet directory, and denies remote publication and web tools. Unlike the Codex `:workspace` sandbox, shell commands are not filesystem- or network-contained on Windows; treat `bypassPermissions` as an explicit per-workspace choice. Agent tools need the server process that started the turn; a one-shot client that exits after each call ends the worker with it, so drive `theater_agent_*` from a persistent MCP connection.
+
 Create a lane in ordinary language. The feature clone appears at `features/<slug>/repo`; its branch is `feature/<slug>`. Feature tasks appear as normal persisted Codex tasks and can be opened directly when desired. Their app-server disables apps, hooks, plugins, browser/computer control, and external MCP servers, so a lane worker cannot call Theater recursively or bypass coordinator-owned external authority.
 
 To start from an explicitly reviewed, unpromoted sibling candidate, pass its lane as `base_feature` and its full frozen commit ID as `base_revision`. The runtime validates that commit in the source lane and fetches its committed objects directly into the independent new clone; the source may have advanced or have dirty files, which are not included. This selects provenance, not candidate approval. Canonical source/cache publication is unnecessary, and omitted bases still use refreshed canonical HEAD. Confirm the callable schema supports `base_feature` before using it; older runtimes need the previously verified cache-based workflow or a coordinated update. Without `base_feature`, the selected revision must resolve in the refreshed cache; private ref names can be pruned, so use their full commit ID. Repository-profile hints still describe canonical default HEAD; inspect the selected checkout's actual setup requirements.

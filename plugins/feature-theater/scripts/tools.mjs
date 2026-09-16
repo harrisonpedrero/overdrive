@@ -116,6 +116,7 @@ export const TOOLS = [
   tool('theater_initialize', 'Initialize Feature Theater', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
+    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'repository']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
   tool('theater_project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize Feature Theater against it.', object({
@@ -123,6 +124,7 @@ export const TOOLS = [
     project_name: string('Human-readable project name.'),
     description: string('Concrete product brief for the new project.'),
     default_branch: string('Initial branch name; defaults to main.'),
+    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'project_name', 'description']), { destructiveHint: false, idempotentHint: true }),
 
   tool('theater_doctor', 'Check Feature Theater', 'Check the local Git, Node, Codex, state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
@@ -235,18 +237,18 @@ export const TOOLS = [
     summary: string('Optional concise promotion disposition.'),
   }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
 
-  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific GPT-6 Astra Codex task with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call theater_work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
+  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Astra Codex task, or a Claude Code session when theater.json sets harness to claude) with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call theater_work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
     ...workspace,
     ...feature,
     instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),
-    effort: string('GPT-6 Astra reasoning effort.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
+    effort: string('Worker reasoning effort.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
     force_new_session: boolean('Create a replacement task instead of resuming the recorded one.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
   tool('theater_agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
     ...workspace,
     ...feature,
-    include_thread: boolean('Read the persisted native Codex task as well as local Theater state.'),
+    include_thread: boolean('Read the persisted native worker task as well as local Theater state.'),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
 
   tool('theater_agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. This does not claim work items. Before dispatching or resuming an existing bounded item, claim its exact key as running under a stable owner with theater_work_update, then include its key and outcome in instruction; do not claim unrelated ready items.', object({

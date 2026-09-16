@@ -25,7 +25,9 @@ Planning cannot declare execution complete. Required commands execute through th
 
 ## Context lifecycle
 
-Every feature has its own persisted Codex thread. The runtime starts it at the feature checkout with GPT-6 Astra and injects a feature-specific developer contract. The feature task reads the repository's own instructions and only that lane's spec/context. Worker app-server processes disable apps, hooks, plugins, browser/computer control, and every configured external MCP server. The Theater coordinator cannot appear recursively and external integrations remain coordinator-owned.
+Every feature has its own persisted worker session. The runtime starts it at the feature checkout and injects a feature-specific developer contract. The feature task reads the repository's own instructions and only that lane's spec/context. Worker processes disable apps, hooks, plugins, browser/computer control, and every configured external MCP server. The Theater coordinator cannot appear recursively and external integrations remain coordinator-owned.
+
+`theater.json` selects the worker harness. The default is a Codex app-server thread running GPT-6 Astra; `"harness": "claude"` runs each turn as a non-interactive Claude Code process resumed by session ID. A router in `app-server.mjs` binds every thread to the backend that created it, so a workspace only launches the harness it uses and a backend exit affects only its own lanes. Both backends emit the same safe event vocabulary (turn started, visible message, working diff, turn completed), and the Claude backend derives the diff from Git rather than from tool arguments.
 
 Each start or steer schedules one bounded turn. The coordinator reconciles its visible handoff with Git and evidence before deciding whether to continue, rather than attaching an unbounded native goal loop that can retry work against stale orchestration state.
 

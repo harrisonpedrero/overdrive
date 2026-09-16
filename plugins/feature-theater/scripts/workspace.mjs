@@ -115,7 +115,7 @@ function markdownCell(value) {
 
 async function ensureWorkspaceFiles(root, config) {
   const coordinatorConfig = contained(root, '.codex', 'config.toml');
-  if (!await exists(coordinatorConfig)) await atomicWrite(root, coordinatorConfig, 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n');
+  if (config?.harness !== 'claude' && !await exists(coordinatorConfig)) await atomicWrite(root, coordinatorConfig, 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n');
   const ignoreFile = contained(root, '.gitignore');
   const required = [
     'features/',
@@ -150,7 +150,7 @@ Before each turn, read:
 
 1. ${contextFile}
 2. ${specFile}
-3. the repository's applicable AGENTS.md and other local instructions under repo/
+3. the repository's applicable AGENTS.md, CLAUDE.md and other local instructions under repo/
 
 Use the durable work graph in the context packet to choose the next useful work. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit Feature Theater state files directly. Do not put coordination artifacts into application commits.
 
@@ -295,17 +295,41 @@ function partialInitializationError() {
   return new TheaterError('A partial .theater directory already exists. Inspect it before retrying initialization.', 'PARTIAL_INITIALIZATION');
 }
 
-export async function initializeWorkspace({ workspace_path, repository }) {
+const HARNESSES = new Set(['codex', 'claude']);
+
+function harnessAddition(harness) {
+  if (harness === undefined) return {};
+  if (!HARNESSES.has(harness)) throw new TheaterError('harness must be codex or claude.', 'INVALID_INPUT');
+  return { harness };
+}
+
+// theater.json selects the lane worker harness; `claude.model`, `claude.laneModels[slug]`
+// and the permission fields apply only when harness is claude.
+export function workerHarness(config, slug) {
+  const harness = config.harness ?? 'codex';
+  if (!HARNESSES.has(harness)) throw new TheaterError(`theater.json harness must be codex or claude, not ${JSON.stringify(harness)}.`, 'INVALID_STATE');
+  if (harness === 'codex') return { harness, workerModel: 'gpt-6-astra', harnessOptions: {} };
+  const settings = config.claude && typeof config.claude === 'object' && !Array.isArray(config.claude) ? config.claude : {};
+  const laneModels = settings.laneModels && typeof settings.laneModels === 'object' ? settings.laneModels : {};
+  const model = laneModels[slug] ?? settings.model ?? null;
+  if (model !== null && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) throw new TheaterError('theater.json claude.model and claude.laneModels values must be model names.', 'INVALID_STATE');
+  const { model: _model, laneModels: _laneModels, ...harnessOptions } = settings;
+  return { harness, workerModel: model, harnessOptions };
+}
+
+export async function initializeWorkspace({ workspace_path, repository, harness }) {
   const root = await resolveWorkspace(workspace_path);
+  const additions = harnessAddition(harness);
   const normalized = await normalizeRepositorySource(repository);
   const existingConfig = contained(root, 'theater.json');
   if (await exists(existingConfig)) return await existingInitialization(root, normalized);
   if (await exists(contained(root, '.theater'))) throw partialInitializationError();
-  return await withWorkspaceLock(root, 'initialize', () => initializeSource(root, normalized));
+  return await withWorkspaceLock(root, 'initialize', () => initializeSource(root, normalized, additions));
 }
 
-export async function initializeManagedProject({ workspace_path, project_name, description, default_branch = 'main' }) {
+export async function initializeManagedProject({ workspace_path, project_name, description, default_branch = 'main', harness }) {
   const root = await resolveWorkspace(workspace_path);
+  const additions = harnessAddition(harness);
   const name = requiredText(project_name, 'project_name', { max: 200 });
   if (/\r|\n/.test(name)) throw new TheaterError('project_name must be one line.', 'INVALID_INPUT');
   const brief = requiredText(description, 'description', { max: 50_000 });
@@ -344,6 +368,7 @@ export async function initializeManagedProject({ workspace_path, project_name, d
     ], { cwd: project });
     const normalized = await normalizeRepositorySource(project);
     const result = await initializeSource(root, normalized, {
+      ...additions,
       managedProject: { name, description: brief, path: project, defaultBranch: branch },
     });
     return result;
@@ -358,6 +383,7 @@ export function overview(ctx) {
     defaultBranch: ctx.config.defaultBranch,
     defaultRevision: ctx.config.defaultRevision,
     model: ctx.config.model,
+    harness: ctx.config.harness ?? 'codex',
     managedProject: ctx.config.managedProject
       ? {
           name: ctx.config.managedProject.name,
@@ -1049,6 +1075,7 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
       agentFile: contained(ctx.root, 'features', row.slug, 'AGENTS.md'),
       work: packet.work,
       developerInstructions: featureAgentInstructions(ctx.root, row),
+      ...workerHarness(ctx.config, row.slug),
     };
   });
 }

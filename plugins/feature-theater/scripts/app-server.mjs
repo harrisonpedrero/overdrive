@@ -2,8 +2,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import fsSync from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { TheaterError } from './util.mjs';
+import { ClaudeWorkerBridge } from './claude-worker.mjs';
 
 const DEFAULT_REQUEST_TIMEOUT = 120_000;
+const HARNESSES = new Set(['codex', 'claude']);
 const WORKER_CONFIG_OVERRIDES = [
   'features.plugins=false',
   'features.apps=false',
@@ -276,6 +278,70 @@ export class CodexAppServer extends EventEmitter {
     if (!child) return;
     this.#failed(new TheaterError('Codex app-server connection closed.', 'CODEX_CLOSED'));
     if (!child.killed) child.kill();
+  }
+}
+
+// Routes each feature thread to the harness backend that owns it. Backends start lazily,
+// so a Claude-only workspace never launches a Codex app-server and vice versa.
+export class WorkerBridge extends EventEmitter {
+  constructor({ codex, claude } = {}) {
+    super();
+    this.factories = { codex: () => new CodexAppServer(codex), claude: () => new ClaudeWorkerBridge(claude) };
+    this.backends = new Map();
+    this.threads = new Map();
+  }
+
+  backend(harness = 'codex') {
+    if (!HARNESSES.has(harness)) throw new TheaterError(`Unknown worker harness: ${harness}`, 'INVALID_STATE');
+    let backend = this.backends.get(harness);
+    if (backend) return backend;
+    backend = this.factories[harness]();
+    backend.on('notification', message => this.emit('notification', message));
+    backend.on('serverRequest', message => this.emit('serverRequest', message));
+    backend.on('exit', (error, threadIds) => {
+      const owned = threadIds ?? [...this.threads].filter(([, owner]) => owner === harness).map(([threadId]) => threadId);
+      for (const threadId of owned) this.threads.delete(threadId);
+      this.emit('exit', error, owned);
+    });
+    this.backends.set(harness, backend);
+    return backend;
+  }
+
+  async ensureStarted() {}
+
+  async startThread({ harness = 'codex', ...params }) {
+    const response = await this.backend(harness).startThread(params);
+    this.threads.set(response.thread.id, harness);
+    return response;
+  }
+
+  async resumeThread({ harness = 'codex', ...params }) {
+    const response = await this.backend(harness).resumeThread(params);
+    this.threads.set(params.threadId, harness);
+    return response;
+  }
+
+  async request(method, { harness, ...params } = {}) {
+    return await this.backend(this.threads.get(params.threadId) ?? harness).request(method, params);
+  }
+
+  liveRequest(requestId) {
+    for (const backend of this.backends.values()) {
+      const request = backend.liveRequest(requestId);
+      if (request) return request;
+    }
+    return null;
+  }
+
+  respondToServer(requestId, result, error = undefined) {
+    for (const backend of this.backends.values()) {
+      if (backend.liveRequest(requestId)) return backend.respondToServer(requestId, result, error);
+    }
+    throw new TheaterError(`Worker request is no longer live: ${requestId}`, 'REQUEST_ORPHANED');
+  }
+
+  shutdown() {
+    for (const backend of this.backends.values()) backend.shutdown();
   }
 }
 

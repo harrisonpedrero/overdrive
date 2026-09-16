@@ -8,7 +8,7 @@ Feature Theater is a native Codex plugin for running several product ideas again
 2. Adopt code with `Use Feature Theater with https://github.com/owner/repository.git`, or start fresh with `Start a new Feature Theater project called Atlas that helps teams triage incidents.`
 3. Then ask for a feature in ordinary language, for example: `Create a search-redesign lane, help me refine the spec, then start it.`
 
-The coordinator can create isolated clones, revise versioned specs, maintain a dependency graph, launch or resume per-feature Codex tasks, inspect safe progress, steer an active turn, record evidence, and switch focus. Each feature task receives only its own spec and checkpoint packet plus the repository's own instructions. Worker processes disable apps, hooks, plugins, browser/computer control, and configured external MCP servers. That prevents recursive Theater calls and keeps external authority in the coordinator.
+The coordinator can create isolated clones, revise versioned specs, maintain a dependency graph, launch or resume per-feature worker tasks, inspect safe progress, steer an active turn, record evidence, and switch focus. Each feature task receives only its own spec and checkpoint packet plus the repository's own instructions. Worker processes disable apps, hooks, plugins, browser/computer control, and configured external MCP servers. That prevents recursive Theater calls and keeps external authority in the coordinator. Workers run under Codex by default; setting `"harness": "claude"` in `theater.json` runs them as isolated Claude Code sessions instead (see the operator guide).
 
 Useful requests include:
 

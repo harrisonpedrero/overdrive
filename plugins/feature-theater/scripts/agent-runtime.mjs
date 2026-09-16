@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CodexAppServer, finalVisibleMessage } from './app-server.mjs';
+import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
 import { summarizePatch, TheaterError, optionalText, parseJsonObject, requiredText, redactString } from './util.mjs';
 import { withAgentControl } from './ownership.mjs';
 import {
@@ -15,7 +15,7 @@ import {
   queueCompaction,
 } from './workspace.mjs';
 
-export function createAgentRuntime(bridge = new CodexAppServer()) {
+export function createAgentRuntime(bridge = new WorkerBridge()) {
 const ownerToken = randomUUID();
 const registrations = new Map();
 const turnMessages = new Map();
@@ -207,24 +207,30 @@ bridge.on('serverRequest', message => { void enqueueStateWork(() => onServerRequ
 bridge.on('notification', message => {
   void enqueueStateWork(() => onNotification(message));
 });
-bridge.on('exit', error => {
+bridge.on('exit', (error, threadIds = null) => {
   notificationQueue = notificationQueue.then(async () => {
-  for (const waiter of compactionWaiters.values()) {
+  // A backend exit only affects the threads it owned; other harness lanes keep running.
+  const affected = threadIds ? threadIds.filter(threadId => registrations.has(threadId)) : [...registrations.keys()];
+  for (const [threadId, waiter] of compactionWaiters) {
+    if (threadIds && !threadIds.includes(threadId)) continue;
     clearTimeout(waiter.timer);
+    compactionWaiters.delete(threadId);
     waiter.reject(error);
   }
-  compactionWaiters.clear();
-  for (const [threadId, registration] of registrations) {
+  for (const threadId of affected) {
+    const registration = registrations.get(threadId);
+    registrations.delete(threadId);
     const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
     const runtime = await featureRuntime({ ...base, allow_inactive: true }).catch(() => null);
     const interrupted = Boolean(runtime?.feature.active_turn_id || runtime?.feature.agent_status === 'waiting_for_user');
-    await saveAgentSession({ ...base, thread_id: threadId, turn_id: null, status: interrupted ? 'disconnected' : 'idle', ...(interrupted ? { summary: `Codex app-server disconnected: ${redactString(error.message)}` } : {}) }).catch(() => {});
+    await saveAgentSession({ ...base, thread_id: threadId, turn_id: null, status: interrupted ? 'disconnected' : 'idle', ...(interrupted ? { summary: `Worker bridge disconnected: ${redactString(error.message)}` } : {}) }).catch(() => {});
   }
-  registrations.clear();
-  turnMessages.clear();
-  turnPlans.clear();
-  turnDiffs.clear();
-  compactionTurns.clear();
+  if (!threadIds) {
+    turnMessages.clear();
+    turnPlans.clear();
+    turnDiffs.clear();
+    compactionTurns.clear();
+  }
   }).catch(() => {});
 });
 
@@ -232,12 +238,17 @@ function runtimeRoots(runtime) {
   return [runtime.feature.checkout_path, path.dirname(runtime.contextPath)];
 }
 
+function harnessParams(runtime) {
+  return { harness: runtime.harness, model: runtime.workerModel, harnessOptions: runtime.harnessOptions };
+}
+
 function runPrompt(runtime, instruction) {
   const direction = optionalText(instruction, 'instruction', { max: 100_000 }) || runtime.feature.next_action || 'Choose and complete the highest-priority ready work.';
   return `Continue the ${runtime.feature.slug} feature lane.\n\nUser/coordinator direction:\n${direction}\n\nFirst load the feature context and spec named in your developer instructions, then inspect current Git state. Reconcile the request with the durable work graph. Work toward the smallest coherent verified result; do not silently broaden scope. Keep visible progress updates safe and concise. End with a handoff containing the exact resulting revision or dirty-state description, checks actually run and their outcomes, unresolved issues, and the next useful action. Do not include private chain-of-thought.`;
 }
 
-async function compactThreadAndWait(threadId) {
+async function compactThreadAndWait(runtime) {
+  const threadId = runtime.feature.thread_id;
   if (compactionWaiters.has(threadId)) throw new TheaterError(`Compaction is already running for ${threadId}.`, 'COMPACTION_ACTIVE');
   let resolve;
   let reject;
@@ -248,7 +259,7 @@ async function compactThreadAndWait(threadId) {
   const timer = setTimeout(() => reject(new TheaterError(`Timed out waiting for thread compaction: ${threadId}`, 'CODEX_TIMEOUT')), 180_000);
   compactionWaiters.set(threadId, { resolve, reject, timer, compacted: false, turnCompleted: false });
   try {
-    await Promise.all([bridge.request('thread/compact/start', { threadId }), completion]);
+    await Promise.all([bridge.request('thread/compact/start', { threadId, harness: runtime.harness }), completion]);
   } catch (error) {
     clearTimeout(timer);
     compactionWaiters.delete(threadId);
@@ -259,6 +270,7 @@ async function compactThreadAndWait(threadId) {
 async function resume(runtime) {
   if (registrations.has(runtime.feature.thread_id)) return;
   const response = await bridge.resumeThread({
+    ...harnessParams(runtime),
     threadId: runtime.feature.thread_id,
     cwd: runtime.feature.checkout_path,
     runtimeWorkspaceRoots: runtimeRoots(runtime),
@@ -273,7 +285,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   await enqueueStateWork(() => saveAgentSession({ ...base, status: 'starting', compacted: created && runtime.feature.compaction_pending }));
   try {
     const result = await bridge.request('turn/start', {
-      threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
+      harness: runtime.harness, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
       runtimeWorkspaceRoots: runtimeRoots(runtime), model: 'gpt-6-astra', effort, summary: 'concise',
     });
     await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_starting: true }));
@@ -295,20 +307,20 @@ async function startOwned({ workspace_path, feature, instruction, effort = 'high
   if (threadId && !force_new_session) {
     await resume(runtime);
     if (runtime.feature.compaction_pending) {
-      await compactThreadAndWait(threadId);
+      await compactThreadAndWait(runtime);
     }
   } else {
     const started = await bridge.startThread({
+      ...harnessParams(runtime),
       cwd: runtime.feature.checkout_path,
       runtimeWorkspaceRoots: runtimeRoots(runtime),
       developerInstructions: runtime.developerInstructions,
-      model: 'gpt-6-astra',
       effort,
     });
     threadId = started.thread.id;
     created = true;
     register(threadId, runtime.root, runtime.feature.slug);
-    await bridge.request('thread/name/set', { threadId, name: `Theater · ${runtime.feature.title}` }).catch(() => {});
+    await bridge.request('thread/name/set', { harness: runtime.harness, threadId, name: `Theater · ${runtime.feature.title}` }).catch(() => {});
   }
   const turn = await dispatchTurn(runtime, threadId, instruction, effort, created);
   return {
@@ -316,7 +328,8 @@ async function startOwned({ workspace_path, feature, instruction, effort = 'high
     threadId,
     turnId: turn.turn.id,
     createdSession: created,
-    model: 'gpt-6-astra',
+    harness: runtime.harness,
+    model: runtime.workerModel ?? 'harness-default',
     effort,
     checkoutPath: runtime.feature.checkout_path,
     next: 'The feature task is running. Use theater_agent_inspect for safe progress or theater_agent_steer to revise direction mid-turn.',
@@ -334,6 +347,7 @@ async function steerOwned({ workspace_path, feature, instruction, effort = 'high
   let mode;
   if (runtime.feature.active_turn_id) {
     result = await bridge.request('turn/steer', {
+      harness: runtime.harness,
       threadId: runtime.feature.thread_id,
       expectedTurnId: runtime.feature.active_turn_id,
       input: textInput(direction),
@@ -341,7 +355,7 @@ async function steerOwned({ workspace_path, feature, instruction, effort = 'high
     mode = 'mid_turn';
   } else {
     if (runtime.feature.compaction_pending) {
-      await compactThreadAndWait(runtime.feature.thread_id);
+      await compactThreadAndWait(runtime);
     }
     result = await dispatchTurn(runtime, runtime.feature.thread_id, direction, effort);
     mode = 'new_turn';
@@ -368,7 +382,7 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   if (include_thread && runtime.feature.thread_id) {
     try {
       await bridge.ensureStarted();
-      const response = await bridge.request('thread/read', { threadId: runtime.feature.thread_id, includeTurns: true });
+      const response = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
       thread = safeThreadView(response.thread);
       const active = response.thread.turns?.find(turn => turn.id === runtime.feature.active_turn_id);
       if (active && ['completed', 'interrupted', 'failed'].includes(active.status)) {
@@ -437,7 +451,7 @@ async function compactOwned({ workspace_path, feature }) {
   await resume(runtime);
   await enqueueStateWork(() => saveAgentSession({ workspace_path, feature, thread_id: runtime.feature.thread_id, owner_token: ownerToken, status: 'compacting' }));
   try {
-    await compactThreadAndWait(runtime.feature.thread_id);
+    await compactThreadAndWait(runtime);
   } catch (error) {
     await enqueueStateWork(async () => {
       const current = await featureRuntime({ workspace_path, feature, allow_inactive: true });
@@ -457,7 +471,7 @@ async function interruptOwned({ workspace_path, feature }) {
   if (!runtime.feature.thread_id || !runtime.feature.active_turn_id) return { interrupted: false, reason: 'No active turn.' };
   await bridge.ensureStarted();
   await resume(runtime);
-  await bridge.request('turn/interrupt', { threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id });
+  await bridge.request('turn/interrupt', { harness: runtime.harness, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id });
   await recordAgentEvent({ workspace_path: runtime.root, feature: runtime.feature.slug, kind: 'coordinator.interrupted', summary: `Interrupted active turn ${runtime.feature.active_turn_id}.`, details: {} });
   return { interrupted: true, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id };
 }
