@@ -47,6 +47,12 @@ Use `theater_agents_wait` to receive the first handoff among up to eight unrecon
 
 For Theater-owned workers, reconcile liveness through their owning Theater controller. An app task view reporting `notLoaded` or `interrupted` does not by itself establish that this controller's active turn stopped; compare the exact turn and controller state before recovery or redispatch. If refresh fails, preserve that uncertainty instead of declaring completion or starting a competing worker.
 
+## Claude Code installation
+
+`plugins/feature-theater-claude/` packages the coordinator for Claude Code: the `feature-theater` skill (the Codex skill rewritten without Codex-only mechanics) and an inline MCP declaration that launches the shared server from `plugins/feature-theater/scripts/server.mjs`. The plugin references that server through `${CLAUDE_PLUGIN_ROOT}/../feature-theater/`, so it must stay inside this repository checkout; the repository root also carries `.claude-plugin/marketplace.json` for a local marketplace named `feature-theater-local`.
+
+Validate with `claude plugin validate plugins/feature-theater-claude`. For one session, start Claude Code with `--plugin-dir C:\path\to\feature-theater\plugins\feature-theater-claude`. To install persistently, run `/plugin marketplace add C:\path\to\feature-theater` once, then `/plugin install feature-theater@feature-theater-local` (or `claude plugin install feature-theater@feature-theater-local --scope user`). A control workspace that already declares `feature_theater` in its own `.mcp.json` should remove that entry when the plugin is installed, otherwise the server is loaded twice with duplicate tools; a workspace that wants only the skill can instead copy `plugins/feature-theater-claude/skills/feature-theater/` into its `.claude/skills/` directory. Agent tools must be called through the session's MCP connection: a one-shot stdio client that exits after each call terminates the worker turn it started.
+
 ## Deliver progressively
 
 For multi-feature work, use the integration lane as an evolving deliverable. Start with the smallest coherent reviewed set of exact inputs and add later inputs as they become ready. A missing input blocks only behavior that depends on it; retain the complete final acceptance gate. An intermediate combined preview is not a release-ready candidate.

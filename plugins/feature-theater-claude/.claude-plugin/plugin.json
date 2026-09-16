@@ -1,0 +1,15 @@
+{
+  "name": "feature-theater",
+  "version": "0.1.0",
+  "description": "Coordinate isolated feature clones, durable specs, live worker steering and executed verification from Claude Code.",
+  "author": {
+    "name": "Harrison Pedrero"
+  },
+  "keywords": ["orchestration", "feature-lanes", "verification"],
+  "mcpServers": {
+    "feature_theater": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/../feature-theater/scripts/server.mjs"]
+    }
+  }
+}
