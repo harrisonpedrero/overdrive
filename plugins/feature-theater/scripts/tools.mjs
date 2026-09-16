@@ -157,7 +157,7 @@ export const TOOLS = [
     rationale: string('Concise reason this revision changed.'),
   }, ['workspace_path', 'feature', 'content']), { destructiveHint: false }),
 
-  tool('theater_work_plan', 'Reconcile feature work graph', 'Upsert bounded work items and their dependencies. Existing completed work cannot be silently reopened; represent regressions or follow-up as repair work.', object({
+  tool('theater_work_plan', 'Reconcile feature work graph', 'Upsert bounded work items and their dependencies. Returns only submitted work items with current feature progress and next action; use theater_feature_get for all work or theater_view for the graph. Existing completed work cannot be silently reopened; represent regressions or follow-up as repair work.', object({
     ...workspace,
     ...feature,
     items: {

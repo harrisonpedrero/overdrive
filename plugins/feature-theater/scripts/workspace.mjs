@@ -676,7 +676,8 @@ export async function planWork({ workspace_path, feature, items }) {
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
-      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id), next: 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.' };
+      const submittedKeys = new Set(normalized.map(item => item.key));
+      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => submittedKeys.has(item.item_key)), next: 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.' };
     } finally { ctx.db.close(); }
   });
 }
