@@ -235,7 +235,7 @@ export const TOOLS = [
     summary: string('Optional concise promotion disposition.'),
   }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
 
-  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific GPT-6 Astra Codex task with only that feature context and the repository instructions.', object({
+  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific GPT-6 Astra Codex task with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call theater_work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
     ...workspace,
     ...feature,
     instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),
@@ -249,7 +249,7 @@ export const TOOLS = [
     include_thread: boolean('Read the persisted native Codex task as well as local Theater state.'),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle.', object({
+  tool('theater_agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. This does not claim work items. Before dispatching or resuming an existing bounded item, claim its exact key as running under a stable owner with theater_work_update, then include its key and outcome in instruction; do not claim unrelated ready items.', object({
     ...workspace,
     ...feature,
     instruction: string('Clear replacement, correction, constraint, or follow-up direction.'),
