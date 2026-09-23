@@ -178,6 +178,11 @@ export async function drainCheckQueue(args) {
             job.reason = `Waiting for: ${dependencies.filter(item => item.status !== 'passed').map(item => `${item.key} (${item.status})`).join(', ')}`;
             continue;
           }
+          // A command still using a clone can leave transient files there; judge that clone only after the command settles.
+          if (queue.jobs.some(other => reserving(other) && overlaps(job, other))
+            || dependencies.some(dependency => queue.jobs.some(other => other.status === 'running' && other.featureId === dependency.featureId))) {
+            job.eligibleAt ??= now(); job.reason = 'Waiting for a reserved clone or shared resource.'; continue;
+          }
           try {
             for (const dependency of dependencies) {
               const dependencyFeature = await binding(ctx, dependency);
@@ -192,7 +197,6 @@ export async function drainCheckQueue(args) {
             continue;
           }
           job.eligibleAt ??= now();
-          if (queue.jobs.some(other => reserving(other) && overlaps(job, other))) { job.reason = 'Waiting for a reserved clone or shared resource.'; continue; }
           if (executing.size + selected.length >= parallel || started.length + selected.length >= maximum || Date.now() >= deadline) continue;
           job.status = 'running'; job.reason = null;
           const startedAt = now();
