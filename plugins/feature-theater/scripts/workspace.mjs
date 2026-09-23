@@ -753,7 +753,8 @@ export async function updateSpec({ workspace_path, feature, content, rationale =
         invalidateCandidates(ctx.db, row.id);
         ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, ?, ?, ?, ?)')
           .run(newId('spec'), row.id, revision, cleanContent, cleanRationale, stamp);
-        ctx.db.prepare('UPDATE features SET spec_revision = ?, updated_at = ?, next_action = ? WHERE id = ?')
+        // A historical edit leaves an archived lane's terminal or checkpointed direction in place.
+        ctx.db.prepare("UPDATE features SET spec_revision = ?, updated_at = ?, next_action = CASE WHEN status = 'archived' THEN next_action ELSE ? END WHERE id = ?")
           .run(revision, stamp, 'Reconcile the work graph with the revised specification.', row.id);
         bumpSemanticGeneration(ctx.db, row.id);
       });
@@ -835,7 +836,8 @@ function workGraphAction(items) {
 
 // Refresh the stored direction only while it is still a work-graph default. Spec revisions,
 // candidates, promotion, done/archived lifecycle and any checkpoint saved since the last
-// derivation keep their deliberately chosen text. Event ids give the exact order; timestamps can tie.
+// derivation keep their deliberately chosen text. Plans made while archived derive nothing.
+// Event ids give the exact order; timestamps can tie.
 function refreshWorkAction(db, featureId, previousItems) {
   const feature = db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(featureId);
   if (['done', 'archived'].includes(feature.status)) return null;
@@ -843,7 +845,9 @@ function refreshWorkAction(db, featureId, previousItems) {
   if (stored !== READY_WORK_ACTION && stored !== workGraphAction(previousItems)) return null;
   const latest = db.prepare(`
     SELECT kind, json_extract(details_json, '$.nextAction') AS next_action FROM events
-    WHERE feature_id = ? AND (kind IN ('feature.checkpointed', 'work.planned') OR (kind LIKE 'work.%' AND json_extract(details_json, '$.nextAction') IS NOT NULL))
+    WHERE feature_id = ? AND (kind = 'feature.checkpointed'
+      OR (kind = 'work.planned' AND json_extract(details_json, '$.directionKept') IS NULL)
+      OR (kind LIKE 'work.%' AND json_extract(details_json, '$.nextAction') IS NOT NULL))
     ORDER BY id DESC LIMIT 1
   `).get(featureId);
   if (latest?.kind === 'feature.checkpointed' && latest.next_action === stored) return null;
@@ -885,6 +889,7 @@ export async function planWork({ workspace_path, feature, items }) {
       const previousContract = featureContract(ctx.db, row);
       const stamp = now();
       let nextAction;
+      let archived = false;
       transaction(ctx.db, () => {
         const existing = workItems(ctx.db, row.id);
         const byKey = new Map(existing.map(item => [item.item_key, item]));
@@ -929,17 +934,25 @@ export async function planWork({ workspace_path, feature, items }) {
         validateWorkGraph(ctx.db, row.id);
         if (reconcileReady(ctx.db, row.id)) changed = true;
         if (previousContract !== featureContract(ctx.db, row) && invalidateCandidates(ctx.db, row.id)) changed = true;
-        nextAction = workGraphAction(workItems(ctx.db, row.id));
-        if (ctx.db.prepare('SELECT next_action FROM features WHERE id = ?').get(row.id).next_action !== nextAction) changed = true;
-        ctx.db.prepare('UPDATE features SET next_action = ?, updated_at = ? WHERE id = ?').run(nextAction, stamp, row.id);
+        // An archived lane keeps its terminal or checkpointed direction until it is reactivated.
+        const saved = ctx.db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(row.id);
+        archived = saved.status === 'archived';
+        if (!archived) {
+          nextAction = workGraphAction(workItems(ctx.db, row.id));
+          if (saved.next_action !== nextAction) changed = true;
+        }
+        ctx.db.prepare('UPDATE features SET next_action = COALESCE(?, next_action), updated_at = ? WHERE id = ?').run(nextAction ?? null, stamp, row.id);
         if (changed) bumpSemanticGeneration(ctx.db, row.id);
       });
-      await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key), nextAction } });
+      await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key), ...(archived ? { directionKept: true } : { nextAction }) } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
       const submittedKeys = new Set(normalized.map(item => item.key));
-      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => submittedKeys.has(item.item_key)), next: 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.' };
+      const next = archived
+        ? `${slug} is archived; reactivate it with theater_feature_status before claiming or dispatching its work.`
+        : 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.';
+      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => submittedKeys.has(item.item_key)), next };
     } finally { ctx.db.close(); }
   });
 }

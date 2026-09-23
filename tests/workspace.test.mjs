@@ -486,6 +486,84 @@ test('archiving gives unused and reviewed lanes a terminal direction that a late
   assert.equal((await setFeatureStatus({ ...unused, status: 'active' })).feature.nextAction, 'Revive only after the parser rewrite lands.');
 });
 
+test('spec and work edits keep an archived lane archived until it is reactivated', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-archive-edit-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const lane = { workspace_path: workspace, feature: 'edited' };
+  const noted = { workspace_path: workspace, feature: 'noted' };
+  const plan = [{ key: 'readme', title: 'Write the README' }];
+  const inspect = slug => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    try {
+      const row = db.prepare('SELECT id, spec_revision, semantic_generation FROM features WHERE slug = ?').get(slug);
+      const candidates = db.prepare('SELECT status FROM candidates WHERE feature_id = ?').all(row.id).map(candidate => candidate.status);
+      return { spec: Number(row.spec_revision), generation: Number(row.semantic_generation), candidates };
+    } finally { db.close(); }
+  };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Archive edits', description: 'Exercise edits to archived lanes.' });
+  await createFeature({ ...lane, title: 'Edited', outcome: 'A reviewed candidate.', spec: '# Edited\n\nThe README exists.' });
+  await planWork({ ...lane, items: plan });
+  await updateChecks({ ...lane, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(lane)).verification.ready, true);
+  await recordCandidate({ ...lane, summary: 'Ready.', checks: ['readme receipt'] });
+  await setFeatureStatus({ ...lane, status: 'archived', disposition: 'Superseded by another lane.' });
+  agreeOn(await directions(workspace, 'edited'), ARCHIVED);
+
+  // Resubmitting the same plan is no lane change and keeps the terminal direction.
+  const archived = inspect('edited');
+  const resubmitted = await planWork({ ...lane, items: plan });
+  assert.equal(resubmitted.feature.nextAction, ARCHIVED);
+  assert.match(resubmitted.next, /reactivate/i);
+  assert.doesNotMatch(resubmitted.next, /Claim/);
+  assert.deepEqual(inspect('edited'), archived);
+  agreeOn(await directions(workspace, 'edited'), ARCHIVED);
+
+  // Legacy archives stored the candidate review text; an unchanged plan still reads as archived.
+  const review = 'Review or integrate the exact recorded candidate.';
+  let db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  db.prepare("UPDATE features SET next_action = ? WHERE slug = 'edited'").run(review);
+  db.close();
+  await planWork({ ...lane, items: plan });
+  agreeOn(await directions(workspace, 'edited'), ARCHIVED);
+  assert.equal((await setFeatureStatus({ ...lane, status: 'active' })).feature.nextAction, review);
+  await setFeatureStatus({ ...lane, status: 'archived', disposition: 'Superseded again.' });
+  agreeOn(await directions(workspace, 'edited'), ARCHIVED);
+
+  // A spec revision still supersedes the candidate and advances the lane, but not its direction.
+  const beforeSpec = inspect('edited');
+  assert.equal((await updateSpec({ ...lane, content: '# Edited\n\nThe README also describes startup.', rationale: 'Historical correction.' })).changed, true);
+  const revised = inspect('edited');
+  assert.equal(revised.spec, beforeSpec.spec + 1);
+  assert.ok(revised.generation > beforeSpec.generation);
+  assert.deepEqual(revised.candidates, ['superseded']);
+  agreeOn(await directions(workspace, 'edited'), ARCHIVED);
+  const followUp = await planWork({ ...lane, items: [...plan, { key: 'startup', title: 'Describe startup' }] });
+  assert.match(followUp.next, /reactivate/i);
+  assert.ok(inspect('edited').generation > revised.generation);
+  agreeOn(await directions(workspace, 'edited'), ARCHIVED);
+  // Reactivation restores work-graph guidance; the superseded candidate no longer awaits review.
+  assert.equal((await setFeatureStatus({ ...lane, status: 'active' })).feature.nextAction, 'Start or continue the highest-priority ready work.');
+  assert.match((await planWork({ ...lane, items: plan })).next, /^Claim/);
+
+  // An explicit checkpoint saved after archival survives later spec and work edits and reactivation.
+  const note = 'Revive only after the parser rewrite lands.';
+  await createFeature({ ...noted, title: 'Noted', outcome: 'Parked work.', spec: '# Noted\n\nNothing yet.' });
+  await planWork({ ...noted, items: plan });
+  await setFeatureStatus({ ...noted, status: 'archived', disposition: 'Parked.' });
+  await checkpointFeature({ ...noted, summary: 'Historical note.', next_action: note });
+  await planWork({ ...noted, items: plan });
+  agreeOn(await directions(workspace, 'noted'), note);
+  await updateSpec({ ...noted, content: '# Noted\n\nParser first.', rationale: 'Record the dependency.' });
+  agreeOn(await directions(workspace, 'noted'), note);
+  await planWork({ ...noted, items: [...plan, { key: 'parser', title: 'Adopt the parser' }] });
+  agreeOn(await directions(workspace, 'noted'), note);
+  assert.equal((await setFeatureStatus({ ...noted, status: 'active' })).feature.nextAction, note);
+  db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const events = db.prepare("SELECT kind FROM events WHERE feature_id = (SELECT id FROM features WHERE slug = 'noted') ORDER BY id").all().map(event => event.kind);
+  db.close();
+  assert.deepEqual(events.slice(-6), ['feature.archived', 'feature.checkpointed', 'work.planned', 'spec.revised', 'work.planned', 'feature.active']);
+});
+
 test('rejects repository URLs containing credentials', async t => {
   const { workspace } = await fixture(t);
   await assert.rejects(initializeWorkspace({ workspace_path: workspace, repository: 'https://user:secret@example.com/repo.git' }), /embedded credentials/i);
