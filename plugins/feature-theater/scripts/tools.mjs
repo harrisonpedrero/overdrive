@@ -88,7 +88,8 @@ export const TOOLS = [
   tool('theater_state', 'Observe scoped feature state', 'Read a versioned, bounded data snapshot for a normal conversational reply. Only load selected sections; an overview never loads other specifications or raw logs.', object(state, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
   tool('theater_view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
     ...workspace, ...feature,
-    work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items.' },
+    work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
+    page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
   }, ['workspace_path']), { destructiveHint: false }),
   tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Changes invalidate earlier candidates; execute through theater_checks_run or the verification queue.', object({
     ...workspace, ...feature,

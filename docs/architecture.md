@@ -35,7 +35,7 @@ Per-feature control locks and a persisted process owner prevent competing active
 
 ## Conversation composition
 
-The presentation boundary is a versioned state snapshot and a pure work-graph renderer. `theater_view` returns Mermaid Markdown for actual work dependencies, states, and blockers; the native conversation renders it. Large graphs can focus on selected work keys, with omitted work counted and outside prerequisites labeled. The runtime preserves the snapshot and diagram source. No HTML interface or presentation-side actions are needed.
+The presentation boundary is a versioned state snapshot and a pure work-graph renderer. `theater_view` returns Mermaid Markdown for actual work dependencies, states, and blockers; the native conversation renders it. Graphs above 24 items default to a deterministic 24-item slice that puts work needing action and its prerequisites first; callers can page through that order or focus on selected work keys, with omitted work counted by state and outside prerequisites labeled. The runtime preserves the snapshot and diagram source. No HTML interface or presentation-side actions are needed.
 
 Observation time, omissions, and unavailable data are explicit. The remaining state sections are bounded context for normal replies, not a catalog of UI panels. Steering, switching, questions, and refresh requests stay in the existing conversation. Overviews exclude specifications and command logs; selected detail loads only one feature. The previous embedded controls and multi-panel renderer were removed because they duplicated the host conversation.
 
