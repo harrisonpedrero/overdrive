@@ -612,6 +612,7 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
   const slug = safeSlug(feature);
   const cleanTitle = requiredText(title || slug.replaceAll('-', ' '), 'title', { max: 200 });
   const cleanOutcome = requiredText(outcome, 'outcome', { max: 10_000 });
+  const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
   const baseSlug = base_feature === undefined ? null : safeSlug(base_feature, 'base feature');
   if (baseSlug && (typeof base_revision !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(base_revision))) {
     throw new TheaterError('base_feature requires an explicitly selected full commit ID in base_revision.', 'INVALID_REVISION');
@@ -640,7 +641,6 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const created = now();
       const id = newId('feature');
       const creationCheckpoint = newId('checkpoint');
-      const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
       transaction(ctx.db, () => {
         meta(ctx.db, 'default_revision', refreshed.defaultRevision);
         meta(ctx.db, 'default_branch', refreshed.defaultBranch);

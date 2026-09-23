@@ -82,6 +82,20 @@ test('initializes a repository and creates independent feature lanes', async t =
   assert.equal(listed.features[0].git.clean, true);
 });
 
+test('an invalid spec is rejected before any feature clone and a corrected retry succeeds', async t => {
+  const { source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  const alpha = { workspace_path: workspace, feature: 'alpha', title: 'Alpha', outcome: 'Reject the spec first.' };
+  await assert.rejects(createFeature({ ...alpha, spec: ' \n\t ' }), error => error.code === 'INVALID_INPUT' && /spec/.test(error.message));
+  await assert.rejects(fs.stat(path.join(workspace, 'features', 'alpha')), error => error.code === 'ENOENT');
+  assert.deepEqual((await listFeatures({ workspace_path: workspace })).features, []);
+
+  const created = await createFeature({ ...alpha, spec: '# Alpha\n\nAccepted on retry.' });
+  assert.equal(created.feature.slug, 'alpha');
+  assert.equal(created.feature.specRevision, 1);
+  assert.equal(await fs.readFile(created.specPath, 'utf8'), '# Alpha\n\nAccepted on retry.\n');
+});
+
 test('starts from scratch and promotes an accepted candidate into the next lane base', async t => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-scratch-'));
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
