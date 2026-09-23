@@ -49,7 +49,11 @@ test('claude worker launch is isolated, resumable and free of nested-session mar
   const resumed = workerLaunchArgs({ ...meta, persisted: true }, 'high');
   assert.ok(resumed.includes('--resume') && !resumed.includes('--session-id') && !resumed.includes('--name'));
   const env = workerEnvironment({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_PID: '1', PATH: 'p', ANTHROPIC_BASE_URL: 'u' });
-  assert.deepEqual(Object.keys(env).sort(), ['ANTHROPIC_BASE_URL', 'PATH']);
+  assert.deepEqual(env, { ANTHROPIC_BASE_URL: 'u', PATH: 'p', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' });
+  for (const inherited of [{ CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0' }, { claude_code_disable_auto_memory: '0' }]) {
+    const forced = workerEnvironment({ ...inherited, CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h' });
+    assert.deepEqual(forced, { CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' });
+  }
   assert.throws(() => normalizeWorkerOptions({ permissionMode: 'plan' }), error => error.code === 'INVALID_STATE');
   assert.throws(() => normalizeWorkerOptions({ allowedTools: 'Bash' }), error => error.code === 'INVALID_STATE');
   const custom = normalizeWorkerOptions({ permissionMode: 'bypassPermissions', allowedTools: [], disallowedTools: ['WebFetch'] });
@@ -82,6 +86,7 @@ test('claude harness turn records only visible handoff and working diff, accepts
   for (const flag of ISOLATION_ARGS) assert.ok(launch.args.includes(flag), flag);
   assert.ok(launch.args.includes('--add-dir'));
   assert.ok(!launch.claudeEnv.includes('CLAUDECODE') && !launch.claudeEnv.includes('CLAUDE_CODE_SESSION_ID'));
+  assert.ok(launch.claudeEnv.includes('CLAUDE_CODE_DISABLE_AUTO_MEMORY'));
   assert.equal(path.resolve(launch.cwd), path.resolve(started.checkoutPath));
   const steered = await runtime.steerFeatureAgent({ ...args, instruction: 'Also write the second file.' });
   assert.equal(steered.mode, 'mid_turn');

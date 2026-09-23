@@ -56,8 +56,11 @@ export function workerLaunchArgs(meta, effort) {
   return args;
 }
 
+// Auto-memory lives outside Theater state and would carry notes across replaced sessions or
+// reused checkouts, so it is forced off regardless of any inherited value or key casing.
 export function workerEnvironment(env = process.env) {
-  return Object.fromEntries(Object.entries(env).filter(([key]) => !NESTED_SESSION_ENV.test(key)));
+  const inherited = Object.entries(env).filter(([key]) => !NESTED_SESSION_ENV.test(key) && key.toUpperCase() !== 'CLAUDE_CODE_DISABLE_AUTO_MEMORY');
+  return { ...Object.fromEntries(inherited), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
 }
 
 function launchSpec(override) {
