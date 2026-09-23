@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { checkOutcome } from './check-outcome.mjs';
+import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { assertCheckReservation, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
@@ -132,9 +133,33 @@ function artifactPaths(value = []) {
   return paths;
 }
 
-async function archiveCheckArtifacts(ctx, feature, check, id, revision) {
+async function artifactFiles(root, paths) {
+  const files = new Map();
+  async function visit(relative) {
+    let stat;
+    try { stat = await fs.lstat(contained(root, relative), { bigint: true }); }
+    catch (error) { if (error?.code === 'ENOENT') return; throw error; }
+    if (stat.isDirectory()) for (const entry of await fs.readdir(contained(root, relative))) await visit(`${relative}/${entry}`);
+    else if (stat.isFile()) files.set(relative, stat);
+  }
+  for (const relative of paths) await visit(relative);
+  return files;
+}
+
+// Matching pre/post-run signatures only suggest a file predates the check; see PROVENANCE_NOTE for the limits.
+const fileSignature = stat => stat && `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+const PROVENANCE_NOTE = 'unchangedSinceBeforeRun=true means matching pre-run and post-run stat observations (inode, size, mtime, ctime); it does not guarantee the file was never modified, and content may change between those observations and the archive copy. false or null (snapshot unavailable) is not proof that this check produced the file.';
+
+async function sha256File(file) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+async function archiveCheckArtifacts(ctx, feature, check, id, revision, before) {
   const paths = artifactPaths(check.artifact_paths);
   if (!paths.length) return null;
+  const current = before && await artifactFiles(feature.checkout_path, paths).catch(() => null);
   const directory = await ensureManagedPath(ctx.root, contained(ctx.root, '.theater', 'artifacts', id));
   await fs.mkdir(directory, { recursive: true });
   for (const relative of paths) {
@@ -149,9 +174,14 @@ async function archiveCheckArtifacts(ctx, feature, check, id, revision) {
       },
     });
   }
+  const files = [];
+  for (const [relative, stat] of [...await artifactFiles(path.join(directory, 'files'), paths)].sort(([a], [b]) => a.localeCompare(b))) {
+    const unchangedSinceBeforeRun = current ? before.has(relative) && fileSignature(before.get(relative)) === fileSignature(current.get(relative)) : null;
+    files.push({ path: relative, bytes: Number(stat.size), sha256: await sha256File(contained(directory, 'files', relative)), unchangedSinceBeforeRun });
+  }
   const manifest = path.join(directory, 'manifest.json');
-  await atomicWrite(ctx.root, manifest, `${JSON.stringify({ evidenceId: id, checkKey: check.key, revision, collectedAt: now(), paths }, null, 2)}\n`);
-  return manifest;
+  await atomicWrite(ctx.root, manifest, `${JSON.stringify({ evidenceId: id, checkKey: check.key, revision, collectedAt: now(), paths, provenance: current ? 'stat-snapshot' : 'unavailable', provenanceNote: PROVENANCE_NOTE, files }, null, 2)}\n`);
+  return { manifest, unchanged: files.filter(file => file.unchangedSinceBeforeRun).length };
 }
 
 export async function updateChecks(args) {
@@ -219,18 +249,22 @@ export async function runChecks(args, execution = {}) {
     captureContract(ctx.db, feature, definition);
     const receipts = [];
     for (const check of selectedChecks) {
+      let artifact = null;
+      let artifactError = null;
+      let archived = null;
+      // Extra metadata walk before the command; a failure here only makes provenance unknown.
+      let existing = null;
+      try { existing = await artifactFiles(feature.checkout_path, artifactPaths(check.artifact_paths)); } catch { existing = null; }
       let result;
       try { result = await run(check.argv, { cwd: feature.checkout_path, timeoutMs: check.timeout_seconds * 1000, maxOutput: 500_000, allowFailure: true }); }
       catch (error) { result = { exitCode: null, stderr: error.message, stdout: '', durationMs: 0 }; }
       const id = execution.receiptId ?? newId('evidence');
-      let artifact = null;
-      let artifactError = null;
-      try { artifact = await archiveCheckArtifacts(ctx, feature, check, id, before.head); }
+      try { archived = await archiveCheckArtifacts(ctx, feature, check, id, before.head, existing); artifact = archived?.manifest ?? null; }
       catch (error) { artifactError = redactString(error.message); }
       const after = await repositorySnapshot(feature.checkout_path);
       const unchanged = after.clean && after.head === before.head;
       const passed = result.exitCode === 0 && !result.timedOut && !result.overflow && unchanged && !artifactError;
-      const summary = `${check.purpose}: ${passed ? 'passed' : 'failed'}${result.timedOut ? ' (timed out)' : result.overflow ? ' (output limit)' : !unchanged ? ' (checkout changed during verification)' : ` (exit ${result.exitCode ?? 'unavailable'})`}${artifactError ? ' (artifact collection failed; remaining checks stopped)' : ''}.`;
+      const summary = `${check.purpose}: ${passed ? 'passed' : 'failed'}${result.timedOut ? ' (timed out)' : result.overflow ? ' (output limit)' : !unchanged ? ' (checkout changed during verification)' : ` (exit ${result.exitCode ?? 'unavailable'})`}${artifactError ? ' (artifact collection failed; remaining checks stopped)' : ''}${archived?.unchanged ? ` (${archived.unchanged} archived artifact file(s) unchanged since before this run)` : ''}.`;
       ctx.db.prepare(`INSERT INTO evidence(id, feature_id, kind, summary, command, revision, passed, created_at, source, spec_revision, contract_hash, check_key, argv_json, exit_code, output, duration_ms, artifact)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         id, feature.id, check.kind, summary, redactString(JSON.stringify(check.argv)), before.head, passed ? 1 : 0, now(),
