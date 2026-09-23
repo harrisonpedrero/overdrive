@@ -11,7 +11,7 @@ import { callTool } from '../plugins/feature-theater/scripts/tools.mjs';
 import { git, withWorkspaceLock } from '../plugins/feature-theater/scripts/util.mjs';
 import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
 import { drainCheckQueue, enqueueChecks } from '../plugins/feature-theater/scripts/check-queue.mjs';
-import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards, markDescendantsUnconfirmed, readUnconfirmedDescendants, attestDescendantsStopped } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -187,6 +187,66 @@ test('a Claude worker guard that outlives its completed turn blocks checks and c
   assert.deepEqual(run.receipts.map(receipt => receipt.passed), [true]);
   assert.equal(run.verification.ready, true);
   const recorded = await recordCandidate({ ...args, summary: 'Ready after the worker exited.', checks: ['README receipt'] });
+  assert.equal(recorded.feature.status, 'review');
+  assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => candidate.status), ['ready']);
+});
+
+test('an unconfirmed-descendants marker blocks checks and candidates until an attestation clears it', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-descendants-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'orphans' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Orphans', description: 'Tools can outlive their worker.' });
+  await createFeature({ ...args, title: 'Orphans', outcome: 'Verified only after its tools are confirmed stopped.', spec: '# Orphans\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(args)).verification.ready, true);
+  // The worker was stopped without its process tree and exited, so no guard remains, but tools it
+  // launched may still be running in the checkout.
+  await bindAgentSession({ ...args, thread_id: 'claude-thread', harness: 'claude' });
+  const marker = await markDescendantsUnconfirmed({ ...args, thread_id: 'claude-thread', turn_id: 'turn-1', summary: 'The worker was stopped without its process tree.' });
+  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
+  assert.deepEqual(await readWorkerGuards(args), []);
+  const executedReceipts = () => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    try { return db.prepare("SELECT id FROM evidence WHERE source = 'executed' ORDER BY rowid").all().map(row => row.id); }
+    finally { db.close(); }
+  };
+  const receipts = executedReceipts();
+  const marked = await getFeatureContext(args);
+  await enqueueChecks({ workspace_path: workspace, jobs: [{ key: 'orphans-readme', feature: 'orphans', check_key: 'readme' }] });
+  const deferred = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'orphans-readme');
+  assert.equal(deferred.status, 'queued');
+  assert.equal(deferred.attempts.at(-1).status, 'deferred');
+  assert.match(deferred.reason, /may still be running/);
+  assert.deepEqual(executedReceipts(), receipts);
+  const before = await getFeatureContext(args);
+  // The deferral is recorded as a still-queued job, never as an executed check.
+  assert.deepEqual(before.timeline.slice(1), marked.timeline);
+  assert.equal(before.timeline[0].kind, 'checks.queue_finished');
+  assert.equal(before.timeline[0].details.status, 'queued');
+  assert.equal(before.feature.agent.status, 'idle');
+  assert.equal(before.verification.ready, true);
+  assert.deepEqual(before.candidates, marked.candidates);
+  const orphaned = error => error.code === 'AGENT_BUSY' && error.details?.unconfirmedDescendants === true && error.details?.turnId === 'turn-1'
+    && /may still be running/.test(error.message) && /prior_turn_attestation/.test(error.message);
+  await assert.rejects(runChecks(args), orphaned);
+  await assert.rejects(recordCandidate({ ...args, summary: 'Ready while its tools run.', checks: ['README receipt'] }), orphaned);
+  const after = await getFeatureContext(args);
+  assert.deepEqual(executedReceipts(), receipts);
+  assert.equal(after.feature.status, 'active');
+  assert.equal(after.verification.ready, true);
+  assert.deepEqual(after.candidates, before.candidates);
+  assert.deepEqual(after.timeline, before.timeline);
+  assert.equal((await readUnconfirmedDescendants(args)).generation, marker.generation);
+
+  assert.equal((await attestDescendantsStopped({ ...args, evidence: 'No process runs in the checkout.', generation: marker.generation })).cleared, true);
+  assert.equal(await readUnconfirmedDescendants(args), null);
+  const drained = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'orphans-readme');
+  assert.equal(drained.status, 'passed');
+  assert.deepEqual(executedReceipts(), [...receipts, drained.attempts.at(-1).receiptId]);
+  const run = await runChecks(args);
+  assert.deepEqual(run.receipts.map(receipt => receipt.passed), [true]);
+  assert.equal(run.verification.ready, true);
+  const recorded = await recordCandidate({ ...args, summary: 'Ready after its tools were confirmed stopped.', checks: ['README receipt'] });
   assert.equal(recorded.feature.status, 'review');
   assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => candidate.status), ['ready']);
 });

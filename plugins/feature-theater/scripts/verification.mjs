@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
-import { workersKey } from './ownership.mjs';
+import { unconfirmedDescendants, workersKey } from './ownership.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function featureChecks(db, featureId) {
@@ -65,10 +65,16 @@ export function assertAgentIdle(feature) {
 
 // A Claude worker process can outlive its completed turn and still change the checkout, so an idle
 // lane is verified only once its clean exit or a coordinator attestation has cleared every guard.
+// Tools launched by a worker stopped without its process tree can likewise outlive it, so an
+// unconfirmed-descendants marker blocks verification until an attestation clears it.
 export function assertWorkersStopped(db, feature) {
   const guards = parseJson(meta(db, workersKey(feature.id)), []);
   if (guards.length) {
     throw new TheaterError('A worker process from this lane has not confirmed its exit. Wait for it to stop, or stop the lane with an attestation, before verifying or recording a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
+  }
+  const marker = unconfirmedDescendants(db, feature.id);
+  if (marker) {
+    throw new TheaterError(`Tools launched by a stopped worker of this lane may still be running, so it cannot be verified or record a candidate. Confirm no process is running in its checkout, then pause the lane with theater_feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
   }
 }
 
