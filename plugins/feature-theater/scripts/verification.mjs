@@ -57,7 +57,7 @@ function captureContract(db, feature, definition) {
 }
 
 export function assertAgentIdle(feature) {
-  if (feature.active_turn_id || ['starting', 'running', 'compacting', 'waiting_for_user'].includes(feature.agent_status)) {
+  if (feature.active_turn_id || ['starting', 'uncertain', 'running', 'compacting', 'waiting_for_user'].includes(feature.agent_status)) {
     throw new TheaterError('Wait for the feature agent to stop before changing its contract or verifying a candidate.', 'AGENT_BUSY');
   }
 }

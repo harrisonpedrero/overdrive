@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import fsSync from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { TheaterError } from './util.mjs';
+import { TheaterError, refusedRequest } from './util.mjs';
 import { ClaudeWorkerBridge } from './claude-worker.mjs';
 
 const DEFAULT_REQUEST_TIMEOUT = 120_000;
@@ -154,7 +154,7 @@ export class CodexAppServer extends EventEmitter {
         if (!pending) continue;
         clearTimeout(pending.timer);
         this.pending.delete(String(message.id));
-        if (message.error) pending.reject(new TheaterError(message.error.message || JSON.stringify(message.error), 'CODEX_RPC_ERROR', message.error));
+        if (message.error) pending.reject(refusedRequest(new TheaterError(message.error.message || JSON.stringify(message.error), 'CODEX_RPC_ERROR', message.error)));
         else pending.resolve(message.result);
         continue;
       }
@@ -177,8 +177,8 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async request(method, params, timeoutMs = this.requestTimeoutMs, skipEnsure = false) {
-    if (!skipEnsure) await this.ensureStarted();
-    if (!this.child?.stdin?.writable) throw new TheaterError('Codex app-server is not running.', 'CODEX_NOT_RUNNING');
+    if (!skipEnsure) await this.ensureStarted().catch(error => { throw refusedRequest(error); });
+    if (!this.child?.stdin?.writable) throw refusedRequest(new TheaterError('Codex app-server is not running.', 'CODEX_NOT_RUNNING'));
     const id = this.nextId++;
     const response = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -292,7 +292,7 @@ export class WorkerBridge extends EventEmitter {
   }
 
   backend(harness = 'codex') {
-    if (!HARNESSES.has(harness)) throw new TheaterError(`Unknown worker harness: ${harness}`, 'INVALID_STATE');
+    if (!HARNESSES.has(harness)) throw refusedRequest(new TheaterError(`Unknown worker harness: ${harness}`, 'INVALID_STATE'));
     let backend = this.backends.get(harness);
     if (backend) return backend;
     backend = this.factories[harness]();
@@ -309,20 +309,48 @@ export class WorkerBridge extends EventEmitter {
 
   async ensureStarted() {}
 
+  // A session belongs to the harness that created it. Callers name that owner; a loaded
+  // session confirms it and a disagreement is refused instead of silently rerouted.
+  owner(threadId, harness) {
+    const loaded = this.threads.get(threadId);
+    if (loaded && harness && loaded !== harness) throw refusedRequest(new TheaterError(`Native session ${threadId} belongs to the ${loaded} harness, not ${harness}.`, 'SESSION_OWNER_CONFLICT'));
+    const owner = loaded ?? harness;
+    if (!owner) throw refusedRequest(new TheaterError(`Native session ${threadId} has no recorded owning harness.`, 'SESSION_OWNER_UNKNOWN'));
+    return owner;
+  }
+
+  // Makes a saved session readable in this controller without launching a turn. Only backends
+  // that keep session metadata in process need this; others read their persisted sessions.
+  async attachThread({ harness, ...params }) {
+    const owner = this.owner(params.threadId, harness);
+    const backend = this.backend(owner);
+    if (!backend.attachThread) return;
+    await backend.attachThread(params);
+    this.threads.set(params.threadId, owner);
+  }
+
   async startThread({ harness = 'codex', ...params }) {
     const response = await this.backend(harness).startThread(params);
     this.threads.set(response.thread.id, harness);
     return response;
   }
 
-  async resumeThread({ harness = 'codex', ...params }) {
-    const response = await this.backend(harness).resumeThread(params);
-    this.threads.set(params.threadId, harness);
+  async resumeThread({ harness, ...params }) {
+    const owner = this.owner(params.threadId, harness);
+    const response = await this.backend(owner).resumeThread(params);
+    this.threads.set(params.threadId, owner);
     return response;
   }
 
+  // A loaded session adopts changed session-bound settings before its next turn, exactly as a
+  // resume after restart would. Backends whose settings travel with each turn need no update.
+  async updateThread({ harness, ...params }) {
+    const backend = this.backend(this.owner(params.threadId, harness));
+    return backend.updateThread ? await backend.updateThread(params) : null;
+  }
+
   async request(method, { harness, ...params } = {}) {
-    return await this.backend(this.threads.get(params.threadId) ?? harness).request(method, params);
+    return await this.backend(params.threadId ? this.owner(params.threadId, harness) : harness).request(method, params);
   }
 
   liveRequest(requestId) {
@@ -340,8 +368,10 @@ export class WorkerBridge extends EventEmitter {
     throw new TheaterError(`Worker request is no longer live: ${requestId}`, 'REQUEST_ORPHANED');
   }
 
-  shutdown() {
-    for (const backend of this.backends.values()) backend.shutdown();
+  // Resolves once every backend has shut down, reporting processes a backend could not stop.
+  async shutdown() {
+    const results = await Promise.all([...this.backends.values()].map(backend => backend.shutdown()));
+    return { unstopped: results.flatMap(result => result?.unstopped ?? []) };
   }
 }
 

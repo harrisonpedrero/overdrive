@@ -5,9 +5,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
-const sessionId = args[args.indexOf('--session-id') + 1] || args[args.indexOf('--resume') + 1] || 'fake-session';
+const resumed = args.includes('--resume');
+const sessionId = args[args.indexOf(resumed ? '--resume' : '--session-id') + 1] || 'fake-session';
 if (process.env.FAKE_CLAUDE_ARGS_FILE) {
   fs.writeFileSync(process.env.FAKE_CLAUDE_ARGS_FILE, JSON.stringify({ args, cwd: process.cwd(), claudeEnv: Object.keys(process.env).filter(key => /^CLAUDE/.test(key)).sort() }));
+}
+// With FAKE_CLAUDE_STORE, sessions persist across processes and resuming an unknown session
+// fails like the real CLI; each launch is appended to FAKE_CLAUDE_LOG.
+if (process.env.FAKE_CLAUDE_STORE) {
+  const storeFile = process.env.FAKE_CLAUDE_STORE;
+  const known = fs.existsSync(storeFile) ? JSON.parse(fs.readFileSync(storeFile, 'utf8')) : [];
+  if (process.env.FAKE_CLAUDE_LOG) fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, `${JSON.stringify({ mode: resumed ? 'resume' : 'create', sessionId })}\n`);
+  if (resumed && !known.includes(sessionId)) {
+    process.stderr.write(`No conversation found with session ID: ${sessionId}\n`);
+    process.exit(1);
+  }
+  if (!resumed) fs.writeFileSync(storeFile, JSON.stringify([...known, sessionId]));
 }
 const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const queue = [];

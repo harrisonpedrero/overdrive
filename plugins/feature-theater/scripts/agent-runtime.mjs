@@ -4,11 +4,13 @@ import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
 import { summarizePatch, TheaterError, optionalText, parseJsonObject, requiredText, redactString } from './util.mjs';
 import { withAgentControl } from './ownership.mjs';
 import {
+  bindAgentSession,
   featureRuntime,
   getFeatureContext,
   markCompacted,
   pendingAgentRequest,
   recordAgentEvent,
+  releaseAgentSession,
   resolveAgentRequestRecord,
   saveAgentSession,
   savePendingAgentRequest,
@@ -77,7 +79,7 @@ async function recordCompaction(base, threadId, turnId) {
     recordedCompactions.add(key);
     if (recordedCompactions.size > 256) recordedCompactions.delete(recordedCompactions.values().next().value);
     try {
-      await markCompacted(base);
+      await markCompacted({ ...base, thread_id: threadId });
     } catch (error) {
       recordedCompactions.delete(key);
       waiter?.reject(error);
@@ -108,7 +110,7 @@ async function onServerRequest(message) {
     return;
   }
   const payload = safePayload(message.params);
-  await savePendingAgentRequest({
+  const saved = await savePendingAgentRequest({
     workspace_path: registration.workspacePath,
     feature: registration.feature,
     owner_token: ownerToken,
@@ -119,6 +121,9 @@ async function onServerRequest(message) {
     summary: requestSummary(message.method, payload),
     payload,
   });
+  if (saved.ignored) {
+    try { bridge.respondToServer(message.id, undefined, 'This native session is no longer bound to its feature lane.'); } catch { /* process may be exiting */ }
+  }
 }
 
 async function onNotification({ method, params }) {
@@ -188,14 +193,15 @@ async function onNotification({ method, params }) {
     const visible = redactString(clip(finalVisibleMessage(turn) || turnMessages.get(turnId) || `Agent turn ${turn.status || 'completed'}.`));
     const diff = turnDiffs.get(turnId);
     const plan = turnPlans.get(turnId);
-    if (plan) await recordAgentEvent({ ...base, kind: 'agent.plan', summary: 'Agent updated its visible plan.', details: plan });
-    if (diff) await recordAgentEvent({ ...base, kind: 'agent.diff', summary: `Working diff touched ${diff.fileCount} file(s), +${diff.additions}/-${diff.deletions}.`, details: diff });
+    if (plan) await recordAgentEvent({ ...base, thread_id: params.threadId, kind: 'agent.plan', summary: 'Agent updated its visible plan.', details: plan });
+    if (diff) await recordAgentEvent({ ...base, thread_id: params.threadId, kind: 'agent.diff', summary: `Working diff touched ${diff.fileCount} file(s), +${diff.additions}/-${diff.deletions}.`, details: diff });
     const status = ['failed', 'interrupted'].includes(turn.status) ? turn.status : 'idle';
-    await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: null, status, summary: visible });
+    const saved = await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: null, status, summary: visible });
     turnMessages.delete(turnId);
     turnDiffs.delete(turnId);
     turnPlans.delete(turnId);
     compactionTurns.delete(turnId);
+    if (saved.ignored) return;
     const runtime = await featureRuntime({ ...base, allow_inactive: true });
     if (!shuttingDown && runtime.feature.compaction_pending && status === 'idle') {
       setTimeout(() => { if (!shuttingDown) void compactFeatureAgent(base).catch(error => process.stderr.write(`[overdrive] deferred compaction: ${redactString(error.message)}\n`)); }, 0);
@@ -222,8 +228,15 @@ bridge.on('exit', (error, threadIds = null) => {
     registrations.delete(threadId);
     const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
     const runtime = await featureRuntime({ ...base, allow_inactive: true }).catch(() => null);
-    const interrupted = Boolean(runtime?.feature.active_turn_id || runtime?.feature.agent_status === 'waiting_for_user');
-    await saveAgentSession({ ...base, thread_id: threadId, turn_id: null, status: interrupted ? 'disconnected' : 'idle', ...(interrupted ? { summary: `Worker bridge disconnected: ${redactString(error.message)}` } : {}) }).catch(() => {});
+    const feature = runtime?.feature;
+    // A turn that may outlive its backend connection (a known active turn or a request that may
+    // have been delivered) stays uncertain with its turn ID; the native session settles it later.
+    const mayBeLive = Boolean(feature?.active_turn_id || ['starting', 'uncertain'].includes(feature?.agent_status));
+    const interrupted = mayBeLive || feature?.agent_status === 'waiting_for_user';
+    const summary = mayBeLive
+      ? `Worker bridge disconnected: ${redactString(error.message)} The turn may still be running; it is reconciled from the native session before more work starts.`
+      : `Worker bridge disconnected: ${redactString(error.message)}`;
+    await saveAgentSession({ ...base, thread_id: threadId, turn_id: mayBeLive ? feature.active_turn_id ?? null : null, status: mayBeLive ? 'uncertain' : interrupted ? 'disconnected' : 'idle', orphan_requests: interrupted, ...(interrupted ? { summary } : {}) }).catch(() => {});
   }
   if (!threadIds) {
     turnMessages.clear();
@@ -267,39 +280,129 @@ async function compactThreadAndWait(runtime) {
   }
 }
 
-async function resume(runtime) {
-  if (registrations.has(runtime.feature.thread_id)) return;
-  const response = await bridge.resumeThread({
+// featureRuntime names the harness that owns the saved session; without one, the session
+// predates recorded ownership and is never guessed onto the configured harness.
+function requireSessionOwner(runtime) {
+  if (runtime.harness) return;
+  throw new TheaterError(`Native session ${runtime.feature.thread_id} of ${runtime.feature.slug} was saved before its backend was recorded, and its owner cannot be proven, so it was not sent to the configured harness. Start a replacement with theater_agent_start and force_new_session: true; the old conversation remains in its original backend.`, 'SESSION_OWNER_UNKNOWN');
+}
+
+function sessionParams(runtime) {
+  return {
     ...harnessParams(runtime),
     threadId: runtime.feature.thread_id,
     cwd: runtime.feature.checkout_path,
     runtimeWorkspaceRoots: runtimeRoots(runtime),
     developerInstructions: runtime.developerInstructions,
-  });
+  };
+}
+
+async function resume(runtime) {
+  requireSessionOwner(runtime);
+  const params = sessionParams(runtime);
+  if (registrations.has(runtime.feature.thread_id)) return await bridge.updateThread?.(params);
+  const response = await bridge.resumeThread(params);
   register(runtime.feature.thread_id, runtime.root, runtime.feature.slug);
   return response;
 }
 
+// Settles an 'uncertain' lane from its owning native session: a turn still in progress becomes
+// the active turn, otherwise the lane is idle. History the backend cannot provide here (a Claude
+// session loaded by a later controller) proves nothing, so the lane stays uncertain unless the
+// coordinator attests, with the evidence it verified, that no worker from that request is
+// running. runtime.feature follows the result.
+async function settleUncertain(runtime, thread, attestation = null) {
+  const unavailable = !thread || thread.history === 'unavailable';
+  if (unavailable && !attestation) return;
+  const running = unavailable ? null : thread.turns?.findLast(turn => turn.status === 'inProgress') ?? null;
+  const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: runtime.feature.thread_id, owner_token: ownerToken };
+  const saved = await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: running?.id ?? null, status: running ? 'running' : 'idle', only_if_status: 'uncertain' }));
+  if (!saved.ignored) {
+    await recordAgentEvent({ ...base, kind: 'agent.dispatch_reconciled', ...(unavailable
+      ? { summary: `The coordinator attested that no worker from the unconfirmed turn request is running (native history unavailable): ${clip(attestation.evidence, 2_000)}`, details: { basis: 'coordinator_attestation', attestation } }
+      : { summary: running ? `The unconfirmed turn request is running as turn ${running.id}.` : 'The unconfirmed turn request left no running turn; the lane is idle.', details: { basis: 'native_history' } }) });
+  }
+  const { agent } = saved.ignored ? (await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1 })).feature : saved;
+  Object.assign(runtime.feature, { agent_status: agent.status, active_turn_id: agent.activeTurnId });
+}
+
+function priorTurnAttestation(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new TheaterError('prior_turn_attestation must be an object whose evidence states the process or backend facts you verified.', 'INVALID_INPUT');
+  return { evidence: redactString(requiredText(value.evidence, 'prior_turn_attestation.evidence', { max: 4_000 })) };
+}
+
+const UNCERTAIN_NEXT = 'Inspect the lane. If you can verify under your existing authority that no worker from that request is still running for this lane (for example by checking the worker processes for its checkout), call theater_agent_start with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline. Until then no turn is dispatched.';
+
+// A turn request without a confirmed outcome may have started a turn, so no new work is
+// dispatched until the owning native session shows whether it did. This also holds after the
+// controller that sent the request has died.
+async function reconcileDispatch(runtime, attestation = null) {
+  if (runtime.feature.agent_status !== 'uncertain') return;
+  const owner = runtime.feature.thread_harness;
+  let thread = null;
+  let unreadable = null;
+  try {
+    // Resuming registers the session so an adopted running turn's events are recorded. A runtime
+    // prepared for a replacement on another harness only attaches the owner's session to read it.
+    if (runtime.harness === owner) await resume(runtime);
+    else if (!registrations.has(runtime.feature.thread_id)) {
+      const { harness: _configured, model: _model, harnessOptions: _options, ...session } = sessionParams(runtime);
+      await bridge.attachThread?.({ ...session, harness: owner });
+    }
+    thread = (await bridge.request('thread/read', { harness: owner, threadId: runtime.feature.thread_id, includeTurns: true })).thread;
+  } catch (error) {
+    unreadable = redactString(error.message);
+  }
+  await settleUncertain(runtime, thread, attestation);
+  if (runtime.feature.agent_status !== 'uncertain') return;
+  const reason = unreadable ? `its native session could not be read (${unreadable})` : 'its native history is not available in this controller';
+  throw new TheaterError(`The last turn request for ${runtime.feature.slug} has no confirmed outcome and ${reason}, so no new turn was started. ${UNCERTAIN_NEXT}`, 'DISPATCH_UNCERTAIN');
+}
+
 async function dispatchTurn(runtime, threadId, instruction, effort, created = false) {
   const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: threadId, owner_token: ownerToken };
-  await enqueueStateWork(() => saveAgentSession({ ...base, status: 'starting', compacted: created && runtime.feature.compaction_pending }));
+  const previous = runtime.feature;
+  await enqueueStateWork(() => created
+    ? bindAgentSession({ ...base, harness: runtime.harness, expected_thread_id: previous.thread_id ?? null, compacted: previous.compaction_pending })
+    : saveAgentSession({ ...base, status: 'starting' }));
   try {
     const result = await bridge.request('turn/start', {
       harness: runtime.harness, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
       runtimeWorkspaceRoots: runtimeRoots(runtime), model: runtime.workerModel, effort, summary: 'concise',
     });
-    await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_starting: true }));
+    await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_status: 'starting' }));
     return result;
   } catch (error) {
-    await enqueueStateWork(() => saveAgentSession({ ...base, status: 'failed', summary: `Unable to start turn: ${redactString(error.message)}` }));
+    const summary = `Unable to start turn: ${redactString(error.message)}`;
+    if (!error?.refused) {
+      // The request may have reached the backend (a lost response, timeout or exit), so the turn
+      // may be running. Keep the binding and any turn already reported; reconcileDispatch
+      // decides from the native session before more work starts.
+      await enqueueStateWork(async () => {
+        await saveAgentSession({ ...base, status: 'uncertain', only_if_status: 'starting' });
+        await recordAgentEvent({ ...base, kind: 'agent.dispatch_uncertain', summary: `${summary} The request may have reached the backend, so the session is reconciled before more work starts.` });
+      });
+      throw error;
+    }
+    await enqueueStateWork(async () => {
+      // A replacement that never ran a turn is abandoned and the previous binding kept.
+      if (created && !(await releaseAgentSession({
+        ...base, previous_thread_id: previous.thread_id ?? null, previous_harness: previous.thread_harness ?? null, compaction_pending: previous.compaction_pending,
+        summary: previous.thread_id ? `${summary} Kept native session ${previous.thread_id}.` : summary,
+      })).ignored) return;
+      await saveAgentSession({ ...base, status: 'failed', summary });
+    });
     throw error;
   }
 }
 
-async function startOwned({ workspace_path, feature, instruction, effort = 'high', force_new_session = false }) {
+async function startOwned({ workspace_path, feature, instruction, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }) {
   if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new TheaterError('Unsupported reasoning effort.', 'INVALID_INPUT');
-  const runtime = await featureRuntime({ workspace_path, feature });
+  const attestation = priorTurnAttestation(prior_turn_attestation);
+  const runtime = await featureRuntime({ workspace_path, feature, force_new_session });
   if (!runtime.feature.spec_revision) throw new TheaterError('Save a concrete feature specification before starting its agent.', 'SPEC_REQUIRED');
+  await reconcileDispatch(runtime, attestation);
   if (runtime.feature.active_turn_id) throw new TheaterError(`Feature already has active turn ${runtime.feature.active_turn_id}; steer it instead.`, 'TURN_ACTIVE');
   await bridge.ensureStarted();
   let threadId = runtime.feature.thread_id;
@@ -343,6 +446,7 @@ async function steerOwned({ workspace_path, feature, instruction, effort = 'high
   if (!runtime.feature.thread_id) throw new TheaterError('This feature has no agent session. Start it first.', 'AGENT_NOT_STARTED');
   await bridge.ensureStarted();
   await resume(runtime);
+  await reconcileDispatch(runtime);
   let result;
   let mode;
   if (runtime.feature.active_turn_id) {
@@ -361,7 +465,7 @@ async function steerOwned({ workspace_path, feature, instruction, effort = 'high
     mode = 'new_turn';
   }
   await recordAgentEvent({ workspace_path: runtime.root, feature: runtime.feature.slug, kind: 'coordinator.steered', summary: `Coordinator ${mode === 'mid_turn' ? 'steered the active turn' : 'started a follow-up turn'}: ${redactString(clip(direction, 2_000))}`, details: { mode } });
-  return { feature: runtime.feature.slug, threadId: runtime.feature.thread_id, turnId: result.turnId || result.turn?.id || runtime.feature.active_turn_id, mode };
+  return { feature: runtime.feature.slug, threadId: runtime.feature.thread_id, turnId: result.turnId || result.turn?.id || runtime.feature.active_turn_id, harness: runtime.harness, mode };
 }
 
 function safeThreadView(thread) {
@@ -372,20 +476,37 @@ function safeThreadView(thread) {
       ? { type: 'agentMessage', text: redactString(clip(item.text, 6_000)) }
       : { type: 'plan', text: redactString(clip(item.text, 6_000)) }),
   }));
-  return { id: thread.id, name: thread.name, cwd: thread.cwd, status: thread.status, updatedAt: thread.updatedAt, turns };
+  // 'native': the backend's own persisted history; 'controller': only turns run by this
+  // controller; 'unavailable': session metadata only, so no turns are presented.
+  const history = thread.history ?? 'native';
+  const historyNote = {
+    controller: 'Only turns run by this controller are shown; earlier turns are summarized by the feature summary and timeline.',
+    unavailable: 'Earlier turns are not loaded in this controller; the feature summary and timeline hold the retained safe handoff.',
+  }[history];
+  return { id: thread.id, name: thread.name, cwd: thread.cwd, status: thread.status, updatedAt: thread.updatedAt, history, ...(historyNote ? { historyNote } : {}), turns: history === 'unavailable' ? null : turns };
 }
 
 async function inspectFeatureAgent({ workspace_path, feature, include_thread = true }) {
   const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true });
   let thread = null;
   let warning = null;
-  if (include_thread && runtime.feature.thread_id) {
+  if (include_thread && runtime.feature.thread_id && !runtime.harness) {
+    warning = `Native session ${runtime.feature.thread_id} has no recorded owning backend, so it was not read. Replace it with theater_agent_start and force_new_session: true.`;
+  } else if (include_thread && runtime.feature.thread_id) {
     try {
       await bridge.ensureStarted();
+      // A fresh controller loads the session's metadata (no turn, no model call) so it can be read.
+      if (!registrations.has(runtime.feature.thread_id)) await bridge.attachThread?.(sessionParams(runtime));
       const response = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
       thread = safeThreadView(response.thread);
       const active = response.thread.turns?.find(turn => turn.id === runtime.feature.active_turn_id);
-      if (active && ['completed', 'interrupted', 'failed'].includes(active.status)) {
+      if (runtime.feature.agent_status === 'uncertain') {
+        await settleUncertain(runtime, response.thread);
+        if (runtime.feature.active_turn_id && !registrations.has(runtime.feature.thread_id)) await resume(runtime);
+        if (runtime.feature.agent_status === 'uncertain') warning = response.thread.history === 'unavailable'
+          ? `The last turn request has no confirmed outcome and this session's history is not available here. ${UNCERTAIN_NEXT}`
+          : 'The last turn request has no confirmed outcome; the next agent command reconciles it from the native session before doing anything else.';
+      } else if (active && ['completed', 'interrupted', 'failed'].includes(active.status)) {
         await enqueueStateWork(() => saveAgentSession({ workspace_path, feature, thread_id: runtime.feature.thread_id, owner_token: ownerToken, status: active.status === 'completed' ? 'idle' : active.status }));
       }
     } catch (error) {
@@ -445,6 +566,8 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
 async function compactOwned({ workspace_path, feature }) {
   const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true });
   if (!runtime.feature.thread_id) return { compacted: false, reason: 'No feature task exists yet.' };
+  requireSessionOwner(runtime);
+  await reconcileDispatch(runtime);
   await queueCompaction({ workspace_path, feature, owner_token: ownerToken });
   if (runtime.feature.active_turn_id) return { compacted: false, queued: true, reason: `Turn ${runtime.feature.active_turn_id} is active; compaction will run when it finishes.` };
   await bridge.ensureStarted();
@@ -468,12 +591,16 @@ async function compactOwned({ workspace_path, feature }) {
 
 async function interruptOwned({ workspace_path, feature }) {
   const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true });
+  await reconcileDispatch(runtime);
   if (!runtime.feature.thread_id || !runtime.feature.active_turn_id) return { interrupted: false, reason: 'No active turn.' };
+  requireSessionOwner(runtime);
   await bridge.ensureStarted();
   await resume(runtime);
-  await bridge.request('turn/interrupt', { harness: runtime.harness, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id });
+  const result = await bridge.request('turn/interrupt', { harness: runtime.harness, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id });
+  // A backend that reports nothing to interrupt (the turn ended first) is taken at its word.
+  if (result?.interrupted === false) return { interrupted: false, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id, harness: runtime.harness, reason: 'The turn had already ended; its completion is recorded from the native session.' };
   await recordAgentEvent({ workspace_path: runtime.root, feature: runtime.feature.slug, kind: 'coordinator.interrupted', summary: `Interrupted active turn ${runtime.feature.active_turn_id}.`, details: {} });
-  return { interrupted: true, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id };
+  return { interrupted: true, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id, harness: runtime.harness };
 }
 
 async function resolveRequestOwned({ workspace_path, feature, request_id, action, response, scope = 'turn' }) {
@@ -508,11 +635,13 @@ async function compactOutgoingAfterSwitch(switchResult, workspacePath) {
   return { attempted: true, ...result };
 }
 
+// Resolves after the bridge has shut down, with the worker processes it could not stop.
 async function shutdownAgentRuntime() {
   shuttingDown = true;
   await notificationQueue;
-  bridge.shutdown();
+  const stopped = await bridge.shutdown();
   await notificationQueue;
+  return { unstopped: stopped?.unstopped ?? [] };
 }
 
 const startFeatureAgent = args => withAgentControl(args, ownerToken, () => startOwned(args));

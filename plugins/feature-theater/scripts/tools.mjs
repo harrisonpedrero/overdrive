@@ -242,7 +242,13 @@ export const TOOLS = [
     ...feature,
     instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),
     effort: string('Worker reasoning effort.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
-    force_new_session: boolean('Create a replacement task instead of resuming the recorded one.'),
+    force_new_session: boolean('Create a replacement task on the currently configured harness instead of resuming the recorded one. A recorded task otherwise always resumes on the harness that created it.'),
+    prior_turn_attestation: {
+      ...object({
+        evidence: string('The process or backend facts you verified, under your existing authority, showing that no worker from the unconfirmed turn request is still running for this lane (for example the process check performed and its result).', { minLength: 1, maxLength: 4000 }),
+      }, ['evidence']),
+      description: 'Evidence-based coordinator attestation for a lane whose agent status is uncertain and whose native history cannot be read. It is recorded in the timeline; it is not a user approval request. Readable native history always takes precedence, and without an attestation such a lane cannot dispatch.',
+    },
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
   tool('theater_agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({

@@ -235,7 +235,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
-  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id}` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'context.md'), packet);
   return { feature, work, checkpoint, evidence, pending, snapshot };
 }
@@ -333,6 +333,14 @@ export function workerHarness(config, slug) {
   if (model !== null && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) throw new TheaterError('theater.json claude.model and claude.laneModels values must be model names.', 'INVALID_STATE');
   const { model: _model, laneModels: _laneModels, ...harnessOptions } = settings;
   return { harness, workerModel: model, harnessOptions };
+}
+
+// theater.json chooses the harness for new sessions only; a saved session always runs on the
+// harness that created it. Unknown legacy ownership yields no harness, so callers refuse it.
+function sessionHarness(config, row, forceNew = false) {
+  if (!row.thread_id || forceNew) return workerHarness(config, row.slug);
+  if (!HARNESSES.has(row.thread_harness)) return { harness: null, workerModel: null, harnessOptions: {} };
+  return workerHarness({ ...config, harness: row.thread_harness }, row.slug);
 }
 
 export async function initializeWorkspace({ workspace_path, repository, harness }) {
@@ -536,6 +544,7 @@ function summarizeFeature(ctx, feature) {
     agent: {
       status: feature.agent_status,
       threadId: feature.thread_id ?? null,
+      harness: feature.thread_id ? feature.thread_harness ?? 'unknown' : null,
       activeTurnId: feature.active_turn_id ?? null,
     },
     compactionPending: feature.compaction_pending,
@@ -1088,7 +1097,7 @@ export async function readTimeline({ workspace_path, feature, limit = 30 }) {
   });
 }
 
-export async function featureRuntime({ workspace_path, feature, allow_inactive = false }) {
+export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new TheaterError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
@@ -1102,25 +1111,74 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
       agentFile: contained(ctx.root, 'features', row.slug, 'AGENTS.md'),
       work: packet.work,
       developerInstructions: featureAgentInstructions(ctx.root, row),
-      ...workerHarness(ctx.config, row.slug),
+      ...sessionHarness(ctx.config, row, force_new_session),
     };
   });
 }
 
-export async function saveAgentSession({ workspace_path, feature, thread_id, turn_id = null, status, summary = undefined, compacted = false, owner_token, only_if_starting = false }) {
+// Binds the lane to a session it just created, recording the owning harness. The replaced
+// binding is kept in the timeline so its conversation stays reachable in its own backend.
+export async function bindAgentSession({ workspace_path, feature, thread_id, harness, expected_thread_id = null, compacted = false, owner_token }) {
+  if (!HARNESSES.has(harness)) throw new TheaterError('A native session must record its owning harness.', 'SESSION_OWNER_UNKNOWN');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      if (!ownsAgent(ctx.db, row.id, owner_token) || (only_if_starting && row.agent_status !== 'starting')) return { ignored: true };
+      if (!ownsAgent(ctx.db, row.id, owner_token)) throw new TheaterError('Another controller took this lane before its new session could be saved.', 'AGENT_OWNED');
+      if ((row.thread_id ?? null) !== expected_thread_id || row.active_turn_id) throw new TheaterError('The lane session changed before its replacement could be saved; inspect it and retry.', 'SESSION_CHANGED');
+      const stamp = now();
+      transaction(ctx.db, () => {
+        ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, active_turn_id = NULL, agent_status = 'starting', compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
+          .run(thread_id, harness, compacted ? 1 : 0, stamp, row.id);
+        if (row.thread_id) ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND thread_id = ? AND status = 'pending'").run(stamp, row.id, row.thread_id);
+      });
+      if (row.thread_id) await addEvent(ctx, { featureId: row.id, kind: 'agent.session_replaced', summary: `Replaced native session ${row.thread_id} (${row.thread_harness ?? 'backend unknown'}) with ${thread_id} (${harness}). The previous conversation remains in its own backend.`, details: { previousThreadId: row.thread_id, previousHarness: row.thread_harness ?? null, threadId: thread_id, harness } });
+      await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
+      await writeIndex(ctx);
+      return summarizeFeature(ctx, featureBySlug(ctx.db, slug));
+    } finally { ctx.db.close(); }
+  });
+}
+
+// Undoes bindAgentSession when the new session never started a turn, restoring the previous
+// binding (or none) so a failed replacement cannot strand the lane on an unusable session.
+export async function releaseAgentSession({ workspace_path, feature, thread_id, previous_thread_id = null, previous_harness = null, compaction_pending = false, summary, owner_token }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token) || row.thread_id !== thread_id || row.active_turn_id || row.agent_status !== 'starting') return { ignored: true };
+      const cleanSummary = requiredText(summary, 'summary', { max: 100_000 });
+      ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, agent_status = 'failed', compaction_pending = ?, summary = ?, updated_at = ? WHERE id = ?`)
+        .run(previous_thread_id, previous_thread_id ? previous_harness : null, compaction_pending ? 1 : 0, cleanSummary, now(), row.id);
+      await addEvent(ctx, { featureId: row.id, kind: 'agent.failed', summary: cleanSummary, details: { threadId: thread_id, restoredThreadId: previous_thread_id, restoredHarness: previous_thread_id ? previous_harness : null } });
+      await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
+      await writeIndex(ctx);
+      return summarizeFeature(ctx, featureBySlug(ctx.db, slug));
+    } finally { ctx.db.close(); }
+  });
+}
+
+// Session state changes only for the session the lane is bound to, so late events from a
+// replaced session cannot mutate its replacement. New sessions are bound by bindAgentSession.
+export async function saveAgentSession({ workspace_path, feature, thread_id, turn_id = null, status, summary = undefined, compacted = false, owner_token, only_if_status = null, orphan_requests = false }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      if (row.thread_id !== thread_id || !ownsAgent(ctx.db, row.id, owner_token) || (only_if_status && row.agent_status !== only_if_status)) return { ignored: true };
       const cleanSummary = summary ? requiredText(summary, 'summary', { max: 100_000 }) : undefined;
       const stamp = now();
       transaction(ctx.db, () => {
-        ctx.db.prepare(`UPDATE features SET thread_id = ?, active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
-          .run(thread_id, turn_id, status, cleanSummary ?? null, compacted ? 1 : 0, stamp, row.id);
-        if (status === 'disconnected') {
+        ctx.db.prepare(`UPDATE features SET active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
+          .run(turn_id, status, cleanSummary ?? null, compacted ? 1 : 0, stamp, row.id);
+        if (status === 'disconnected' || orphan_requests) {
           ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND thread_id = ? AND status = 'pending'").run(stamp, row.id, thread_id);
         }
       });
@@ -1132,14 +1190,14 @@ export async function saveAgentSession({ workspace_path, feature, thread_id, tur
   });
 }
 
-export async function recordAgentEvent({ workspace_path, feature, kind, summary, details = {}, owner_token }) {
+export async function recordAgentEvent({ workspace_path, feature, kind, summary, details = {}, owner_token, thread_id = undefined }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
+      if (!ownsAgent(ctx.db, row.id, owner_token) || (thread_id !== undefined && row.thread_id !== thread_id)) return { ignored: true };
       const cleanSummary = requiredText(summary, 'summary', { max: 100_000 });
       return await addEvent(ctx, { featureId: row.id, kind, summary: cleanSummary, details });
     } finally { ctx.db.close(); }
@@ -1153,7 +1211,8 @@ export async function savePendingAgentRequest({ workspace_path, feature, request
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
+      // A controller may only raise requests from the session the lane is currently bound to.
+      if (!ownsAgent(ctx.db, row.id, owner_token) || (owner_token && row.thread_id !== thread_id)) return { ignored: true };
       const stamp = now();
       ctx.db.prepare(`INSERT OR REPLACE INTO pending_agent_requests(request_id, feature_id, thread_id, turn_id, method, summary, payload_json, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`)
         .run(String(request_id), row.id, thread_id, turn_id ?? null, method, summary, JSON.stringify(payload ?? {}), stamp);
@@ -1199,14 +1258,14 @@ export async function resolveAgentRequestRecord({ workspace_path, feature, reque
   });
 }
 
-export async function markCompacted({ workspace_path, feature, owner_token }) {
+export async function markCompacted({ workspace_path, feature, owner_token, thread_id = undefined }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
+      if (!ownsAgent(ctx.db, row.id, owner_token) || (thread_id !== undefined && row.thread_id !== thread_id)) return { ignored: true };
       ctx.db.prepare('UPDATE features SET compaction_pending = 0 WHERE id = ?').run(row.id);
       await addEvent(ctx, { featureId: row.id, kind: 'agent.compacted', summary: 'Compacted the feature agent at a saved checkpoint.', details: { threadId: row.thread_id } });
       const current = featureBySlug(ctx.db, slug);

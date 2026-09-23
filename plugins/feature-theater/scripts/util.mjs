@@ -14,6 +14,14 @@ export class TheaterError extends Error {
   }
 }
 
+// Marks a worker request error that proves the requested work never began: the request failed
+// before reaching its backend or the backend explicitly refused it. Timeouts and lost
+// connections stay unmarked because the backend may already be doing the work.
+export function refusedRequest(error) {
+  error.refused = true;
+  return error;
+}
+
 export const now = () => new Date().toISOString();
 export const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 

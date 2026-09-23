@@ -10,7 +10,7 @@ To begin from nothing, say `Start a new OVERDRIVE project called <name> that <pr
 
 ## Worker harness and models
 
-The coordinator's model is whatever its Codex task or Claude Code session uses; it never selects worker models, and worker settings never change it. The top-level `model` field in `theater.json` is recorded coordinator metadata. When the user names a worker model, record it in the settings below instead of substituting the coordinator's model. Harness and model changes apply to the next agent start.
+The coordinator's model is whatever its Codex task or Claude Code session uses; it never selects worker models, and worker settings never change it. The top-level `model` field in `theater.json` is recorded coordinator metadata. When the user names a worker model, record it in the settings below instead of substituting the coordinator's model. Harness changes apply to new sessions; model changes apply to the next turn.
 
 Lane workers run under Codex by default, using `gpt-6-sol`. Set `codex.model` for a workspace default and `codex.laneModels` for named lane overrides in `theater.json`:
 
@@ -26,6 +26,10 @@ Lane workers run under Codex by default, using `gpt-6-sol`. Set `codex.model` fo
 `codex.laneModels[<slug>]` takes precedence over `codex.model`, which takes precedence over the `gpt-6-sol` default.
 
 The selected model is used when starting or resuming a worker thread and for each new turn. Model names must be nonempty identifiers using letters, numbers, periods, underscores, colons or hyphens.
+
+A lane keeps the harness that created its native session. Changing `theater.json` applies to new sessions; existing sessions resume, steer, inspect, interrupt and compact on their recorded harness. Current model and permission settings for that harness apply to the next turn, including after a controller restart. Use `force_new_session: true` to replace a session on the newly configured harness; the earlier conversation remains in its original backend.
+
+If a turn request times out or loses its response, the lane stays `uncertain` until the owning backend shows whether a turn started. This state survives a controller restart and blocks duplicate dispatch. A newly attached Claude session has no earlier turn history in the controller, so inspection reports `history: "unavailable"` and relies on the retained feature summary and timeline. When native history is unavailable, the coordinator can resume only after verifying that no worker from the request still runs and supplying `prior_turn_attestation: { evidence }` to `theater_agent_start`. Sessions saved before harness ownership was recorded require a replacement when their owner cannot be proven.
 
 To run workers as Claude Code sessions instead, pass `harness: "claude"` to `theater_initialize` or `theater_project_create`, or set `"harness": "claude"` in an existing `theater.json`. An optional `claude` object configures the workers:
 

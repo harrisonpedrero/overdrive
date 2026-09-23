@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { TheaterError, now, run } from './util.mjs';
+import { TheaterError, now, refusedRequest, run } from './util.mjs';
 
 // Workers get no MCP servers, hooks, skills, plugins or browser integration; the Theater
 // coordinator therefore cannot be called recursively from a lane.
@@ -142,13 +142,13 @@ export class ClaudeWorkerBridge extends EventEmitter {
 
   #thread(threadId) {
     const meta = this.threads.get(threadId);
-    if (!meta) throw new TheaterError(`Claude worker session ${threadId} is not loaded; resume it first.`, 'THREAD_UNKNOWN');
+    if (!meta) throw refusedRequest(new TheaterError(`Claude worker session ${threadId} is not loaded; resume it first.`, 'THREAD_UNKNOWN'));
     return meta;
   }
 
   #register({ threadId, cwd, runtimeWorkspaceRoots = [], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, persisted }) {
     const existing = this.threads.get(threadId);
-    // Updated in place: an in-flight turn keeps finishing against the same record.
+    // An in-flight turn and any lingering process keep the same session record.
     const meta = Object.assign(existing ?? {}, {
       id: threadId,
       cwd,
@@ -180,8 +180,22 @@ export class ClaudeWorkerBridge extends EventEmitter {
     return { thread: { id: meta.id } };
   }
 
+  // Model, permission policy and instructions are bound when a turn process launches, so a
+  // loaded session takes the current settings before its next turn; a running turn is unaffected.
+  async updateThread(params) {
+    const meta = this.#register({ ...params, persisted: this.#thread(params.threadId).persisted });
+    return { thread: { id: meta.id } };
+  }
+
+  // Loads a saved session so it can be read without launching a process. Turns from earlier
+  // controllers are not replayed (their transcripts include private reasoning), and none runs here.
+  async attachThread(params) {
+    if (!this.threads.has(params.threadId)) this.#register({ ...params, persisted: true });
+    return { thread: { id: params.threadId } };
+  }
+
   async request(method, params = {}) {
-    await this.ensureStarted();
+    await this.ensureStarted().catch(error => { throw refusedRequest(error); });
     switch (method) {
       case 'turn/start': return await this.#startTurn(params);
       case 'turn/steer': return this.#steer(params);
@@ -242,7 +256,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (!previous || exited(previous)) return;
     if (await waitForExit(previous, this.terminationTimeoutMs)) return;
     if (await terminateTree(previous, this.treeKill, this.terminationTimeoutMs)) return;
-    throw new TheaterError(`Claude worker process ${previous.pid} from an earlier turn is still running in ${meta.cwd} and could not be stopped; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING');
+    throw refusedRequest(new TheaterError(`Claude worker process ${previous.pid} from an earlier turn is still running in ${meta.cwd} and could not be stopped; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING'));
   }
 
   #track(meta, child) {
@@ -293,7 +307,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     });
     await new Promise((resolve, reject) => {
       child.once('spawn', resolve);
-      child.once('error', reject);
+      child.once('error', error => reject(refusedRequest(error)));
     });
     meta.active = turn;
     meta.turns = [...meta.turns, turn].slice(-RETAINED_TURNS);
@@ -338,8 +352,11 @@ export class ClaudeWorkerBridge extends EventEmitter {
         id: meta.id,
         name: meta.name,
         cwd: meta.cwd,
-        status: meta.active ? 'active' : 'idle',
+        status: meta.active ? 'active' : meta.turns.length || !meta.persisted ? 'idle' : 'unknown',
         updatedAt: meta.updatedAt,
+        // Only turns run by this bridge are held; a session loaded by resume or attach has no
+        // earlier history here, which is reported rather than shown as an empty transcript.
+        history: meta.turns.length || !meta.persisted ? 'controller' : 'unavailable',
         turns: meta.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.status === 'inProgress' ? turn.text.map(text => ({ type: 'agentMessage', text })) : turn.items })),
       },
     };
