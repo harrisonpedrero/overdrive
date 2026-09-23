@@ -30,15 +30,27 @@ const GRAPH_LIMIT = 24;
 const ATTENTION_STATES = ['running', 'blocked', 'failed', 'review', 'ready'];
 const QUIET_STATES = ['planned', 'done', 'cancelled'];
 
-// Work needing action first, then its direct prerequisites, then everything else; ties keep planned order.
-function graphOrder(work) {
+// Packs every item exactly once into full 24-item pages: work needing action first, each placed beside
+// its not-yet-shown direct prerequisites when they fit, then everything else; ties keep planned order.
+function graphPages(work) {
   const byState = states => (a, b) => states.indexOf(a.status) - states.indexOf(b.status);
-  const attention = work.filter(item => ATTENTION_STATES.includes(item.status)).sort(byState(ATTENTION_STATES));
-  const listed = new Set(attention.map(item => item.item_key));
-  const prerequisites = new Set(attention.flatMap(item => item.dependencies));
-  const context = work.filter(item => !listed.has(item.item_key) && prerequisites.has(item.item_key));
-  for (const item of context) listed.add(item.item_key);
-  return [...attention, ...context, ...work.filter(item => !listed.has(item.item_key)).sort(byState(QUIET_STATES))];
+  const pages = [[]];
+  const placed = new Set();
+  const place = item => {
+    if (pages.at(-1).length === GRAPH_LIMIT) pages.push([]);
+    pages.at(-1).push(item);
+    placed.add(item.item_key);
+  };
+  for (const item of work.filter(item => ATTENTION_STATES.includes(item.status)).sort(byState(ATTENTION_STATES))) {
+    if (placed.has(item.item_key)) continue;
+    if (pages.at(-1).length === GRAPH_LIMIT) pages.push([]);
+    const room = GRAPH_LIMIT - pages.at(-1).length - 1;
+    const context = work.filter(other => item.dependencies.includes(other.item_key) && !placed.has(other.item_key));
+    for (const prerequisite of context.slice(0, room)) place(prerequisite);
+    place(item);
+  }
+  for (const item of work.filter(item => !placed.has(item.item_key)).sort(byState(QUIET_STATES))) place(item);
+  return pages;
 }
 
 function graphScope(work, work_items, page) {
@@ -46,7 +58,7 @@ function graphScope(work, work_items, page) {
   const pages = Math.max(1, Math.ceil(work.length / GRAPH_LIMIT));
   if (page > pages) throw new TheaterError(`This work graph has ${pages} page${pages === 1 ? '' : 's'}.`, 'INVALID_INPUT');
   if (pages === 1) return { scoped: work, view: { mode: 'all', page, pages } };
-  return { scoped: graphOrder(work).slice((page - 1) * GRAPH_LIMIT, page * GRAPH_LIMIT), view: { mode: 'attention', page, pages } };
+  return { scoped: graphPages(work)[page - 1], view: { mode: 'attention', page, pages } };
 }
 
 export async function snapshotState({ workspace_path, feature, components, include_archived = false, work_items, graph_page }) {
@@ -151,7 +163,16 @@ function graphLabel(value, max = 100) {
     }
   }
   if (line) lines.push(line);
-  return lines.map(value => value.replace(/[&<>"'#\u0060\\[\]{}|]/g, char => '#' + char.codePointAt(0) + ';')).join('<br/>');
+  return lines.map(graphEscape).join('<br/>');
+}
+
+function graphEscape(value) {
+  return value.replace(/[&<>"'#\u0060\\[\]{}|]/g, char => '#' + char.codePointAt(0) + ';');
+}
+
+// Work keys are exact identifiers: shown whole and unwrapped so they can be copied into updates.
+function graphKey(value) {
+  return graphEscape(String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 100));
 }
 
 export function renderWorkGraph(snapshot) {
@@ -160,23 +181,41 @@ export function renderWorkGraph(snapshot) {
   if (work.length > GRAPH_LIMIT) throw new TheaterError('This graph has more than 24 tasks. Select the relevant work_items for a readable subgraph.', 'GRAPH_TOO_LARGE', { items: work.map(({ key, title, state }) => ({ key, title, state })) });
   if (!work.length) return null;
   const view = snapshot.selected.view;
-  const outsideLabel = key => view?.outside?.[key] ? key + ' (' + view.outside[key] + ')' : key;
   const ids = new Map(work.map((item, index) => [item.key, 'n' + index]));
   const lines = ['flowchart TD'];
   for (const item of work) {
-    const label = graphLabel(item.title) + '<br/>' + graphLabel(item.state) + (item.blocker ? '<br/>' + graphLabel(item.blocker, 140) : '');
+    const label = graphKey(item.key) + '<br/>' + graphLabel(item.title) + '<br/>' + graphLabel(item.state) + (item.blocker ? '<br/>' + graphLabel(item.blocker, 140) : '');
     lines.push('  ' + ids.get(item.key) + '["' + label + '"]');
   }
-  for (const item of work) {
-    const outside = [];
-    for (const dependency of item.dependencies) {
-      if (ids.has(dependency)) lines.push('  ' + ids.get(dependency) + ' --> ' + ids.get(item.key));
-      else outside.push(dependency);
+  if (view?.mode === 'attention') {
+    // A page shows each prerequisite outside it once, linked to every dependent on the page.
+    const outside = new Map();
+    const edges = [];
+    for (const item of work) {
+      for (const dependency of item.dependencies) {
+        if (ids.has(dependency)) { edges.push('  ' + ids.get(dependency) + ' --> ' + ids.get(item.key)); continue; }
+        if (!outside.has(dependency)) {
+          outside.set(dependency, 'o' + outside.size);
+          const state = view.outside?.[dependency];
+          lines.push('  ' + outside.get(dependency) + '["Outside view<br/>' + graphKey(dependency) + (state ? '<br/>' + graphLabel(state) : '') + '"]');
+        }
+        edges.push('  ' + outside.get(dependency) + ' -.-> ' + ids.get(item.key));
+      }
     }
-    if (outside.length) {
-      const id = ids.get(item.key) + '_outside';
-      lines.push('  ' + id + '["Outside view<br/>' + graphLabel(outside.map(outsideLabel).join(', '), 200) + '"]');
-      lines.push('  ' + id + ' -.-> ' + ids.get(item.key));
+    lines.push(...edges);
+  } else {
+    const outsideLabel = key => view?.outside?.[key] ? key + ' (' + view.outside[key] + ')' : key;
+    for (const item of work) {
+      const outside = [];
+      for (const dependency of item.dependencies) {
+        if (ids.has(dependency)) lines.push('  ' + ids.get(dependency) + ' --> ' + ids.get(item.key));
+        else outside.push(dependency);
+      }
+      if (outside.length) {
+        const id = ids.get(item.key) + '_outside';
+        lines.push('  ' + id + '["Outside view<br/>' + graphLabel(outside.map(outsideLabel).join(', '), 200) + '"]');
+        lines.push('  ' + id + ' -.-> ' + ids.get(item.key));
+      }
     }
   }
   if (view && view.total > view.shown) {
