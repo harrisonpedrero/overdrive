@@ -1183,9 +1183,11 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       // Archiving ends the lane's work, so its direction becomes terminal; a later checkpoint may
       // still record explicit historical direction, which a repeated archive leaves in place.
       // Leaving the archive replaces only that terminal text, with the candidate or work graph direction.
+      // The projected direction also treats a legacy archive's stored review text as terminal.
+      const terminal = featureBySlug(ctx.db, slug).next_action === ARCHIVED_ACTION;
       const resumed = ctx.db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(row.id) ? CANDIDATE_REVIEW_ACTION : workGraphAction(workItems(ctx.db, row.id));
-      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN next_action = ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
-        .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, ARCHIVED_ACTION, resumed, stamp, row.id);
+      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
+        .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, terminal ? 1 : 0, resumed, stamp, row.id);
       if (!changed.changes) throw new TheaterError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
       if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
       const saved = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
