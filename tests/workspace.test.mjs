@@ -471,6 +471,16 @@ test('archiving gives unused and reviewed lanes a terminal direction that a late
   await recordCandidate({ ...reviewed, summary: 'Ready.', checks: ['readme receipt'] });
   await setFeatureStatus({ ...reviewed, status: 'archived', disposition: 'Superseded by another lane.' });
   agreeOn(await directions(workspace, 'reviewed'), ARCHIVED);
+  // Older archives kept the candidate review text; it reads as archived until a checkpoint follows.
+  const review = 'Review or integrate the exact recorded candidate.';
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  db.prepare("UPDATE features SET next_action = ? WHERE slug = 'reviewed'").run(review);
+  db.close();
+  assert.equal((await getFeatureContext(reviewed)).feature.nextAction, ARCHIVED);
+  assert.equal((await listFeatures({ workspace_path: workspace, include_archived: true })).features.find(item => item.slug === 'reviewed').nextAction, ARCHIVED);
+  await checkpointFeature({ ...reviewed, summary: 'Candidate kept for a later decision.', next_action: review });
+  assert.equal((await setFeatureStatus({ ...reviewed, status: 'archived', disposition: 'Still superseded.' })).unchanged, true);
+  agreeOn(await directions(workspace, 'reviewed'), review);
   // Reactivation replaces only the terminal text; the candidate still awaits review.
   assert.equal((await setFeatureStatus({ ...reviewed, status: 'active' })).feature.nextAction, 'Review or integrate the exact recorded candidate.');
   assert.equal((await setFeatureStatus({ ...unused, status: 'active' })).feature.nextAction, 'Revive only after the parser rewrite lands.');

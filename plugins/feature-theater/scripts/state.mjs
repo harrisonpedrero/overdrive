@@ -346,8 +346,14 @@ export function assertBoundCheckout(feature) {
   );
 }
 
+// Whether an explicit checkpoint followed the lane's latest archive; event ids give the exact order.
+const FEATURE_COLUMNS = `*, CASE WHEN status = 'archived' THEN EXISTS (
+  SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
+  AND checkpointed.id > (SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind = 'feature.archived')
+) ELSE 0 END AS checkpointed_after_archive`;
+
 export function readFeatureRow(db, slug) {
-  const row = db.prepare('SELECT * FROM features WHERE slug = ?').get(slug);
+  const row = db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE slug = ?`).get(slug);
   if (!row) throw new TheaterError(`Unknown feature: ${slug}`, 'FEATURE_NOT_FOUND');
   return normalizeFeature(row, databaseRoots.get(db));
 }
@@ -360,7 +366,7 @@ export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded c
 const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
 export const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
 
-export function normalizeFeature(row, root = undefined) {
+export function normalizeFeature({ checkpointed_after_archive: checkpointedAfterArchive, ...row }, root = undefined) {
   const feature = {
     ...row,
     priority: Number(row.priority),
@@ -371,7 +377,8 @@ export function normalizeFeature(row, root = undefined) {
   // instruction stays as history and any later explicit checkpoint direction is shown as saved.
   if (row.status === 'done' && row.next_action === CANDIDATE_REVIEW_ACTION) feature.next_action = COMPLETED_ACTION;
   // Archiving closes the lane with a disposition, so a recorded candidate is no longer awaiting review.
-  if (row.status === 'archived' && row.next_action === CANDIDATE_REVIEW_ACTION) feature.next_action = ARCHIVED_ACTION;
+  // Archives now store the terminal direction; this covers older ones unless a checkpoint followed.
+  if (row.status === 'archived' && row.next_action === CANDIDATE_REVIEW_ACTION && !checkpointedAfterArchive) feature.next_action = ARCHIVED_ACTION;
   if (root) {
     feature.checkout_location = checkoutLocation(root, row);
     // Only the path under the current root is ever exposed as the lane's checkout.
@@ -382,8 +389,8 @@ export function normalizeFeature(row, root = undefined) {
 
 export function listFeatureRows(db, { includeArchived = false } = {}) {
   const rows = includeArchived
-    ? db.prepare('SELECT * FROM features ORDER BY status = \'active\' DESC, priority DESC, updated_at DESC').all()
-    : db.prepare("SELECT * FROM features WHERE status <> 'archived' ORDER BY status = 'active' DESC, priority DESC, updated_at DESC").all();
+    ? db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features ORDER BY status = 'active' DESC, priority DESC, updated_at DESC`).all()
+    : db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE status <> 'archived' ORDER BY status = 'active' DESC, priority DESC, updated_at DESC`).all();
   const root = databaseRoots.get(db);
   return rows.map(row => normalizeFeature(row, root));
 }
