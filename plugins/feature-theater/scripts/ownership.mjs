@@ -1,4 +1,4 @@
-import { assertCheckReservation, loadWorkspace, featureBySlug, meta, parseJson, recordEvent, transaction } from './state.mjs';
+import { assertCheckReservation, loadWorkspace, featureBySlug, meta, parseJson, readFeatureRow, recordEvent, transaction } from './state.mjs';
 import { TheaterError, now, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function ownerAlive(owner) {
@@ -24,7 +24,8 @@ export function recoverAgentState(ctx, feature) {
     ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND status = 'pending'").run(now(), feature.id);
     recordEvent(ctx.db, { featureId: feature.id, kind: 'agent.recovered', summary: 'The previous controller process ended. The checkout and task are preserved; resume from current state.' });
   });
-  return featureBySlug(ctx.db, feature.slug);
+  // Listings recover unbound lanes too; lane operations already refused them before reaching here.
+  return readFeatureRow(ctx.db, feature.slug);
 }
 
 export async function withAgentControl(args, token, fn) {

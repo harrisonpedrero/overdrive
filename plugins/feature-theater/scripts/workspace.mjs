@@ -34,6 +34,7 @@ import {
   verifyCheckoutRevision,
 } from './git.mjs';
 import {
+  assertBoundCheckout,
   featureBySlug,
   initializeDatabase,
   listFeatureRows,
@@ -437,7 +438,15 @@ export async function doctorWorkspace({ workspace_path }) {
           detail: `${snapshot.branch || 'detached'} @ ${snapshot.head.slice(0, 12)} · ${snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`}`,
         });
       }
-      checks.push({ name: 'Feature paths', ok: true, detail: `${listFeatureRows(ctx.db, { includeArchived: true }).length} registered lane(s)` });
+      const lanes = listFeatureRows(ctx.db, { includeArchived: true });
+      const unbound = lanes.filter(lane => lane.checkout_location?.bound === false);
+      checks.push({
+        name: 'Feature paths',
+        ok: unbound.length === 0,
+        detail: unbound.length
+          ? `${unbound.length} of ${lanes.length} lane(s) not bound to this workspace: ${unbound.map(lane => `${lane.slug} (${lane.checkout_location.reason === 'linked_path' ? `linked via ${lane.checkout_location.link}` : `recorded at ${lane.checkout_location.recorded}`})`).join('; ')}`
+          : `${lanes.length} registered lane(s)`,
+      });
     } finally { ctx.db.close(); }
   } catch (error) {
     checks.push({ name: 'Workspace', ok: false, detail: error.message });
@@ -521,6 +530,7 @@ function summarizeFeature(ctx, feature) {
     blocker: feature.blocker || null,
     specRevision: feature.spec_revision,
     checkoutPath: feature.checkout_path,
+    ...(feature.checkout_location?.bound === false ? { checkoutLocation: { bound: false, reason: feature.checkout_location.reason, recordedPath: feature.checkout_location.recorded } } : {}),
     branch: feature.branch,
     baseRevision: feature.base_revision,
     agent: {
@@ -540,7 +550,7 @@ export async function listFeatures({ workspace_path, include_archived = false, r
       const result = summarizeFeature(ctx, recoverAgentState(ctx, feature));
       result.focused = feature.slug === focus;
       if (refresh_git) {
-        try { result.git = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
+        try { result.git = await repositorySnapshot(assertBoundCheckout(feature).checkout_path, feature.base_revision); }
         catch (error) { result.git = { error: error.message }; }
       }
       features.push(result);

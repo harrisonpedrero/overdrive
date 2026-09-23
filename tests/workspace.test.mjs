@@ -8,6 +8,8 @@ import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/veri
 import {
   checkpointFeature,
   createFeature,
+  doctorWorkspace,
+  featureRuntime,
   getFeatureContext,
   initializeManagedProject,
   initializeWorkspace,
@@ -316,4 +318,55 @@ test('scopes reusable app-server request ids to their feature lane', async t => 
   await resolveAgentRequestRecord({ workspace_path: workspace, feature: 'alpha', request_id: 1, summary: 'Old request expired.', status: 'orphaned' });
   assert.equal((await getFeatureContext({ workspace_path: workspace, feature: 'alpha' })).pendingAgentRequests.length, 0);
   assert.equal((await getFeatureContext({ workspace_path: workspace, feature: 'beta' })).pendingAgentRequests.length, 1);
+});
+
+test('binds lanes to the current workspace after a copy, rename or linked path', async t => {
+  const { parent, source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Stays inside its own workspace.', spec: '# Lane' });
+  await createFeature({ workspace_path: workspace, feature: 'linked', outcome: 'Refuses a linked lane path.' });
+  // The check leaves a marker beside the clone it actually ran in.
+  await updateChecks({ workspace_path: workspace, feature: 'lane', checks: [{ key: 'marker', purpose: 'Show which clone executes', argv: [process.execPath, '-e', "require('node:fs').appendFileSync(require('node:path').join(process.cwd(), '..', 'ran.txt'), 'x')"] }] });
+  const marker = root => path.join(root, 'features', 'lane', 'ran.txt');
+  const mismatch = error => error.code === 'CHECKOUT_LOCATION_MISMATCH';
+
+  assert.equal((await runChecks({ workspace_path: workspace, feature: 'lane' })).verification.ready, true);
+  await fs.rm(marker(workspace));
+
+  const copy = path.join(parent, 'copy');
+  await fs.cp(workspace, copy, { recursive: true, verbatimSymlinks: true });
+  await assert.rejects(getFeatureContext({ workspace_path: copy, feature: 'lane' }), mismatch);
+  await assert.rejects(runChecks({ workspace_path: copy, feature: 'lane' }), mismatch);
+  await assert.rejects(featureRuntime({ workspace_path: copy, feature: 'lane' }), mismatch);
+  await assert.rejects(checkpointFeature({ workspace_path: copy, feature: 'lane', summary: 'Copied.', next_action: 'None.' }), mismatch);
+  await assert.rejects(createFeature({ workspace_path: copy, feature: 'derived', outcome: 'Borrows a base.', base_feature: 'lane', base_revision: (await git(path.join(workspace, 'features', 'lane', 'repo'), 'rev-parse', 'HEAD')).stdout }), mismatch);
+  assert.equal(await fs.stat(marker(workspace)).catch(() => null), null);
+  assert.equal(await fs.stat(marker(copy)).catch(() => null), null);
+  const copied = (await listFeatures({ workspace_path: copy, refresh_git: true })).features.find(item => item.slug === 'lane');
+  assert.equal(copied.checkoutLocation.bound, false);
+  assert.equal(path.relative(await fs.realpath(copy), copied.checkoutPath), path.join('features', 'lane', 'repo'));
+  assert.equal(path.resolve(copied.checkoutLocation.recordedPath), path.resolve(await fs.realpath(workspace), 'features', 'lane', 'repo'));
+  assert.match(copied.git.error, /not bound to this workspace/);
+  const copyDoctor = (await doctorWorkspace({ workspace_path: copy })).checks.find(check => check.name === 'Feature paths');
+  assert.equal(copyDoctor.ok, false);
+  assert.match(copyDoctor.detail, /2 of 2 lane\(s\) not bound/);
+
+  // The original is untouched and still fully usable.
+  assert.equal((await getFeatureContext({ workspace_path: workspace, feature: 'lane' })).feature.checkoutLocation, undefined);
+  assert.equal((await doctorWorkspace({ workspace_path: workspace })).checks.find(check => check.name === 'Feature paths').ok, true);
+
+  const renamed = path.join(parent, 'renamed');
+  await fs.rename(workspace, renamed);
+  await assert.rejects(getFeatureContext({ workspace_path: renamed, feature: 'lane' }), mismatch);
+  await assert.rejects(runChecks({ workspace_path: renamed, feature: 'lane' }), mismatch);
+  await fs.rename(renamed, workspace);
+  assert.equal((await runChecks({ workspace_path: workspace, feature: 'lane' })).verification.ready, true);
+  assert.equal(await fs.readFile(marker(workspace), 'utf8'), 'x');
+
+  const outside = path.join(parent, 'outside-linked');
+  await fs.rename(path.join(workspace, 'features', 'linked'), outside);
+  await fs.symlink(outside, path.join(workspace, 'features', 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(getFeatureContext({ workspace_path: workspace, feature: 'linked' }), error => mismatch(error) && /symlink or junction/.test(error.message));
+  await assert.rejects(featureRuntime({ workspace_path: workspace, feature: 'linked' }), mismatch);
+  assert.equal((await getFeatureContext({ workspace_path: workspace, feature: 'lane' })).feature.slug, 'lane');
 });

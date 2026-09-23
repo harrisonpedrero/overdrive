@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { checkoutPath } from './git.mjs';
 import { TheaterError, contained, ensureManagedPath, now, readJson } from './util.mjs';
 
 const SCHEMA_VERSION = 3;
 export const CHECK_QUEUE_META = 'checks:queue';
+// Every lane is bound to the root its database was opened from, never to a recorded absolute path.
+const databaseRoots = new WeakMap();
 
 export function assertCheckReservation(db, featureId, receiptId = null) {
   const raw = meta(db, CHECK_QUEUE_META);
@@ -206,6 +210,7 @@ function migrate(db, currentVersion) {
 export function openDatabase(root) {
   const file = contained(root, '.theater', 'state.sqlite3');
   const db = new DatabaseSync(file);
+  databaseRoots.set(db, path.resolve(root));
   schema(db);
   const current = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
   if (current && Number(current.value) > SCHEMA_VERSION) {
@@ -286,26 +291,75 @@ export function meta(db, key, value = undefined) {
   return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value;
 }
 
-export function featureBySlug(db, slug) {
-  const row = db.prepare('SELECT * FROM features WHERE slug = ?').get(slug);
-  if (!row) throw new TheaterError(`Unknown feature: ${slug}`, 'FEATURE_NOT_FOUND');
-  return normalizeFeature(row);
+function samePath(left, right) {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-export function normalizeFeature(row) {
-  return {
+function linkedComponent(root, target) {
+  let cursor = root;
+  for (const part of path.relative(root, target).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    try { if (lstatSync(cursor).isSymbolicLink()) return cursor; }
+    catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
+  }
+  return null;
+}
+
+// A copied or moved workspace keeps its predecessor's absolute checkout paths; report them instead of following them.
+function checkoutLocation(root, row) {
+  const expected = checkoutPath(root, row.slug);
+  if (!samePath(row.checkout_path, expected)) return { expected, recorded: row.checkout_path, bound: false, reason: 'recorded_elsewhere' };
+  const link = linkedComponent(root, expected);
+  if (link) return { expected, recorded: row.checkout_path, bound: false, reason: 'linked_path', link };
+  return { expected, recorded: row.checkout_path, bound: true };
+}
+
+export function assertBoundCheckout(feature) {
+  const location = feature.checkout_location;
+  if (!location || location.bound) return feature;
+  const detail = location.reason === 'linked_path'
+    ? `its managed path passes through a symlink or junction (${location.link})`
+    : `it was registered at ${location.recorded}`;
+  throw new TheaterError(
+    `Feature ${feature.slug} is not bound to this workspace: ${detail}, not ${location.expected}. Refusing to inspect, verify or run a worker outside this workspace.`,
+    'CHECKOUT_LOCATION_MISMATCH',
+    { feature: feature.slug, expectedCheckout: location.expected, recordedCheckout: location.recorded, recovery: 'This control workspace appears to be a copy or relocation of another. Operate the lane from the workspace that owns its checkout, or create a new lane here; recorded paths are never rewritten automatically.' },
+  );
+}
+
+export function readFeatureRow(db, slug) {
+  const row = db.prepare('SELECT * FROM features WHERE slug = ?').get(slug);
+  if (!row) throw new TheaterError(`Unknown feature: ${slug}`, 'FEATURE_NOT_FOUND');
+  return normalizeFeature(row, databaseRoots.get(db));
+}
+
+export function featureBySlug(db, slug) {
+  return assertBoundCheckout(readFeatureRow(db, slug));
+}
+
+export function normalizeFeature(row, root = undefined) {
+  const feature = {
     ...row,
     priority: Number(row.priority),
     spec_revision: Number(row.spec_revision),
     compaction_pending: Boolean(row.compaction_pending),
   };
+  if (root) {
+    feature.checkout_location = checkoutLocation(root, row);
+    // Only the path under the current root is ever exposed as the lane's checkout.
+    feature.checkout_path = feature.checkout_location.expected;
+  }
+  return feature;
 }
 
 export function listFeatureRows(db, { includeArchived = false } = {}) {
   const rows = includeArchived
     ? db.prepare('SELECT * FROM features ORDER BY status = \'active\' DESC, priority DESC, updated_at DESC').all()
     : db.prepare("SELECT * FROM features WHERE status <> 'archived' ORDER BY status = 'active' DESC, priority DESC, updated_at DESC").all();
-  return rows.map(normalizeFeature);
+  const root = databaseRoots.get(db);
+  return rows.map(row => normalizeFeature(row, root));
 }
 
 export function workItems(db, featureId) {
