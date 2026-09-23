@@ -460,9 +460,7 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
   };
 }
 
-async function steerOwned({ workspace_path, feature, instruction, effort = 'high' }) {
-  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new TheaterError('Unsupported reasoning effort.', 'INVALID_INPUT');
-  const direction = requiredText(instruction, 'instruction', { max: 100_000 });
+async function steerOwned({ workspace_path, feature, effort = 'high' }, direction) {
   const runtime = await featureRuntime({ workspace_path, feature });
   if (!runtime.feature.thread_id) throw new TheaterError('This feature has no agent session. Start it first.', 'AGENT_NOT_STARTED');
   await bridge.ensureStarted();
@@ -810,7 +808,14 @@ const startFeatureAgent = async args => {
   const direction = args.instruction === undefined || args.instruction === null ? undefined : requiredText(args.instruction, 'instruction', { max: 100_000 });
   return await withAgentControl(args, ownerToken, () => startOwned(args, direction));
 };
-const steerFeatureAgent = args => withAgentControl(args, ownerToken, () => steerOwned(args));
+// A steer's effort and instruction are validated before the control lock, which may replace a
+// dead owner and mark its running turn uncertain.
+const steerFeatureAgent = async args => {
+  const { effort = 'high' } = args;
+  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new TheaterError('Unsupported reasoning effort.', 'INVALID_INPUT');
+  const direction = requiredText(args.instruction, 'instruction', { max: 100_000 });
+  return await withAgentControl(args, ownerToken, () => steerOwned(args, direction));
+};
 const compactFeatureAgent = args => withAgentControl(args, ownerToken, () => compactOwned(args));
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
 const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));

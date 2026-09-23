@@ -540,3 +540,43 @@ test('a late completion cannot recreate an attested descendant marker', async t 
   const fresh = await markDescendantsUnconfirmed({ ...marker, turn_id: next.turnId });
   assert.ok(fresh.generation && fresh.generation !== first.generation);
 });
+
+test('an invalid steer leaves lane ownership, agent state and the native task untouched', async t => {
+  const f = await fixture(t, 'codex');
+  // Raw rows: reading feature context would itself recover a dead owner's lane.
+  const read = statement => {
+    const db = new DatabaseSync(path.join(f.root, '.theater', 'state.sqlite3'));
+    try { return db.prepare(statement).all().map(row => ({ ...row })); } finally { db.close(); }
+  };
+  const owners = () => read("SELECT key, value FROM meta WHERE key LIKE 'agent-owner:%' ORDER BY key");
+  const lane = () => read("SELECT agent_status, thread_id, thread_harness, active_turn_id FROM features WHERE slug = 'alpha'")[0];
+  const invalid = [{ instruction: ' \n\t ' }, { instruction: '' }, { instruction: 42 }, {}, { instruction: 'a\0b' }, { instruction: 'Continue.', effort: 'extreme' }];
+  const rejectAll = async () => {
+    for (const input of invalid) {
+      await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, ...input }), error => error.code === 'INVALID_INPUT', JSON.stringify(input));
+    }
+  };
+
+  // A fresh lane gains no owner and stays unstarted.
+  await rejectAll();
+  assert.deepEqual(owners(), []);
+  assert.deepEqual(lane(), { agent_status: 'not_started', thread_id: null, thread_harness: null, active_turn_id: null });
+  assert.deepEqual(f.calls, []);
+
+  // A lane whose owning controller ended mid-turn keeps that owner, its running status and turn.
+  const started = await f.runtime.startFeatureAgent(f.args);
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  f.sql("UPDATE meta SET value = json_object('token', 'ended-controller', 'pid', ?) WHERE key LIKE 'agent-owner:%'", dead);
+  const before = { owners: owners(), lane: lane(), calls: f.calls.length, turns: structuredClone(f.stores.codex.get(started.threadId).turns) };
+  assert.deepEqual(before.lane, { agent_status: 'running', thread_id: started.threadId, thread_harness: 'codex', active_turn_id: started.turnId });
+  await rejectAll();
+  assert.deepEqual({ owners: owners(), lane: lane(), calls: f.calls.length, turns: f.stores.codex.get(started.threadId).turns }, before);
+  assert.ok(!(await getFeatureContext({ ...f.args, timeline_limit: 50 })).timeline.some(entry => entry.kind === 'coordinator.steered'));
+
+  // A valid steer still takes over the lane and steers the running turn.
+  const steered = await f.runtime.steerFeatureAgent({ ...f.args, instruction: '  Also cover the edge case.  ' });
+  assert.deepEqual({ mode: steered.mode, turnId: steered.turnId }, { mode: 'mid_turn', turnId: started.turnId });
+  assert.deepEqual(f.calls.filter(call => call.method === 'turn/steer'), [{ harness: 'codex', method: 'turn/steer', threadId: started.threadId }]);
+  assert.notDeepEqual(owners(), before.owners);
+  assert.deepEqual(lane(), before.lane);
+});
