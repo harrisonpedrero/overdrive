@@ -181,7 +181,7 @@ export const TOOLS = [
     ...feature,
     key: string('Stable work item key.'),
     status: string('New work state.', { enum: ['planned', 'ready', 'running', 'blocked', 'review', 'done', 'failed', 'cancelled'] }),
-    owner: string('Required owner identifier when starting work.'),
+    owner: string('Stable owner identifier. Required when starting work; while that lease is active, pass the same owner to renew, complete, block, fail, or otherwise change the claimed item.'),
     summary: string('Required result summary when completing work.'),
     blocker: string('Required blocker/failure detail for blocked or failed work.'),
     result_revision: string('Exact resulting Git revision when one exists.'),
