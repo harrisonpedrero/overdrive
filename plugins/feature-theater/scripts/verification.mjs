@@ -111,6 +111,12 @@ export function assertVerified(ctx, feature, revision, candidate = null) {
   return verification;
 }
 
+// Superseding a candidate or reopening a lane changes its projected direction and status, so the
+// persisted packet and index follow. workspace.mjs imports this module, hence the deferred import.
+async function refreshLaneFiles(ctx, slug) {
+  await (await import('./workspace.mjs')).refreshLaneFiles(ctx, slug);
+}
+
 async function withFeature(args, fn, lockOptions) {
   const root = await resolveWorkspace(args.workspace_path);
   return withWorkspaceLock(root, `control-${safeSlug(args.feature)}`, async () => {
@@ -224,6 +230,7 @@ export async function updateChecks(args) {
       ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(now(), feature.id);
       recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.updated', summary: `Configured ${checks.length} verification command(s).` });
     });
+    if (changed) await refreshLaneFiles(ctx, feature.slug);
     return { feature: feature.slug, changed, checks, contractHash: featureContract(ctx.db, feature) };
   });
 }
@@ -252,9 +259,11 @@ export async function runChecks(args, execution = {}) {
     }
     captureContract(ctx.db, feature, definition);
     // Receipts are live evidence; only a superseded candidate or reopened lane is a semantic change.
+    let invalidated = false;
     const invalidateUnverified = () => {
       if (!verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head).ready && invalidateCandidates(ctx.db, feature.id)) {
         bumpSemanticGeneration(ctx.db, feature.id);
+        invalidated = true;
       }
     };
     const receipts = [];
@@ -294,6 +303,7 @@ export async function runChecks(args, execution = {}) {
     const selectedCheckKeys = selectedChecks.map(check => check.key);
     const completion = checkOutcome(selectedCheckKeys, receipts);
     recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `Run finished at ${before.head.slice(0, 12)}: ${receipts.length} executed, ${completion.failedCheckKeys.length} failed, ${completion.notRunCheckKeys.length} not run.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys, completion } });
+    if (invalidated) await refreshLaneFiles(ctx, feature.slug);
     return { feature: feature.slug, selectedCheckKeys, receipts, completion, verification, git: await repositorySnapshot(feature.checkout_path) };
   }, execution.receiptId ? { timeoutMs: 0 } : undefined);
 }

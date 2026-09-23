@@ -377,11 +377,11 @@ export function featureBySlug(db, slug) {
   return assertBoundCheckout(readFeatureRow(db, slug));
 }
 
-// A checkpoint may echo the projected paused direction; only the direction after resume is stored.
-// The bare resume instruction is kept as is, and resuming replaces it with derived direction.
+// A paused lane's checkpoint may echo its exact projected direction; only the direction after
+// resume is stored. The bare resume instruction is kept as is, and resuming replaces it.
 export function unwrapPausedAction(text) {
-  if (!text.startsWith(PAUSED_ACTION)) return text;
-  return text.slice(PAUSED_ACTION.length).replace(/^\s*Then:\s*/, '').trim() || PAUSED_ACTION;
+  const prefix = `${PAUSED_ACTION} Then: `;
+  return text.startsWith(prefix) && text.length > prefix.length ? text.slice(prefix.length) : text;
 }
 
 export function normalizeFeature({ checkpointed_after_archive: checkpointedAfterArchive, review_superseded: reviewSuperseded, ...row }, root = undefined) {

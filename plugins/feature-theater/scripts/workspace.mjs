@@ -353,6 +353,15 @@ This is a compact navigation projection. Load one feature's context packet inste
   await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'index.md'), body);
 }
 
+// Rewrites a lane's context packet and the workspace index after a change made under the lane's
+// control lock alone, such as verification, taking the features lock in control-then-features order.
+export async function refreshLaneFiles(ctx, slug) {
+  await withWorkspaceLock(ctx.root, 'features', async () => {
+    await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
+    await writeIndex(ctx);
+  });
+}
+
 export async function writeFeatureContext(ctx, featureOrSlug) {
   const feature = typeof featureOrSlug === 'string' ? featureBySlug(ctx.db, safeSlug(featureOrSlug)) : featureOrSlug;
   const work = workItems(ctx.db, feature.id);
@@ -1040,12 +1049,13 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  const next = unwrapPausedAction(requiredText(next_action, 'next_action', { max: 20_000 }));
+  const requested = requiredText(next_action, 'next_action', { max: 20_000 });
   const openQuestions = cleanStringArray(unresolved, 'unresolved');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      const next = row.status === 'paused' ? unwrapPausedAction(requested) : requested;
       // Verification holds only the lane's control lock, so it can change the lane during the Git
       // snapshot. The checkpoint covers the generation seen before it and refuses to bless a later one.
       const semanticGeneration = Number(row.semantic_generation);
@@ -1192,8 +1202,10 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       // Leaving the archive replaces only that terminal text, with the candidate or work graph direction.
       // The projected direction also treats a legacy archive's stored review text as terminal.
       // A paused lane projects the bare resume instruction when it has no direction to resume with:
-      // none stored, or generated review text whose candidate was superseded while paused.
-      const terminal = [ARCHIVED_ACTION, PAUSED_ACTION].includes(featureBySlug(ctx.db, slug).next_action);
+      // none stored, or generated review text whose candidate was superseded while paused. Only
+      // leaving the pause replaces it; pausing again keeps the stored guidance.
+      const projected = featureBySlug(ctx.db, slug).next_action;
+      const terminal = projected === ARCHIVED_ACTION || (projected === PAUSED_ACTION && status !== 'paused');
       const resumed = ctx.db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(row.id) ? CANDIDATE_REVIEW_ACTION : workGraphAction(workItems(ctx.db, row.id));
       const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
         .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, terminal ? 1 : 0, resumed, stamp, row.id);

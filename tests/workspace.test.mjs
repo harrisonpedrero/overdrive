@@ -598,9 +598,19 @@ const pausedThen = next => `${PAUSED} Then: ${next}`;
 function storedDirection(workspace, slug) {
   const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
   try {
-    const row = db.prepare('SELECT id, next_action FROM features WHERE slug = ?').get(slug);
-    return { feature: row.next_action, checkpoint: db.prepare('SELECT next_action FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id).next_action };
+    const row = db.prepare('SELECT id, next_action, semantic_generation FROM features WHERE slug = ?').get(slug);
+    return { feature: row.next_action, checkpoint: db.prepare('SELECT next_action FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id).next_action, generation: Number(row.semantic_generation) };
   } finally { db.close(); }
+}
+
+// The persisted packet and index as written, read before any call that could rewrite them.
+async function persisted(workspace, feature) {
+  const packet = await fs.readFile(path.join(workspace, '.theater', 'features', feature, 'context.md'), 'utf8');
+  const index = await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8');
+  return {
+    context: packet.match(/^Next action: (.*)$/m)[1],
+    index: index.split('\n').find(line => line.includes(`| ${feature} |`)).split('|').at(-2).trim(),
+  };
 }
 
 test('a paused lane directs resuming first while its edits keep the post-resume direction', async t => {
@@ -636,13 +646,29 @@ test('a paused lane directs resuming first while its edits keep the post-resume 
   agreeOn(await directions(workspace, 'held'), pausedThen(note));
   await checkpointFeature({ ...lane, summary: 'Still waiting on the parser.', next_action: pausedThen(note) });
   agreeOn(await directions(workspace, 'held'), pausedThen(note));
-  assert.deepEqual(storedDirection(workspace, 'held'), { feature: note, checkpoint: note });
+  assert.deepEqual(storedDirection(workspace, 'held'), { ...storedDirection(workspace, 'held'), feature: note, checkpoint: note });
+  // Only that exact projected form is unwrapped; other text that begins like it is saved as written.
+  const logs = `${PAUSED} Also check the parser logs.`;
+  await checkpointFeature({ ...lane, summary: 'Still waiting on the parser.', next_action: logs });
+  assert.equal(storedDirection(workspace, 'held').feature, logs);
+  await checkpointFeature({ ...lane, summary: 'Still waiting on the parser.', next_action: note });
   assert.equal((await setFeatureStatus({ ...lane, status: 'active' })).feature.nextAction, note);
   agreeOn(await directions(workspace, 'held'), note);
+  // An active lane unwraps nothing, even text in the projected paused form.
+  const quoted = pausedThen(note);
+  await checkpointFeature({ ...lane, summary: 'Quoting the earlier pause.', next_action: quoted });
+  assert.deepEqual(storedDirection(workspace, 'held'), { ...storedDirection(workspace, 'held'), feature: quoted, checkpoint: quoted });
+  agreeOn(await directions(workspace, 'held'), quoted);
 
-  // Echoing the bare resume instruction leaves nothing beyond resuming; resuming then derives direction.
+  // Echoing the bare resume instruction leaves nothing beyond resuming; pausing again keeps that
+  // guidance and changes nothing, and resuming then derives direction.
   await setFeatureStatus({ ...lane, status: 'paused' });
   await checkpointFeature({ ...lane, summary: 'Parked.', next_action: PAUSED });
+  agreeOn(await directions(workspace, 'held'), PAUSED);
+  const parked = storedDirection(workspace, 'held');
+  assert.equal(parked.feature, PAUSED);
+  assert.equal((await setFeatureStatus({ ...lane, status: 'paused' })).feature.nextAction, PAUSED);
+  assert.deepEqual(storedDirection(workspace, 'held'), parked);
   agreeOn(await directions(workspace, 'held'), PAUSED);
   assert.equal((await setFeatureStatus({ ...lane, status: 'active' })).feature.nextAction, stuck);
 
@@ -661,11 +687,12 @@ test('a paused lane directs resuming first while its edits keep the post-resume 
 test('resuming a paused lane drops review direction only for a candidate superseded while paused', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-pause-review-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
-  const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }];
+  const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }];
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Pause review', description: 'Exercise paused candidate review.' });
   const reviewed = async slug => {
     const lane = { workspace_path: workspace, feature: slug };
-    await createFeature({ ...lane, title: slug, outcome: 'A reviewed candidate.', spec: '# Reviewed\n\nThe README exists.' });
+    const created = await createFeature({ ...lane, title: slug, outcome: 'A reviewed candidate.', spec: '# Reviewed\n\nThe README exists.' });
+    await fs.appendFile(path.join(created.feature.checkoutPath, '.git', 'info', 'exclude'), '\n.check-fails\n');
     await planWork({ ...lane, items: [{ key: 'readme', title: 'Write the README' }] });
     await updateChecks({ ...lane, checks: check('Read the committed README') });
     assert.equal((await runChecks(lane)).verification.ready, true);
@@ -680,11 +707,10 @@ test('resuming a paused lane drops review direction only for a candidate superse
   await setFeatureStatus({ ...held, status: 'paused' });
   // A contract change supersedes the candidate; the generated review text no longer applies.
   await updateChecks({ ...held, checks: check('Read the README, revised') });
+  // Verification rewrites the persisted packet and index itself.
+  assert.deepEqual(await persisted(workspace, 'held'), { context: PAUSED, index: PAUSED });
   assert.equal((await getFeatureContext(held)).feature.status, 'paused');
-  // Verification leaves the workspace index to the next lane write; the live surfaces already agree.
-  const live = await directions(workspace, 'held');
-  delete live.index;
-  assert.deepEqual(live, { get: PAUSED, list: PAUSED, context: PAUSED });
+  agreeOn(await directions(workspace, 'held'), PAUSED);
   assert.equal((await setFeatureStatus({ ...held, status: 'active' })).feature.nextAction, READY);
   agreeOn(await directions(workspace, 'held'), READY);
 
@@ -693,8 +719,18 @@ test('resuming a paused lane drops review direction only for a candidate superse
   await setFeatureStatus({ ...kept, status: 'paused' });
   await checkpointFeature({ ...kept, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
   await updateChecks({ ...kept, checks: check('Read the README, revised') });
-  assert.equal((await getFeatureContext(kept)).feature.nextAction, pausedThen(REVIEW));
+  assert.deepEqual(await persisted(workspace, 'kept'), { context: pausedThen(REVIEW), index: pausedThen(REVIEW) });
+  agreeOn(await directions(workspace, 'kept'), pausedThen(REVIEW));
   assert.equal((await setFeatureStatus({ ...kept, status: 'active' })).feature.nextAction, REVIEW);
+
+  // A failing check run supersedes the candidate the same way and rewrites the persisted surfaces.
+  const failing = await reviewed('failing');
+  await setFeatureStatus({ ...failing, status: 'paused' });
+  await fs.writeFile(path.join(workspace, 'features', 'failing', 'repo', '.check-fails'), 'fail');
+  assert.equal((await runChecks(failing)).verification.ready, false);
+  assert.deepEqual(await persisted(workspace, 'failing'), { context: PAUSED, index: PAUSED });
+  agreeOn(await directions(workspace, 'failing'), PAUSED);
+  assert.equal((await setFeatureStatus({ ...failing, status: 'active' })).feature.nextAction, READY);
 });
 
 test('rejects repository URLs containing credentials', async t => {
