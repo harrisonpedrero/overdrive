@@ -74,7 +74,7 @@ export function assertWorkersStopped(db, feature) {
   }
   const marker = unconfirmedDescendants(db, feature.id);
   if (marker) {
-    throw new TheaterError(`Tools launched by a stopped worker of this lane may still be running, so it cannot be verified or record a candidate. Confirm no process is running in its checkout, then pause the lane with theater_feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
+    throw new TheaterError(`Tools launched by a stopped worker of this lane may still be running, so checks and candidate recording must wait. Confirm no process is running in its checkout, then pause the lane with theater_feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
   }
 }
 
