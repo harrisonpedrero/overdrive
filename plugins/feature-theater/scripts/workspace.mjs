@@ -34,6 +34,7 @@ import {
   verifyCheckoutRevision,
 } from './git.mjs';
 import {
+  ARCHIVED_ACTION,
   CANDIDATE_REVIEW_ACTION,
   assertBoundCheckout,
   bumpSemanticGeneration,
@@ -1021,12 +1022,16 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
     }
     const stamp = now();
     transaction(ctx.db, () => {
-      const previous = ctx.db.prepare('SELECT status, blocker, summary FROM features WHERE id = ?').get(row.id);
-      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
-        .run(status, cleanBlocker, cleanDisposition, cleanDisposition, stamp, row.id);
+      const previous = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
+      // Archiving ends the lane's work, so its direction becomes terminal; a later checkpoint may
+      // still record explicit historical direction, which a repeated archive leaves in place.
+      // Leaving the archive replaces only that terminal text, with the candidate or work graph direction.
+      const resumed = ctx.db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(row.id) ? CANDIDATE_REVIEW_ACTION : workGraphAction(workItems(ctx.db, row.id));
+      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN next_action = ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
+        .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, ARCHIVED_ACTION, resumed, stamp, row.id);
       if (!changed.changes) throw new TheaterError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
       if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
-      const saved = ctx.db.prepare('SELECT status, blocker, summary FROM features WHERE id = ?').get(row.id);
+      const saved = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
       if (completionCandidate || Object.keys(saved).some(field => saved[field] !== previous[field])) bumpSemanticGeneration(ctx.db, row.id);
     });
     await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: {} });

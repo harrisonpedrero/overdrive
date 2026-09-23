@@ -431,6 +431,51 @@ test('checkpoints saved before semantic generations must be renewed after upgrad
   assert.equal((await switchFeature({ workspace_path: workspace, feature: 'beta' })).focus, 'beta');
 });
 
+const ARCHIVED = 'None. The lane is archived; its disposition records what shipped or remains.';
+
+async function directions(workspace, feature) {
+  const listed = (await listFeatures({ workspace_path: workspace, include_archived: true })).features.find(item => item.slug === feature);
+  const packet = await fs.readFile(path.join(workspace, '.theater', 'features', feature, 'context.md'), 'utf8');
+  const index = await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8');
+  return {
+    get: (await getFeatureContext({ workspace_path: workspace, feature })).feature.nextAction,
+    list: listed.nextAction,
+    context: packet.match(/^Next action: (.*)$/m)[1],
+    index: index.split('\n').find(line => line.includes(`| ${feature} |`)).split('|').at(-2).trim(),
+  };
+}
+
+function agreeOn(observed, action) {
+  assert.deepEqual(observed, { get: action, list: action, context: action, index: action });
+}
+
+test('archiving gives unused and reviewed lanes a terminal direction that a later checkpoint can replace', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-archive-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const unused = { workspace_path: workspace, feature: 'unused' };
+  const reviewed = { workspace_path: workspace, feature: 'reviewed' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Archive', description: 'Exercise archived direction.' });
+  await createFeature({ ...unused, title: 'Unused', outcome: 'Never started.', spec: '# Unused\n\nNothing yet.' });
+  agreeOn(await directions(workspace, 'unused'), 'Plan the first bounded work from the accepted spec.');
+
+  assert.equal((await setFeatureStatus({ ...unused, status: 'archived', disposition: 'Dropped before work.' })).feature.nextAction, ARCHIVED);
+  agreeOn(await directions(workspace, 'unused'), ARCHIVED);
+  await checkpointFeature({ ...unused, summary: 'Historical note.', next_action: 'Revive only after the parser rewrite lands.' });
+  const repeated = await setFeatureStatus({ ...unused, status: 'archived', disposition: 'Dropped again.' });
+  assert.equal(repeated.unchanged, true);
+  agreeOn(await directions(workspace, 'unused'), 'Revive only after the parser rewrite lands.');
+
+  await createFeature({ ...reviewed, title: 'Reviewed', outcome: 'A reviewed candidate.', spec: '# Reviewed\n\nThe README exists.' });
+  await updateChecks({ ...reviewed, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(reviewed)).verification.ready, true);
+  await recordCandidate({ ...reviewed, summary: 'Ready.', checks: ['readme receipt'] });
+  await setFeatureStatus({ ...reviewed, status: 'archived', disposition: 'Superseded by another lane.' });
+  agreeOn(await directions(workspace, 'reviewed'), ARCHIVED);
+  // Reactivation replaces only the terminal text; the candidate still awaits review.
+  assert.equal((await setFeatureStatus({ ...reviewed, status: 'active' })).feature.nextAction, 'Review or integrate the exact recorded candidate.');
+  assert.equal((await setFeatureStatus({ ...unused, status: 'active' })).feature.nextAction, 'Revive only after the parser rewrite lands.');
+});
+
 test('rejects repository URLs containing credentials', async t => {
   const { workspace } = await fixture(t);
   await assert.rejects(initializeWorkspace({ workspace_path: workspace, repository: 'https://user:secret@example.com/repo.git' }), /embedded credentials/i);

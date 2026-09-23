@@ -99,6 +99,8 @@ After a new coordinator task or compaction:
 3. Reconcile the recorded task status with the native task and live Git state.
 4. Continue from the saved next action; do not reconstruct old deliberation.
 
+Archiving sets a lane's next action to the terminal archived direction. A checkpoint saved after the archive may record explicit historical direction, and repeating the archive keeps it; reactivating replaces only the terminal text. Lanes archived before this behavior keep their stored direction, except that a recorded candidate's review instruction reads as the archived direction. Other stored text is not rewritten, because it cannot be told apart from an explicit checkpoint without ordering the lane's history; treat it as history, or checkpoint the lane with the direction it should show.
+
 Switching lanes automatically compacts the outgoing feature task when it is idle. For the coordinator itself, use the single `/compact` recommendation returned after a substantial switch; MCP servers cannot safely compact the already-loaded host task from a second app-server process.
 
 If Codex restarted during an approval prompt, the old callback cannot safely be answered. Inspect the feature, resume or steer it, and let it issue a fresh request.

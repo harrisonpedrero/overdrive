@@ -358,7 +358,7 @@ export function featureBySlug(db, slug) {
 
 export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded candidate.';
 const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
-const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
+export const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
 
 export function normalizeFeature(row, root = undefined) {
   const feature = {
