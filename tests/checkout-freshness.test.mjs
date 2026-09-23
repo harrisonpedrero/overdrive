@@ -165,6 +165,33 @@ test('an idle lane cannot switch after same-count checkout drift; an active work
   assert.doesNotMatch(await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8'), /CAVEAT/);
 });
 
+// Worker state is read inside the switch transaction, after the Git scan, so a worker that became
+// active after the observation takes this path too: a matching observation is not freshness.
+test('an active worker keeps a visible caveat even when its checkout matched the checkpoint', async t => {
+  const { alpha, beta, checkout, sql, workspace } = await lanes(t);
+  await fs.writeFile(path.join(checkout, 'app.js'), 'export const value = 2;\n');
+  sql("UPDATE features SET active_turn_id = 'turn-1' WHERE slug = 'alpha'");
+  const drifted = await switchFeature(beta);
+  assert.equal(drifted.checkoutFreshness.status, 'changed');
+  await switchFeature(alpha);
+
+  // The checkout now matches a new checkpoint, but the worker is still running.
+  await checkpointFeature({ ...alpha, summary: 'Alpha edits app.js.', next_action: 'Continue.' });
+  const matched = await switchFeature(beta);
+  assert.deepEqual([matched.checkoutFreshness.status, matched.checkoutFreshness.worker], ['fresh', 'active']);
+  assert.match(matched.checkoutFreshness.caveat, /matched checkpoint .*worker was active/);
+  const caveat = (await getFeatureContext(alpha)).checkoutCaveat;
+  assert.deepEqual([caveat?.status, caveat?.worker], ['fresh', 'active']);
+  assert.match(await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8'), /CHECKOUT FRESHNESS CAVEAT: Checkout matched checkpoint/);
+
+  // Once the worker is idle, a fresh comparison clears it.
+  await switchFeature(alpha);
+  sql("UPDATE features SET active_turn_id = NULL WHERE slug = 'alpha'");
+  const idle = await switchFeature(beta);
+  assert.deepEqual([idle.checkoutFreshness.status, idle.checkoutFreshness.caveat], ['fresh', null]);
+  assert.equal((await getFeatureContext(alpha)).checkoutCaveat, null);
+});
+
 test('an indeterminate comparison needs explicit acceptance and never overrides definite drift', async t => {
   const { alpha, beta, checkout, database, sql } = await lanes(t);
   await switchFeature(alpha);

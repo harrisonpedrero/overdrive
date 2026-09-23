@@ -118,7 +118,7 @@ function assertCheckpointFresh(db, feature) {
 }
 
 // A visible checkout-freshness caveat for a lane's recovery packet. Only a complete observation
-// that matched (a complete checkpoint fingerprint or a fresh switch comparison) clears it.
+// that matched (a complete checkpoint fingerprint or an idle lane's fresh switch comparison) clears it.
 const checkoutCaveatKey = featureId => `checkout-caveat:${featureId}`;
 
 function checkoutCaveat(db, featureId) {
@@ -211,8 +211,10 @@ function applyCheckoutFreshness(db, feature, observation, acceptUnverified) {
   }
   const accepted = !worker.active && comparison.status === 'indeterminate';
   const cause = accepted ? 'the switch was explicitly accepted as unverified' : "the lane's worker was active at the switch";
+  // A matching observation of a lane whose worker may still write is not freshness; only an idle
+  // lane's fresh comparison clears the caveat.
   const message = {
-    fresh: null,
+    fresh: worker.active ? `Checkout matched checkpoint ${checkpoint.id} when observed, but the lane's worker was active at the switch, so the checkout may have changed since.` : null,
     changed: `Checkout changed after checkpoint ${checkpoint.id} (${comparison.changed.join(', ')}); ${cause}, so the checkpoint may not describe the current checkout.`,
     unverified: `Checkpoint ${checkpoint.id} has no comparable checkout fingerprint; ${cause}, so checkout freshness is unverified.`,
     indeterminate: `Checkout freshness against checkpoint ${checkpoint.id} could not be established (${reasons.join(', ') || comparison.indeterminate.join(', ')}); ${cause}. The checkpoint is not proven to match the checkout.`,
