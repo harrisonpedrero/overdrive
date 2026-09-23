@@ -205,9 +205,10 @@ export const TOOLS = [
     unresolved: { type: 'array', items: string('Open decision, risk, or blocker.'), maxItems: 100 },
   }, ['workspace_path', 'feature', 'summary', 'next_action']), { destructiveHint: false }),
 
-  tool('theater_feature_switch', 'Switch feature focus', 'Switch coordinator focus after an outgoing checkpoint. Queues feature-session compaction, returns the destination recovery packet, and signals a high-value coordinator compaction boundary.', object({
+  tool('theater_feature_switch', 'Switch feature focus', 'Switch coordinator focus after an outgoing checkpoint. Queues feature-session compaction, returns the destination recovery packet, and signals a high-value coordinator compaction boundary. The outgoing checkout is compared with its checkpoint fingerprint: an idle lane whose checkout changed (CHECKPOINT_REQUIRED, reason checkout_changed) or whose checkpoint has no fingerprint (checkout_unverified) must be checkpointed again; a lane with a possibly running worker switches with a checkoutFreshness caveat. The comparison is a best-effort observation, not an atomic proof.', object({
     ...workspace,
     ...feature,
+    accept_unverified_checkout: boolean('Switch an idle lane whose checkout comparison is indeterminate (CHECKOUT_INDETERMINATE: oversized, unreadable or unstable state) and record an explicit unverified-checkout caveat. Never overrides definite drift.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
   tool('theater_feature_status', 'Set feature lifecycle state', 'Pause, resume, block, review, complete, or archive a lane without moving its checkout. Completion requires closed work and passing evidence. Pausing or archiving first stops the lane worker and records the status only once no turn is running; if the stop cannot be confirmed the status is unchanged and STOP_UNCONFIRMED explains what is still running. A paused lane dispatches nothing until it is made active again.', object({

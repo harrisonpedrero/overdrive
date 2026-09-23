@@ -424,7 +424,7 @@ test('checkpoints saved before semantic generations must be renewed after upgrad
 
   await switchRequiresCheckpoint(workspace, 'beta', 'legacy_checkpoint');
   db = new DatabaseSync(file);
-  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '5');
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '6');
   assert.deepEqual({ ...db.prepare('SELECT semantic_generation, thread_harness FROM features WHERE id = ?').get(id) }, { semantic_generation: 0, thread_harness: null });
   db.close();
   assert.equal((await checkpointFeature({ ...alpha, summary: 'Renewed after upgrade.', next_action: 'Continue.' })).semanticGeneration, 0);

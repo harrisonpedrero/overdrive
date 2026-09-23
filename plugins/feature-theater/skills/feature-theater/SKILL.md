@@ -87,7 +87,7 @@ For a real focus change:
 
 1. Inspect the outgoing lane if its state may have changed.
 2. Call `theater_checkpoint` with what is now true, one next action, and unresolved decisions/risks. A checkpoint is a semantic handoff, not a transcript.
-3. Call `theater_feature_switch`.
+3. Call `theater_feature_switch`. If the outgoing checkout changed after the checkpoint, an idle lane returns `CHECKPOINT_REQUIRED`: review its current state and checkpoint again. `CHECKOUT_INDETERMINATE` means the checkout could not be compared completely; retry, reduce the dirty or untracked content and checkpoint again, or pass `accept_unverified_checkout: true` only when switching with an unverified checkout is acceptable. When `checkoutFreshness.caveat` is present (for example, a running worker kept changing the checkout), state it in the switch confirmation instead of calling the lane fresh.
 4. The runtime compacts the outgoing feature task when it is idle, or keeps compaction queued until an idle boundary. The saved checkpoint is the coordinator's semantic compaction boundary. Codex does not currently let an MCP process compact the already-loaded host task, so when the outgoing lane contributed substantial context, end the concise switch confirmation by recommending `/compact` once. Afterward, recover only from `.theater/index.md` and the destination packet.
 5. Load the destination with `theater_feature_get`. Do not preload every other feature spec. Use `theater_feature_list` for the cross-feature overview.
 

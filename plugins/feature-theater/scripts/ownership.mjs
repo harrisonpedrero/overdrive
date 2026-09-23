@@ -53,7 +53,7 @@ export function unconfirmedDescendants(db, featureId) {
   return parseJson(meta(db, descendantsKey(featureId)), null);
 }
 
-function agentBusy(row) {
+export function agentBusy(row) {
   return Boolean(row.active_turn_id) || BUSY_STATUSES.includes(row.agent_status);
 }
 

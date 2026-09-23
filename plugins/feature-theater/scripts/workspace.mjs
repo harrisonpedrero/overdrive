@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { assertAgentIdle, assertVerified, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
-import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, descendantsKey, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
+import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, agentBusy, agentOwner, descendantsKey, ownerAlive, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -21,9 +21,13 @@ import {
   writeJson,
 } from './util.mjs';
 import {
+  checkoutFingerprint,
+  compareCheckoutFingerprints,
   createFeatureCheckout,
   diffSummary,
   checkoutPath,
+  fingerprintComplete,
+  fingerprintSummary,
   initializeMirror,
   inspectMirror,
   mirrorPath,
@@ -111,6 +115,113 @@ function assertCheckpointFresh(db, feature) {
     checkpointGeneration: recorded === null ? null : Number(recorded),
     currentGeneration: current,
   });
+}
+
+// A visible checkout-freshness caveat for a lane's recovery packet. Only a complete observation
+// that matched (a complete checkpoint fingerprint or a fresh switch comparison) clears it.
+const checkoutCaveatKey = featureId => `checkout-caveat:${featureId}`;
+
+function checkoutCaveat(db, featureId) {
+  return parseJson(meta(db, checkoutCaveatKey(featureId)), null);
+}
+
+function setCheckoutCaveat(db, featureId, caveat) {
+  if (caveat) meta(db, checkoutCaveatKey(featureId), JSON.stringify(caveat));
+  else db.prepare('DELETE FROM meta WHERE key = ?').run(checkoutCaveatKey(featureId));
+}
+
+function indeterminateReasons(...fingerprints) {
+  return [...new Set(fingerprints.flatMap(fingerprint => fingerprint?.indeterminate ?? []).map(item => `${item.component} ${item.reason}`))];
+}
+
+// Only a complete capture clears a lane's caveat; an incomplete one replaces it with its own.
+function checkpointCaveat(checkpointId, fingerprint) {
+  if (fingerprintComplete(fingerprint)) return null;
+  const reasons = indeterminateReasons(fingerprint);
+  return {
+    source: 'checkpoint', status: 'indeterminate', changed: [], indeterminate: reasons, checkpointId, observedAt: fingerprint.observedAt,
+    message: `Checkpoint ${checkpointId} could not fingerprint the checkout completely (${reasons.join(', ')}); a later switch cannot prove the checkout unchanged.`,
+  };
+}
+
+function unavailableFingerprint(error) {
+  return { observedAt: now(), head: null, index: null, paths: null, contents: null, counts: null, excluded: [], indeterminate: [{ component: 'all', reason: 'checkout_unavailable', detail: { message: error.message } }] };
+}
+
+// Observes the outgoing checkout against its latest checkpoint. This is async Git and file I/O, so
+// it runs before the switch transaction; the policy is applied inside it.
+async function observeCheckout(db, feature) {
+  const checkpoint = latestCheckpoint(db, feature.id);
+  const saved = parseJson(checkpoint?.checkout_fingerprint_json ?? null, null);
+  let current = null;
+  if (saved) {
+    try { current = await checkoutFingerprint(feature.checkout_path); }
+    catch (error) { current = unavailableFingerprint(error); }
+  }
+  return { checkpoint, saved, current, comparison: compareCheckoutFingerprints(saved, current) };
+}
+
+// Durable turn state decides whether a worker may be writing; an idle session owner is not active.
+// Owner liveness, worker guards and unconfirmed descendants are reported, not used to decide.
+function workerEvidence(db, featureId) {
+  const row = db.prepare('SELECT active_turn_id, agent_status FROM features WHERE id = ?').get(featureId);
+  return {
+    active: agentBusy(row),
+    agentStatus: row.agent_status,
+    activeTurnId: row.active_turn_id ?? null,
+    ownerAlive: ownerAlive(agentOwner(db, featureId)),
+    workerGuards: parseJson(meta(db, workersKey(featureId)), []).length,
+    unconfirmedDescendants: Boolean(unconfirmedDescendants(db, featureId)),
+  };
+}
+
+// Git checkout freshness for the outgoing lane, applied inside the switch transaction after the
+// semantic-generation check. An idle lane cannot switch on definite drift or on a checkpoint
+// without a comparable fingerprint; an indeterminate comparison needs explicit acceptance. A lane
+// whose worker may be running switches with a caveat instead, since its checkout is still moving.
+function applyCheckoutFreshness(db, feature, observation, acceptUnverified) {
+  const { checkpoint, saved, current, comparison } = observation;
+  if (latestCheckpoint(db, feature.id)?.id !== checkpoint.id) {
+    throw new TheaterError(`${feature.slug} was checkpointed while it was being switched; switch again.`, 'CHECKPOINT_CONFLICT', { feature: feature.slug, observedCheckpointId: checkpoint.id });
+  }
+  const worker = workerEvidence(db, feature.id);
+  const reasons = indeterminateReasons(saved, current);
+  const checkout = {
+    status: comparison.status,
+    ...(comparison.reason ? { reason: comparison.reason } : {}),
+    changed: comparison.changed,
+    indeterminate: comparison.indeterminate,
+    checkpoint: fingerprintSummary(saved),
+    current: fingerprintSummary(current),
+  };
+  const details = reason => ({ feature: feature.slug, reason, checkpointId: checkpoint.id, checkout, worker });
+  if (!worker.active) {
+    if (comparison.status === 'changed') {
+      throw new TheaterError(`Checkpoint ${feature.slug} again before switching: its checkout changed after the checkpoint (${comparison.changed.join(', ')}).`, 'CHECKPOINT_REQUIRED', details('checkout_changed'));
+    }
+    if (comparison.status === 'unverified') {
+      throw new TheaterError(`Checkpoint ${feature.slug} again before switching: its latest checkpoint has no comparable checkout fingerprint.`, 'CHECKPOINT_REQUIRED', details('checkout_unverified'));
+    }
+    if (comparison.status === 'indeterminate' && !acceptUnverified) {
+      throw new TheaterError(`${feature.slug}'s checkout could not be compared completely with its checkpoint (${reasons.join(', ') || comparison.indeterminate.join(', ')}).`, 'CHECKOUT_INDETERMINATE', {
+        ...details('checkout_indeterminate'),
+        recovery: 'Retry once transient conditions clear, reduce dirty and untracked content below the limits (commit, stash or ignore generated files) and checkpoint again, or switch with accept_unverified_checkout: true to record an explicit unverified-checkout caveat.',
+      });
+    }
+  }
+  const accepted = !worker.active && comparison.status === 'indeterminate';
+  const cause = accepted ? 'the switch was explicitly accepted as unverified' : "the lane's worker was active at the switch";
+  const message = {
+    fresh: null,
+    changed: `Checkout changed after checkpoint ${checkpoint.id} (${comparison.changed.join(', ')}); ${cause}, so the checkpoint may not describe the current checkout.`,
+    unverified: `Checkpoint ${checkpoint.id} has no comparable checkout fingerprint; ${cause}, so checkout freshness is unverified.`,
+    indeterminate: `Checkout freshness against checkpoint ${checkpoint.id} could not be established (${reasons.join(', ') || comparison.indeterminate.join(', ')}); ${cause}. The checkpoint is not proven to match the checkout.`,
+  }[comparison.status];
+  setCheckoutCaveat(db, feature.id, message ? {
+    source: 'switch', status: comparison.status, changed: comparison.changed, indeterminate: reasons,
+    worker: worker.active ? 'active' : 'idle', accepted, checkpointId: checkpoint.id, observedAt: current?.observedAt ?? null, message,
+  } : null);
+  return { ...checkout, worker: worker.active ? 'active' : 'idle', workerEvidence: worker, accepted, caveat: message, checkpointId: checkpoint.id };
 }
 
 function evidenceRows(db, featureId, limit = 50) {
@@ -246,6 +357,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const pending = pendingRows(ctx.db, feature.id);
   const canonicalSpec = latestSpec(ctx.db, feature.id);
   if (canonicalSpec) await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'spec.md'), `${canonicalSpec.content.trim()}\n`);
+  const caveat = checkoutCaveat(ctx.db, feature.id);
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
   catch (error) { snapshot = { unavailable: error.message }; }
@@ -255,9 +367,9 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
-  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${caveat ? `- CHECKOUT FRESHNESS CAVEAT: ${caveat.message}\n` : ''}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'context.md'), packet);
-  return { feature, work, checkpoint, evidence, pending, snapshot };
+  return { feature, work, checkpoint, evidence, pending, snapshot, checkoutCaveat: caveat };
 }
 
 async function existingInitialization(root, normalized) {
@@ -509,8 +621,12 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       ctx.config.repositoryProfile = profile;
       const base = selectedBase || await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
       const clone = await createFeatureCheckout(root, ctx.config, slug, base, baseRepository);
+      let fingerprint;
+      try { fingerprint = await checkoutFingerprint(clone.destination); }
+      catch (error) { fingerprint = unavailableFingerprint(error); }
       const created = now();
       const id = newId('feature');
+      const creationCheckpoint = newId('checkpoint');
       const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
       transaction(ctx.db, () => {
         meta(ctx.db, 'default_revision', refreshed.defaultRevision);
@@ -521,9 +637,11 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
         `).run(id, slug, cleanTitle, cleanOutcome, priority, base, clone.branch, clone.destination, initialSpec ? 1 : 0, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', created, created);
         if (initialSpec) ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, 1, ?, ?, ?)')
           .run(newId('spec'), id, initialSpec, 'Initial feature specification.', created);
-        // The creation checkpoint covers the lane's initial generation, including any initial spec.
-        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, summary, next_action, unresolved_json, semantic_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)')
-          .run(newId('checkpoint'), id, base, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', '[]', created);
+        // The creation checkpoint covers the lane's initial generation, including any initial spec,
+        // and the new clone's checkout.
+        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, summary, next_action, unresolved_json, semantic_generation, checkout_fingerprint_json, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)')
+          .run(creationCheckpoint, id, base, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', '[]', JSON.stringify(fingerprint), created);
+        setCheckoutCaveat(ctx.db, id, checkpointCaveat(creationCheckpoint, fingerprint));
         if (!meta(ctx.db, 'focus')) meta(ctx.db, 'focus', slug);
       });
       const row = featureBySlug(ctx.db, slug);
@@ -609,6 +727,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       verification: verificationStatus(ctx, row, projection.snapshot.head),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
+      checkoutCaveat: projection.checkoutCaveat,
       timeline,
       contextPath: contained(ctx.root, '.theater', 'features', row.slug, 'context.md'),
     };
@@ -908,7 +1027,13 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
       // Verification holds only the lane's control lock, so it can change the lane during the Git
       // snapshot. The checkpoint covers the generation seen before it and refuses to bless a later one.
       const semanticGeneration = Number(row.semantic_generation);
+      // A best-effort observation of the checkout; the snapshot below is a separate one.
+      const fingerprint = await checkoutFingerprint(row.checkout_path);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
+      if (fingerprint.head && fingerprint.head.oid !== snapshot.head) {
+        throw new TheaterError(`${slug}'s HEAD moved while it was being checkpointed; checkpoint again once it settles.`, 'CHECKPOINT_CONFLICT', { feature: slug, reason: 'checkout_moved', fingerprintHead: fingerprint.head.oid, snapshotHead: snapshot.head });
+      }
+      const complete = fingerprintComplete(fingerprint);
       const stamp = now();
       const id = newId('checkpoint');
       transaction(ctx.db, () => {
@@ -916,22 +1041,28 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
         if (current !== semanticGeneration) {
           throw new TheaterError(`${slug} changed while it was being checkpointed; review its current state and checkpoint again.`, 'CHECKPOINT_CONFLICT', { feature: slug, observedGeneration: semanticGeneration, currentGeneration: current });
         }
-        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, dirty_summary, summary, next_action, unresolved_json, semantic_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, row.id, snapshot.head, snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`, cleanSummary, next, JSON.stringify(openQuestions), semanticGeneration, stamp);
+        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, dirty_summary, summary, next_action, unresolved_json, semantic_generation, checkout_fingerprint_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(id, row.id, snapshot.head, snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`, cleanSummary, next, JSON.stringify(openQuestions), semanticGeneration, JSON.stringify(fingerprint), stamp);
         ctx.db.prepare('UPDATE features SET summary = ?, next_action = ?, compaction_pending = 1, updated_at = ? WHERE id = ?').run(cleanSummary, next, stamp, row.id);
+        setCheckoutCaveat(ctx.db, row.id, checkpointCaveat(id, fingerprint));
       });
-      await addEvent(ctx, { featureId: row.id, kind: 'feature.checkpointed', summary: cleanSummary, details: { head: snapshot.head, clean: snapshot.clean, nextAction: next, unresolved: openQuestions } });
+      await addEvent(ctx, { featureId: row.id, kind: 'feature.checkpointed', summary: cleanSummary, details: { head: snapshot.head, clean: snapshot.clean, checkoutFingerprint: complete ? 'complete' : 'indeterminate', nextAction: next, unresolved: openQuestions } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
-      return { checkpointId: id, semanticGeneration, feature: summarizeFeature(ctx, current), git: snapshot, compaction: { featureSession: Boolean(row.thread_id), metaSession: 'recommended_at_switch' } };
+      return {
+        checkpointId: id, semanticGeneration, feature: summarizeFeature(ctx, current), git: snapshot, checkoutFingerprint: fingerprint,
+        ...(complete ? {} : { warnings: [`The checkout fingerprint is indeterminate (${indeterminateReasons(fingerprint).join(', ')}); an idle switch can still detect definite drift from it, but cannot prove freshness without accept_unverified_checkout.`] }),
+        compaction: { featureSession: Boolean(row.thread_id), metaSession: 'recommended_at_switch' },
+      };
     } finally { ctx.db.close(); }
   });
 }
 
-export async function switchFeature({ workspace_path, feature }) {
+export async function switchFeature({ workspace_path, feature, accept_unverified_checkout = false }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
+  if (typeof accept_unverified_checkout !== 'boolean') throw new TheaterError('accept_unverified_checkout must be a boolean.', 'INVALID_INPUT');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
@@ -943,16 +1074,26 @@ export async function switchFeature({ workspace_path, feature }) {
         return { changed: false, focus: slug, feature: summarizeFeature(ctx, destination), git: packet.snapshot, coordinatorCompactionRecommended: false };
       }
       const outgoing = outgoingSlug ? featureBySlug(ctx.db, outgoingSlug) : null;
+      let observation = null;
+      if (outgoing) {
+        // Semantic freshness takes precedence and is cheap, so a stale lane fails before any Git scan.
+        assertCheckpointFresh(ctx.db, outgoing);
+        observation = await observeCheckout(ctx.db, outgoing);
+      }
+      let checkoutFreshness = null;
       transaction(ctx.db, () => {
         if (outgoing) {
           // Checked inside the transaction: verification writes hold only the lane's control lock.
           assertCheckpointFresh(ctx.db, outgoing);
+          // Worker state is re-read here, after the scan, before the active-worker exception applies.
+          checkoutFreshness = applyCheckoutFreshness(ctx.db, outgoing, observation, accept_unverified_checkout);
           // Compaction scheduling is housekeeping, not a lane change, so it leaves the generation alone.
           ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(outgoing.id);
         }
         meta(ctx.db, 'focus', slug);
       });
-      await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoing?.slug ?? null, to: slug } });
+      const freshnessEvent = checkoutFreshness && { status: checkoutFreshness.status, changed: checkoutFreshness.changed, worker: checkoutFreshness.worker, accepted: checkoutFreshness.accepted, caveat: checkoutFreshness.caveat };
+      await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoing?.slug ?? null, to: slug, ...(freshnessEvent ? { checkoutFreshness: freshnessEvent } : {}) } });
       const current = featureBySlug(ctx.db, slug);
       const packet = await writeFeatureContext(ctx, current);
       if (outgoing) await writeFeatureContext(ctx, outgoing.slug);
@@ -964,6 +1105,7 @@ export async function switchFeature({ workspace_path, feature }) {
         feature: summarizeFeature(ctx, current),
         contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
         git: packet.snapshot,
+        checkoutFreshness,
         compactFeatureThreadId: outgoing?.thread_id ?? null,
         coordinatorCompactionRecommended: Boolean(outgoing),
         compactionDirective: outgoing

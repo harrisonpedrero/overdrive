@@ -140,7 +140,9 @@ function commandDescription(argv) {
   return argv.map(part => (/^[a-zA-Z0-9_./:@\\=-]+$/.test(part) ? part : JSON.stringify(part))).join(' ');
 }
 
-export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false } = {}) {
+// binary returns stdout as a byte-exact Buffer capped at maxOutput bytes, for output such as raw
+// Git paths that must never pass through per-chunk text decoding.
+export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, binary = false } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new TheaterError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
@@ -179,7 +181,17 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       if (next.length > maxOutput) overflow = true;
       return next.slice(0, maxOutput);
     };
-    child.stdout.on('data', chunk => { stdout = collect(stdout, chunk); });
+    const bytes = [];
+    let byteCount = 0;
+    const collectBytes = chunk => {
+      const room = maxOutput - byteCount;
+      if (chunk.length > room) overflow = true;
+      if (room <= 0) return;
+      const part = chunk.subarray(0, room);
+      bytes.push(part);
+      byteCount += part.length;
+    };
+    child.stdout.on('data', chunk => { if (binary) collectBytes(chunk); else stdout = collect(stdout, chunk); });
     child.stderr.on('data', chunk => { stderr = collect(stderr, chunk); });
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -197,9 +209,10 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
     });
     child.once('close', code => {
       clearTimeout(timer);
-      if (allowFailure) return resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs: Date.now() - started, argv });
-      if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
-      const detail = stderr.trim().slice(-4_000) || stdout.trim().slice(-4_000) || 'No output';
+      if (binary) stdout = Buffer.concat(bytes);
+      if (allowFailure) return resolve({ stdout: binary ? stdout : stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs: Date.now() - started, argv });
+      if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput || binary ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
+      const detail = stderr.trim().slice(-4_000) || (binary ? '' : stdout.trim().slice(-4_000)) || 'No output';
       reject(new TheaterError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}: ${detail}`, 'COMMAND_FAILED'));
     });
   });

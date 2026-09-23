@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { checkoutPath } from './git.mjs';
 import { TheaterError, contained, ensureManagedPath, now, readJson } from './util.mjs';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 export const CHECK_QUEUE_META = 'checks:queue';
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
@@ -104,6 +104,7 @@ function schema(db) {
       next_action TEXT NOT NULL,
       unresolved_json TEXT NOT NULL DEFAULT '[]',
       semantic_generation INTEGER,
+      checkout_fingerprint_json TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -187,7 +188,8 @@ function migrate(db, currentVersion) {
     const additions = {
       // Checkpoints saved before generations existed stay NULL and never prove freshness.
       features: { thread_harness: 'TEXT', semantic_generation: 'INTEGER NOT NULL DEFAULT 0' },
-      checkpoints: { semantic_generation: 'INTEGER' },
+      // Checkpoints saved before checkout fingerprints existed stay NULL: their checkout is unverified.
+      checkpoints: { semantic_generation: 'INTEGER', checkout_fingerprint_json: 'TEXT' },
       evidence: {
         source: "TEXT NOT NULL DEFAULT 'reported'", spec_revision: 'INTEGER NOT NULL DEFAULT -1',
         contract_hash: "TEXT NOT NULL DEFAULT ''", check_key: 'TEXT', argv_json: 'TEXT',
