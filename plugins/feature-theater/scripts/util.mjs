@@ -245,8 +245,10 @@ export async function normalizeRepositorySource(value) {
   return { source: real, kind: 'local' };
 }
 
+// A lock name is an operation name, or a lane control lock: `control-` followed by a whole feature
+// slug. The prefix sits outside the 63-character body so every accepted slug keeps a distinct lock.
 export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_000 } = {}) {
-  if (typeof operation !== 'string' || !/^[a-z][a-z0-9-]{0,62}$/.test(operation)) {
+  if (typeof operation !== 'string' || !/^(?:control-)?[a-z][a-z0-9-]{0,62}$/.test(operation)) {
     throw new TheaterError('Workspace lock name is invalid.', 'INVALID_LOCK');
   }
   const lockDirectory = await ensureManagedPath(root, contained(root, '.theater', 'locks'));
