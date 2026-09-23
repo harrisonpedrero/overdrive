@@ -349,6 +349,9 @@ export function featureBySlug(db, slug) {
   return assertBoundCheckout(readFeatureRow(db, slug));
 }
 
+export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded candidate.';
+const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
+
 export function normalizeFeature(row, root = undefined) {
   const feature = {
     ...row,
@@ -356,6 +359,9 @@ export function normalizeFeature(row, root = undefined) {
     spec_revision: Number(row.spec_revision),
     compaction_pending: Boolean(row.compaction_pending),
   };
+  // Completion accepts the reviewed candidate but does not prove delivery; the stored review
+  // instruction stays as history and any later explicit checkpoint direction is shown as saved.
+  if (row.status === 'done' && row.next_action === CANDIDATE_REVIEW_ACTION) feature.next_action = COMPLETED_ACTION;
   if (root) {
     feature.checkout_location = checkoutLocation(root, row);
     // Only the path under the current root is ever exposed as the lane's checkout.

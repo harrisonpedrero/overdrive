@@ -34,6 +34,7 @@ import {
   verifyCheckoutRevision,
 } from './git.mjs';
 import {
+  CANDIDATE_REVIEW_ACTION,
   assertBoundCheckout,
   featureBySlug,
   initializeDatabase,
@@ -976,7 +977,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
           .run(id, row.id, resolved, row.base_revision, cleanSummary, JSON.stringify(cleanChecks), stamp);
         ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
         ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, next_action = ?, updated_at = ? WHERE id = ?")
-          .run(cleanSummary, 'Review or integrate the exact recorded candidate.', stamp, row.id);
+          .run(cleanSummary, CANDIDATE_REVIEW_ACTION, stamp, row.id);
       });
       await addEvent(ctx, { featureId: row.id, kind: 'candidate.recorded', summary: `Recorded candidate ${resolved.slice(0, 12)} with ${cleanChecks.length} check(s).`, details: { candidateId: id, checks: cleanChecks, clean: snapshot.clean } });
       const current = featureBySlug(ctx.db, slug);
