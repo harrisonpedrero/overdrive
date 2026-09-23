@@ -6,7 +6,7 @@ import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { git } from '../plugins/feature-theater/scripts/util.mjs';
 import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
-import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 test('latest required receipt and current specification gate delivery; dirty checks cannot pass', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-evidence-'));
@@ -35,6 +35,31 @@ test('latest required receipt and current specification gate delivery; dirty che
   assert.equal(changed.receipts[0].passed, false);
   assert.match(changed.receipts[0].summary, /checkout changed/);
   assert.equal((await git(repo, 'status', '--porcelain')).stdout.includes('unexpected.txt'), true);
+});
+
+test('an archived lane refuses candidates until it is explicitly reactivated', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-archived-candidate-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'shelved' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Archive', description: 'Archive stays terminal.' });
+  await createFeature({ ...args, title: 'Shelved', outcome: 'Stays archived.', spec: '# Shelved\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(args)).verification.ready, true);
+  await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
+  await setFeatureStatus({ ...args, status: 'archived', disposition: 'Shelved without integration.' });
+  const archived = await getFeatureContext(args);
+  assert.equal(archived.verification.ready, true);
+  await assert.rejects(recordCandidate({ ...args, summary: 'Sneak back in.', checks: ['README receipt'] }), error => error.code === 'INVALID_TRANSITION' && /archived/.test(error.message) && /reactivate/i.test(error.message));
+  const after = await getFeatureContext(args);
+  assert.equal(after.feature.status, 'archived');
+  assert.equal(after.feature.summary, archived.feature.summary);
+  assert.equal(after.feature.nextAction, archived.feature.nextAction);
+  assert.deepEqual(after.candidates, archived.candidates);
+  assert.equal((await listFeatures({ workspace_path: workspace })).features.some(feature => feature.slug === 'shelved'), false);
+  await setFeatureStatus({ ...args, status: 'active' });
+  const reopened = await recordCandidate({ ...args, summary: 'Ready after reactivation.', checks: ['README receipt'] });
+  assert.equal(reopened.feature.status, 'review');
+  assert.equal((await listFeatures({ workspace_path: workspace })).features.some(feature => feature.slug === 'shelved'), true);
 });
 
 test('checks execute in saved order and reordering changes the contract', async t => {

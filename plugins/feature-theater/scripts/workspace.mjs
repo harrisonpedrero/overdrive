@@ -1225,6 +1225,8 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      // Recording moves the lane to review, so an archived lane must be reactivated explicitly first.
+      if (row.status === 'archived') throw new TheaterError(`Feature ${slug} is archived; reactivate it with theater_feature_status before recording a candidate.`, 'INVALID_TRANSITION');
       assertAgentIdle(row);
       const resolved = await verifyCheckoutRevision(row.checkout_path, revision);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
