@@ -1,7 +1,7 @@
 {
   "name": "feature-theater-local",
   "interface": {
-    "displayName": "Feature Theater Development"
+    "displayName": "OVERDRIVE Development"
   },
   "plugins": [
     {

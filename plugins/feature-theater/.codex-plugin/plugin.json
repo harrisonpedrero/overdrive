@@ -1,6 +1,6 @@
 {
   "name": "feature-theater",
-  "version": "0.1.0+codex.20260923172057",
+  "version": "0.1.0+codex.20260923180332",
   "description": "OVERDRIVE runs each feature in an isolated repository clone and orchestrates the lane workers, with durable specs, live steering, executed verification, and an inline work graph.",
   "author": {
     "name": "Harrison Pedrero"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "OVERDRIVE",
     "shortDescription": "Isolated feature clones, orchestrated from Codex.",
-    "longDescription": "OVERDRIVE develops a repository through isolated feature clones orchestrated from one conversation. Adopt a repository or begin a managed project from scratch; every feature lane gets its own full clone, durable spec, and context packet. GPT-6 Astra refines specs, dispatches and steers lane workers, and checkpoints context. A native work graph shows dependencies, progress, and blockers; all interaction stays in the existing conversation. Required checks execute against exact commits and the current feature contract before a lane is accepted.",
+    "longDescription": "OVERDRIVE develops a repository through isolated feature clones orchestrated from one conversation. Adopt a repository or begin a managed project from scratch; every feature lane gets its own full clone, durable spec, and context packet. The coordinator refines specs, dispatches and steers lane workers, and checkpoints context. A native work graph shows dependencies, progress, and blockers; all interaction stays in the existing conversation. Required checks execute against exact commits and the current feature contract before a lane is accepted.",
     "developerName": "Harrison Pedrero",
     "category": "Productivity",
     "capabilities": [
