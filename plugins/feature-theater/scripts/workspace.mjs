@@ -906,9 +906,9 @@ export async function switchFeature({ workspace_path, feature }) {
         const checkpoint = latestCheckpoint(ctx.db, outgoing.id);
         if (!checkpoint || checkpoint.created_at < outgoing.updated_at) throw new TheaterError(`Checkpoint ${outgoing.slug} after its latest change before switching.`, 'CHECKPOINT_REQUIRED');
       }
-      const stamp = now();
       transaction(ctx.db, () => {
-        if (outgoing) ctx.db.prepare('UPDATE features SET compaction_pending = 1, updated_at = ? WHERE id = ?').run(stamp, outgoing.id);
+        // Compaction scheduling is housekeeping, not a lane change; leave updated_at so the outgoing checkpoint stays fresh.
+        if (outgoing) ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(outgoing.id);
         meta(ctx.db, 'focus', slug);
       });
       await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoing?.slug ?? null, to: slug } });

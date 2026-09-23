@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { git } from '../plugins/feature-theater/scripts/util.mjs';
+import { git, now, sleep } from '../plugins/feature-theater/scripts/util.mjs';
 import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
 import {
   checkpointFeature,
@@ -289,6 +289,46 @@ test('checkpoints and switches focus without moving active clones', async t => {
   assert.ok(await fs.stat(path.join(workspace, 'features', 'beta', 'repo', '.git')));
   const index = await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8');
   assert.match(index, /Focused feature: beta/);
+});
+
+// Checkpoint freshness compares millisecond timestamps strictly; step past the latest stamp so a change cannot tie it.
+async function advanceClock() {
+  const start = now();
+  while (now() === start) await sleep(1);
+}
+
+test('keeps checkpoints fresh across focus round-trips until the lane changes', async t => {
+  const { source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  await createFeature({ workspace_path: workspace, feature: 'alpha', title: 'Alpha', outcome: 'Alpha outcome.' });
+  await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
+  await switchFeature({ workspace_path: workspace, feature: 'alpha' });
+  await checkpointFeature({ workspace_path: workspace, feature: 'alpha', summary: 'Alpha is scoped.', next_action: 'Implement alpha.' });
+  const toBeta = await switchFeature({ workspace_path: workspace, feature: 'beta' });
+  assert.equal(toBeta.from.compactionPending, true);
+  await checkpointFeature({ workspace_path: workspace, feature: 'beta', summary: 'Beta is scoped.', next_action: 'Implement beta.' });
+  assert.equal((await switchFeature({ workspace_path: workspace, feature: 'alpha' })).focus, 'alpha');
+  const again = await switchFeature({ workspace_path: workspace, feature: 'beta' });
+  assert.equal(again.focus, 'beta');
+  assert.equal(again.from.compactionPending, true);
+
+  await switchFeature({ workspace_path: workspace, feature: 'alpha' });
+  await advanceClock();
+  await updateSpec({ workspace_path: workspace, feature: 'alpha', content: '# Alpha\n\nRevised after round-trip.\n', rationale: 'Exercise checkpoint freshness.' });
+  await assert.rejects(
+    switchFeature({ workspace_path: workspace, feature: 'beta' }),
+    error => error.code === 'CHECKPOINT_REQUIRED',
+  );
+  await checkpointFeature({ workspace_path: workspace, feature: 'alpha', summary: 'Alpha spec is revised.', next_action: 'Implement revised alpha.' });
+  assert.equal((await switchFeature({ workspace_path: workspace, feature: 'beta' })).focus, 'beta');
+
+  await switchFeature({ workspace_path: workspace, feature: 'alpha' });
+  await advanceClock();
+  await planWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'build', title: 'Build' }] });
+  await assert.rejects(
+    switchFeature({ workspace_path: workspace, feature: 'beta' }),
+    error => error.code === 'CHECKPOINT_REQUIRED',
+  );
 });
 
 test('rejects repository URLs containing credentials', async t => {
