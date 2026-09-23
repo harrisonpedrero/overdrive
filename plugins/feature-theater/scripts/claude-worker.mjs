@@ -21,6 +21,8 @@ const DEFAULT_OPTIONS = Object.freeze({
 const RETAINED_TURNS = 4;
 const DIFF_DEBOUNCE_MS = 4_000;
 const RESULT_GRACE_MS = 15_000;
+const TERMINATION_TIMEOUT_MS = 5_000;
+const EXIT_DRAIN_MS = 1_000;
 
 function toolList(value, name) {
   if (value === undefined) return undefined;
@@ -82,20 +84,52 @@ function textOf(input) {
   return '';
 }
 
-function killTree(child) {
-  if (!child || child.exitCode !== null) return;
-  if (process.platform === 'win32') {
-    const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', shell: false });
-    killer.once('error', () => child.kill());
-    return;
-  }
-  child.kill('SIGTERM');
+const exited = child => child.exitCode !== null || child.signalCode !== null;
+
+function waitForExit(child, timeoutMs) {
+  if (exited(child)) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const onExit = () => { clearTimeout(timer); resolve(true); };
+    const timer = setTimeout(() => { child.off('exit', onExit); resolve(exited(child)); }, timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
+function runKiller({ command, args }, timeoutMs) {
+  return new Promise(resolve => {
+    let killer;
+    try { killer = spawn(command, args, { windowsHide: true, stdio: 'ignore', shell: false }); } catch { resolve(false); return; }
+    const timer = setTimeout(() => { killer.kill(); resolve(false); }, timeoutMs);
+    killer.once('error', () => { clearTimeout(timer); resolve(false); });
+    killer.once('exit', code => { clearTimeout(timer); resolve(code === 0); });
+  });
+}
+
+const defaultTreeKill = pid => (process.platform === 'win32' ? { command: 'taskkill.exe', args: ['/PID', String(pid), '/T', '/F'] } : null);
+
+// Resolves true only once the worker process has actually exited. taskkill /T also stops the
+// tools Claude launched; when it cannot run, fails or stalls, the direct child is terminated
+// instead and onDirectKill records that its descendants were not confirmed stopped. Only this
+// child's PID is ever targeted, and never after it has exited.
+async function terminateTree(child, treeKill, timeoutMs, onDirectKill = () => {}) {
+  if (!child || exited(child)) return true;
+  const tree = treeKill(child.pid);
+  if (tree && await runKiller(tree, timeoutMs) && await waitForExit(child, timeoutMs)) return true;
+  if (exited(child)) return true;
+  onDirectKill();
+  try { child.kill(); } catch { /* reported through the exit wait below */ }
+  if (await waitForExit(child, timeoutMs)) return true;
+  if (process.platform === 'win32') return false;
+  try { child.kill('SIGKILL'); } catch { /* reported through the exit wait below */ }
+  return await waitForExit(child, timeoutMs);
 }
 
 export class ClaudeWorkerBridge extends EventEmitter {
-  constructor({ launch } = {}) {
+  constructor({ launch, treeKill = defaultTreeKill, terminationTimeoutMs = TERMINATION_TIMEOUT_MS } = {}) {
     super();
     this.launchOverride = launch;
+    this.treeKill = treeKill;
+    this.terminationTimeoutMs = terminationTimeoutMs;
     this.launch = null;
     this.threads = new Map();
   }
@@ -114,7 +148,8 @@ export class ClaudeWorkerBridge extends EventEmitter {
 
   #register({ threadId, cwd, runtimeWorkspaceRoots = [], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, persisted }) {
     const existing = this.threads.get(threadId);
-    const meta = {
+    // Updated in place: an in-flight turn keeps finishing against the same record.
+    const meta = Object.assign(existing ?? {}, {
       id: threadId,
       cwd,
       addDirs: runtimeWorkspaceRoots.filter(root => root && path.resolve(root) !== path.resolve(cwd)),
@@ -126,8 +161,9 @@ export class ClaudeWorkerBridge extends EventEmitter {
       persisted: existing?.persisted || persisted,
       turns: existing?.turns ?? [],
       active: existing?.active ?? null,
+      lingering: existing?.lingering ?? null,
       updatedAt: now(),
-    };
+    });
     this.threads.set(threadId, meta);
     return meta;
   }
@@ -163,22 +199,63 @@ export class ClaudeWorkerBridge extends EventEmitter {
     throw new TheaterError(`Claude workers answer permission prompts by policy; request ${requestId} is not live.`, 'REQUEST_ORPHANED');
   }
 
+  // Stops every worker process this bridge still holds. Callers may ignore the result; it
+  // resolves with the PIDs that did not exit, which are also written to stderr.
   shutdown() {
     const affected = [];
+    const stopping = [];
+    const stop = (child, termination) => stopping.push(termination.then(stopped => (stopped ? null : child.pid)));
     for (const meta of this.threads.values()) {
+      const previous = meta.lingering;
+      if (previous && !exited(previous)) stop(previous, terminateTree(previous, this.treeKill, this.terminationTimeoutMs));
       if (!meta.active) continue;
       affected.push(meta.id);
-      meta.active.interrupted = true;
-      killTree(meta.active.child);
+      const turn = meta.active;
+      try { turn.child?.stdin?.end(); } catch { /* process already gone */ }
+      stop(turn.child, this.#stop(turn));
     }
     this.threads.clear();
     if (affected.length) this.emit('exit', new TheaterError('Claude worker bridge closed.', 'CLAUDE_CLOSED'), affected);
+    return Promise.all(stopping).then(pids => {
+      const unstopped = pids.filter(pid => pid !== null);
+      if (unstopped.length) process.stderr.write(`[feature-theater] Claude worker process(es) ${unstopped.join(', ')} did not exit on shutdown.\n`);
+      return { unstopped };
+    });
+  }
+
+  // Once an interrupt begins, only termination decides the turn: late output and a pending
+  // steer grace period can no longer complete it.
+  #stop(turn) {
+    turn.interrupted = true;
+    clearTimeout(turn.graceTimer);
+    turn.termination ??= terminateTree(turn.child, this.treeKill, this.terminationTimeoutMs, () => { turn.descendantsUnconfirmed = true; });
+    return turn.termination;
+  }
+
+  // A finished turn's process normally exits once its stdin closes. If one is still running
+  // when the next turn starts it is given that chance, then stopped; two processes never share
+  // a session. This guard is in memory only and does not survive a bridge restart.
+  async #settlePrevious(threadId) {
+    const meta = this.#thread(threadId);
+    if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
+    const previous = meta.lingering;
+    if (!previous || exited(previous)) return;
+    if (await waitForExit(previous, this.terminationTimeoutMs)) return;
+    if (await terminateTree(previous, this.treeKill, this.terminationTimeoutMs)) return;
+    throw new TheaterError(`Claude worker process ${previous.pid} from an earlier turn is still running in ${meta.cwd} and could not be stopped; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING');
+  }
+
+  #track(meta, child) {
+    meta.lingering = child;
+    child.once('exit', () => { if (meta.lingering === child) meta.lingering = null; });
   }
 
   async #startTurn({ threadId, input, effort }) {
+    await this.#settlePrevious(threadId);
     const meta = this.#thread(threadId);
     if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
-    const turn = { id: `turn_${randomUUID()}`, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, interrupted: false, child: null, diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
+    meta.lingering = null;
+    const turn = { id: `turn_${randomUUID()}`, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, interrupted: false, child: null, termination: null, descendantsUnconfirmed: false, diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
     const args = [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)];
     const child = spawn(this.launch.command, args, { cwd: meta.cwd, env: workerEnvironment(), windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
     turn.child = child;
@@ -198,10 +275,21 @@ export class ClaudeWorkerBridge extends EventEmitter {
       }
     });
     child.stderr.on('data', chunk => { turn.stderrTail = (turn.stderrTail + chunk).slice(-8_000); });
-    child.once('error', error => { void this.#finish(meta, turn, 'failed', `Unable to launch the Claude worker: ${error.message}`); });
+    // A dead worker surfaces through its exit; a write to its closed stdin must not crash the host.
+    child.stdin.on('error', () => {});
+    child.on('error', error => {
+      // Before spawn this is a launch failure; afterwards it is a failed kill, which termination reports.
+      if (child.pid === undefined) void this.#finish(meta, turn, 'failed', `Unable to launch the Claude worker: ${error.message}`);
+    });
     child.once('exit', code => {
-      if (turn.status !== 'inProgress') return;
-      void this.#finish(meta, turn, turn.interrupted ? 'interrupted' : 'failed', turn.interrupted ? undefined : `Claude worker exited (${code}) before completing the turn. ${turn.stderrTail.trim()}`.trim());
+      // stdout can still hold the final result when the process exits; let it drain briefly.
+      const settle = () => {
+        if (turn.status !== 'inProgress') return;
+        void this.#finish(meta, turn, turn.interrupted ? 'interrupted' : 'failed', turn.interrupted ? undefined : `Claude worker exited (${code}) before completing the turn. ${turn.stderrTail.trim()}`.trim());
+      };
+      if (child.stdout.readableEnded) return settle();
+      const timer = setTimeout(settle, EXIT_DRAIN_MS);
+      child.stdout.once('end', () => { clearTimeout(timer); settle(); });
     });
     await new Promise((resolve, reject) => {
       child.once('spawn', resolve);
@@ -223,20 +311,24 @@ export class ClaudeWorkerBridge extends EventEmitter {
   #steer({ threadId, expectedTurnId, input }) {
     const meta = this.#thread(threadId);
     const turn = meta.active;
-    if (!turn || turn.id !== expectedTurnId) throw new TheaterError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
+    if (!turn || turn.id !== expectedTurnId || turn.interrupted) throw new TheaterError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
     turn.pendingResults += 1;
     clearTimeout(turn.graceTimer);
     this.#send(turn, textOf(input));
     return { turnId: turn.id };
   }
 
-  #interrupt({ threadId, turnId }) {
+  // Reports success only after the worker process has exited. If it cannot be stopped the
+  // turn fails visibly and the next turn start must stop that process first.
+  async #interrupt({ threadId, turnId }) {
     const meta = this.#thread(threadId);
     const turn = meta.active;
     if (!turn || turn.id !== turnId) return { interrupted: false };
-    turn.interrupted = true;
-    killTree(turn.child);
-    return { interrupted: true };
+    const pid = turn.child.pid;
+    if (await this.#stop(turn)) return { interrupted: true };
+    const message = `Interrupt could not stop Claude worker process ${pid}; it may still be running in ${meta.cwd}. The next turn start retries stopping it.`;
+    await this.#finish(meta, turn, 'failed', message);
+    throw new TheaterError(message, 'CLAUDE_TERMINATION_FAILED');
   }
 
   #read({ threadId }) {
@@ -268,7 +360,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   #event(meta, turn, message) {
-    if (turn.status !== 'inProgress') return;
+    if (turn.status !== 'inProgress' || turn.interrupted) return;
     if (message.type === 'system' && message.subtype === 'init') {
       meta.persisted = true;
       clearTimeout(turn.graceTimer);
@@ -300,7 +392,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
       }
       // A steer was queued; the CLI normally starts a new response for it. If nothing
       // follows, the queued message was folded into this response and the turn is done.
-      turn.graceTimer = setTimeout(() => { void this.#finish(meta, turn, 'completed'); }, RESULT_GRACE_MS);
+      turn.graceTimer = setTimeout(() => { if (!turn.interrupted) void this.#finish(meta, turn, 'completed'); }, RESULT_GRACE_MS);
     }
   }
 
@@ -335,12 +427,15 @@ export class ClaudeWorkerBridge extends EventEmitter {
     turn.diffTimer = null;
     if (meta.active === turn) meta.active = null;
     meta.updatedAt = now();
-    try { turn.child?.stdin?.end(); } catch { /* process already gone */ }
+    const child = turn.child;
+    if (child && child.pid !== undefined && !exited(child)) this.#track(meta, child);
+    try { child?.stdin?.end(); } catch { /* process already gone */ }
     const patch = await this.#workingPatch(meta).catch(() => null);
     if (patch) this.emit('notification', { method: 'turn/diff/updated', params: { threadId: meta.id, turnId: turn.id, diff: patch } });
     const items = [];
     const text = failureText ?? turn.final ?? turn.text.join('\n');
     if (text) items.push({ type: 'agentMessage', text });
+    if (turn.descendantsUnconfirmed && status === 'interrupted') items.push({ type: 'agentMessage', text: 'The worker process tree could not be ended as a whole, so only the worker process itself was terminated; tools it launched may still be running.' });
     if (turn.denials.length) items.push({ type: 'agentMessage', text: `Worker permission policy denied ${turn.denials.length} tool call(s): ${[...new Set(turn.denials)].join(', ')}. Route those needs through the coordinator.` });
     turn.items = items;
     turn.text = [];
