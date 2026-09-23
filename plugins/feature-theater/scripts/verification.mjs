@@ -63,15 +63,15 @@ export function assertAgentIdle(feature) {
 }
 
 // Reports whether a candidate or the lane status actually changed; callers own the generation bump.
-// An active, review or done lane then trades the review direction its candidate generated for the
-// work graph's, unless a checkpoint since the latest candidate or archive saved that exact text.
-// Event ids give the order. Paused, blocked and archived lanes keep their own direction rules.
+// Generated review text then yields to the work graph's direction on active, review, done and blocked
+// lanes (reactivation keeps a blocked lane's stored text), unless a checkpoint saved that exact text
+// after the latest candidate or archive event.
 export function invalidateCandidates(db, featureId) {
   const { status } = db.prepare('SELECT status FROM features WHERE id = ?').get(featureId);
   const superseded = db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId).changes;
   const reopened = db.prepare("UPDATE features SET status = 'active' WHERE id = ? AND status IN ('done','review')").run(featureId).changes;
   if (!superseded && !reopened) return false;
-  if (['active', 'review', 'done'].includes(status)) {
+  if (['active', 'review', 'done', 'blocked'].includes(status)) {
     db.prepare(`UPDATE features SET next_action = ? WHERE id = ? AND next_action = ? AND NOT EXISTS (
       SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
       AND json_extract(checkpointed.details_json, '$.nextAction') = features.next_action

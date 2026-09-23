@@ -747,7 +747,7 @@ test('resuming a paused lane drops review direction only for a candidate superse
   assert.equal((await setFeatureStatus({ ...failing, status: 'active' })).feature.nextAction, READY);
 });
 
-test('superseding a candidate retires only its generated review direction on active, review and done lanes', async t => {
+test('superseding a candidate retires only its generated review direction on active, review, done and blocked lanes', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-superseded-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }];
@@ -838,12 +838,26 @@ test('superseding a candidate retires only its generated review direction on act
   assert.deepEqual(candidates('failing'), ['superseded']);
   agreeOn(await directions(workspace, 'failing'), READY);
 
-  // Blocked and archived lanes keep their stored direction.
+  // A blocked lane stays blocked with its blocker, but no longer awaits the superseded candidate,
+  // so reactivating it cannot bring back an impossible review instruction.
   const blocked = await reviewed('blocked');
   await setFeatureStatus({ ...blocked, status: 'blocked', blocker: 'Waiting on review.' });
   await updateChecks({ ...blocked, checks: revised });
-  assert.equal(storedDirection(workspace, 'blocked').feature, REVIEW);
-  assert.equal((await getFeatureContext(blocked)).feature.status, 'blocked');
+  assert.deepEqual(await saved('blocked'), retiredTo(READY, 'blocked'));
+  assert.deepEqual(candidates('blocked'), ['superseded']);
+  assert.equal((await getFeatureContext(blocked)).feature.blocker, 'Waiting on review.');
+  agreeOn(await directions(workspace, 'blocked'), READY);
+  assert.equal((await setFeatureStatus({ ...blocked, status: 'active' })).feature.nextAction, READY);
+  agreeOn(await directions(workspace, 'blocked'), READY);
+  // Review text a checkpoint saved after the candidate stays through the block and reactivation.
+  const held = await reviewed('held');
+  await setFeatureStatus({ ...held, status: 'blocked', blocker: 'Waiting on review.' });
+  await checkpointFeature({ ...held, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
+  await updateChecks({ ...held, checks: revised });
+  assert.deepEqual(await saved('held'), retiredTo(REVIEW, 'blocked'));
+  assert.equal((await setFeatureStatus({ ...held, status: 'active' })).feature.nextAction, REVIEW);
+
+  // Archived lanes keep their stored direction.
   const shelved = await reviewed('shelved');
   await setFeatureStatus({ ...shelved, status: 'archived', disposition: 'Shelved.' });
   await updateChecks({ ...shelved, checks: revised });
