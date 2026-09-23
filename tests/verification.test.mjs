@@ -10,7 +10,8 @@ import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs'
 import { callTool } from '../plugins/feature-theater/scripts/tools.mjs';
 import { git, withWorkspaceLock } from '../plugins/feature-theater/scripts/util.mjs';
 import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
-import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { drainCheckQueue, enqueueChecks } from '../plugins/feature-theater/scripts/check-queue.mjs';
+import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -138,6 +139,56 @@ test('a paused lane refuses candidates until it is explicitly resumed', async t 
   const reviewed = await getFeatureContext(args);
   assert.equal(reviewed.candidates.filter(candidate => candidate.status === 'ready').length, 1);
   assert.equal(reviewed.candidates.find(candidate => candidate.status === 'ready').summary, 'Ready after resuming.');
+});
+
+test('a Claude worker guard that outlives its completed turn blocks checks and candidates until it clears', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-live-worker-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'lingering' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Lingering', description: 'A worker can outlive its turn.' });
+  await createFeature({ ...args, title: 'Lingering', outcome: 'Verified only after the worker exits.', spec: '# Lingering\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(args)).verification.ready, true);
+  // The turn completed and the lane reads idle, but its worker process has not exited yet.
+  await bindAgentSession({ ...args, thread_id: 'claude-thread', harness: 'claude' });
+  await registerWorkerGuard({ ...args, thread_id: 'claude-thread', guard_id: 'live-process' });
+  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
+  const executedReceipts = () => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    try { return db.prepare("SELECT id FROM evidence WHERE source = 'executed' ORDER BY rowid").all().map(row => row.id); }
+    finally { db.close(); }
+  };
+  const receipts = executedReceipts();
+  // A queued job passes admission on the idle status alone; its runChecks call must still defer it.
+  await enqueueChecks({ workspace_path: workspace, jobs: [{ key: 'lingering-readme', feature: 'lingering', check_key: 'readme' }] });
+  const deferred = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'lingering-readme');
+  assert.equal(deferred.status, 'queued');
+  assert.equal(deferred.attempts.at(-1).status, 'deferred');
+  assert.match(deferred.reason, /worker process/);
+  assert.deepEqual(executedReceipts(), receipts);
+  const before = await getFeatureContext(args);
+  assert.equal(before.feature.agent.status, 'idle');
+  assert.equal(before.verification.ready, true);
+  const lingering = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /worker process/.test(error.message);
+  await assert.rejects(runChecks(args), lingering);
+  await assert.rejects(recordCandidate({ ...args, summary: 'Ready while the worker runs.', checks: ['README receipt'] }), lingering);
+  const after = await getFeatureContext(args);
+  assert.deepEqual(executedReceipts(), receipts);
+  assert.equal(after.feature.status, 'active');
+  assert.deepEqual(after.candidates, before.candidates);
+  assert.deepEqual(after.timeline, before.timeline);
+  assert.deepEqual(await readWorkerGuards(args), [{ id: 'live-process', threadId: 'claude-thread' }]);
+
+  await clearWorkerGuards({ ...args, guard_id: 'live-process' });
+  const drained = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'lingering-readme');
+  assert.equal(drained.status, 'passed');
+  assert.deepEqual(executedReceipts(), [...receipts, drained.attempts.at(-1).receiptId]);
+  const run = await runChecks(args);
+  assert.deepEqual(run.receipts.map(receipt => receipt.passed), [true]);
+  assert.equal(run.verification.ready, true);
+  const recorded = await recordCandidate({ ...args, summary: 'Ready after the worker exited.', checks: ['README receipt'] });
+  assert.equal(recorded.feature.status, 'review');
+  assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => candidate.status), ['ready']);
 });
 
 test('checks execute in saved order and reordering changes the contract', async t => {

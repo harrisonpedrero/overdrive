@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { assertAgentIdle, assertVerified, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
+import { assertAgentIdle, assertVerified, assertWorkersStopped, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
 import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, agentBusy, agentOwner, descendantsKey, ownerAlive, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -1242,6 +1242,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
       // Likewise a paused lane stays paused until it is explicitly resumed.
       if (row.status === 'paused') throw new TheaterError(`Feature ${slug} is paused; resume it with theater_feature_status before recording a candidate.`, 'INVALID_TRANSITION');
       assertAgentIdle(row);
+      assertWorkersStopped(ctx.db, row);
       const resolved = await verifyCheckoutRevision(row.checkout_path, revision);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       if (snapshot.head !== resolved) throw new TheaterError(`Candidate ${resolved.slice(0, 12)} is not the checkout HEAD ${snapshot.head.slice(0, 12)}.`, 'STALE_CANDIDATE');

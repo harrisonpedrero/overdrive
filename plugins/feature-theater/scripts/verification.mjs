@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
+import { workersKey } from './ownership.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function featureChecks(db, featureId) {
@@ -59,6 +60,15 @@ function captureContract(db, feature, definition) {
 export function assertAgentIdle(feature) {
   if (feature.active_turn_id || ['starting', 'uncertain', 'running', 'compacting', 'waiting_for_user'].includes(feature.agent_status)) {
     throw new TheaterError('Wait for the feature agent to stop before changing its contract or verifying a candidate.', 'AGENT_BUSY');
+  }
+}
+
+// A Claude worker process can outlive its completed turn and still change the checkout, so an idle
+// lane is verified only once its clean exit or a coordinator attestation has cleared every guard.
+export function assertWorkersStopped(db, feature) {
+  const guards = parseJson(meta(db, workersKey(feature.id)), []);
+  if (guards.length) {
+    throw new TheaterError('A worker process from this lane has not confirmed its exit. Wait for it to stop, or stop the lane with an attestation, before verifying or recording a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
   }
 }
 
@@ -251,6 +261,7 @@ export async function runChecks(args, execution = {}) {
   return withFeature(args, async (ctx, feature) => {
     assertCheckReservation(ctx.db, feature.id, execution.receiptId);
     assertAgentIdle(feature);
+    assertWorkersStopped(ctx.db, feature);
     const checks = featureChecks(ctx.db, feature.id);
     if (!checks.length) throw new TheaterError('Configure meaningful verification commands first.', 'CHECKS_REQUIRED');
     let selectedChecks = checks;
