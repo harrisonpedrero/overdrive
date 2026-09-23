@@ -662,6 +662,52 @@ export function reconcileReady(db, featureId) {
   return updates.length;
 }
 
+const READY_WORK_ACTION = 'Start or continue the highest-priority ready work.';
+
+function workKeyList(items) {
+  const keys = items.map(item => item.item_key);
+  return keys.length > 3 ? `${keys.slice(0, 3).join(', ')} and ${keys.length - 3} more` : keys.join(', ');
+}
+
+// Default lane direction implied by the work graph. It never claims delivery: settled work still
+// needs lane verification and a candidate.
+function workGraphAction(items) {
+  const having = (...statuses) => items.filter(item => statuses.includes(item.status));
+  if (having('ready').length) return READY_WORK_ACTION;
+  const stuck = having('blocked', 'failed');
+  if (stuck.length) {
+    const [first] = stuck;
+    const reason = String(first.blocker || '').replace(/\s+/g, ' ').trim();
+    const shown = reason.length > 240 ? `${reason.slice(0, 239)}…` : reason;
+    return `Resolve ${first.status} ${first.item_key}${shown ? `: ${shown}` : '.'}${stuck.length > 1 ? ` (+${stuck.length - 1} more blocked or failed)` : ''}`;
+  }
+  if (having('review').length) return `Review work awaiting acceptance: ${workKeyList(having('review'))}.`;
+  if (having('running').length) return `Await or reconcile running work: ${workKeyList(having('running'))}.`;
+  if (having('planned').length) return `Replan work waiting on cancelled dependencies: ${workKeyList(having('planned'))}.`;
+  if (items.length) return 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.';
+  return 'Plan bounded work from the current spec.';
+}
+
+// Refresh the stored direction only while it is still a work-graph default. Spec revisions,
+// candidates, promotion, done/archived lifecycle and any checkpoint saved since the last
+// derivation keep their deliberately chosen text. Event ids give the exact order; timestamps can tie.
+function refreshWorkAction(db, featureId, previousItems) {
+  const feature = db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(featureId);
+  if (['done', 'archived'].includes(feature.status)) return null;
+  const stored = feature.next_action;
+  if (stored !== READY_WORK_ACTION && stored !== workGraphAction(previousItems)) return null;
+  const latest = db.prepare(`
+    SELECT kind, json_extract(details_json, '$.nextAction') AS next_action FROM events
+    WHERE feature_id = ? AND (kind IN ('feature.checkpointed', 'work.planned') OR (kind LIKE 'work.%' AND json_extract(details_json, '$.nextAction') IS NOT NULL))
+    ORDER BY id DESC LIMIT 1
+  `).get(featureId);
+  if (latest?.kind === 'feature.checkpointed' && latest.next_action === stored) return null;
+  const next = workGraphAction(workItems(db, featureId));
+  if (next === stored) return null;
+  db.prepare('UPDATE features SET next_action = ? WHERE id = ?').run(next, featureId);
+  return next;
+}
+
 export async function planWork({ workspace_path, feature, items }) {
   if (!Array.isArray(items) || !items.length || items.length > 200) throw new TheaterError('items must contain 1 to 200 work items.', 'INVALID_INPUT');
   const normalized = items.map((item, index) => {
@@ -693,6 +739,7 @@ export async function planWork({ workspace_path, feature, items }) {
       assertAgentIdle(row);
       const previousContract = featureContract(ctx.db, row);
       const stamp = now();
+      let nextAction;
       transaction(ctx.db, () => {
         const existing = workItems(ctx.db, row.id);
         const byKey = new Map(existing.map(item => [item.item_key, item]));
@@ -733,9 +780,10 @@ export async function planWork({ workspace_path, feature, items }) {
         validateWorkGraph(ctx.db, row.id);
         reconcileReady(ctx.db, row.id);
         if (previousContract !== featureContract(ctx.db, row)) invalidateCandidates(ctx.db, row.id);
-        ctx.db.prepare('UPDATE features SET next_action = ?, updated_at = ? WHERE id = ?').run('Start or continue the highest-priority ready work.', stamp, row.id);
+        nextAction = workGraphAction(workItems(ctx.db, row.id));
+        ctx.db.prepare('UPDATE features SET next_action = ?, updated_at = ? WHERE id = ?').run(nextAction, stamp, row.id);
       });
-      await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key) } });
+      await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key), nextAction } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
@@ -789,13 +837,15 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       const lease = status === 'running' ? new Date(Date.now() + lease_seconds * 1000).toISOString() : null;
       const clearResultRevision = ['planned', 'ready', 'running'].includes(status);
       const stamp = now();
+      let nextAction = null;
       transaction(ctx.db, () => {
         ctx.db.prepare(`UPDATE work_items SET status = ?, owner = ?, result_summary = ?, blocker = ?, result_revision = CASE WHEN ? THEN NULL ELSE COALESCE(?, result_revision) END, lease_expires_at = ?, updated_at = ? WHERE id = ?`)
           .run(status, status === 'running' ? cleanOwner : item.owner, cleanSummary, cleanBlocker, clearResultRevision ? 1 : 0, revision ?? null, lease, stamp, item.id);
         reconcileReady(ctx.db, row.id);
+        nextAction = refreshWorkAction(ctx.db, row.id, featureWork);
         ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(stamp, row.id);
       });
-      await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${cleanSummary ? `: ${cleanSummary}` : cleanBlocker ? `: ${cleanBlocker}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease } });
+      await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${cleanSummary ? `: ${cleanSummary}` : cleanBlocker ? `: ${cleanBlocker}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease, ...(nextAction ? { nextAction } : {}) } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
