@@ -40,6 +40,7 @@ import {
 import {
   ARCHIVED_ACTION,
   CANDIDATE_REVIEW_ACTION,
+  PAUSED_ACTION,
   assertBoundCheckout,
   bumpSemanticGeneration,
   featureBySlug,
@@ -53,6 +54,7 @@ import {
   parseJson,
   recordEvent,
   transaction,
+  unwrapPausedAction,
   workItems,
 } from './state.mjs';
 
@@ -890,6 +892,7 @@ export async function planWork({ workspace_path, feature, items }) {
       const stamp = now();
       let nextAction;
       let archived = false;
+      let paused = false;
       transaction(ctx.db, () => {
         const existing = workItems(ctx.db, row.id);
         const byKey = new Map(existing.map(item => [item.item_key, item]));
@@ -937,6 +940,7 @@ export async function planWork({ workspace_path, feature, items }) {
         // An archived lane keeps its terminal or checkpointed direction until it is reactivated.
         const saved = ctx.db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(row.id);
         archived = saved.status === 'archived';
+        paused = saved.status === 'paused';
         if (!archived) {
           nextAction = workGraphAction(workItems(ctx.db, row.id));
           if (saved.next_action !== nextAction) changed = true;
@@ -951,7 +955,10 @@ export async function planWork({ workspace_path, feature, items }) {
       const submittedKeys = new Set(normalized.map(item => item.key));
       const next = archived
         ? `${slug} is archived; reactivate it with theater_feature_status before claiming or dispatching its work.`
-        : 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.';
+        : paused
+          // A paused lane still derives its post-resume direction, but dispatches nothing yet.
+          ? `${slug} is paused; resume it with theater_feature_status (status active) before claiming or dispatching its work.`
+          : 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.';
       return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => submittedKeys.has(item.item_key)), next };
     } finally { ctx.db.close(); }
   });
@@ -1033,7 +1040,7 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  const next = requiredText(next_action, 'next_action', { max: 20_000 });
+  const next = unwrapPausedAction(requiredText(next_action, 'next_action', { max: 20_000 }));
   const openQuestions = cleanStringArray(unresolved, 'unresolved');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
@@ -1184,7 +1191,9 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       // still record explicit historical direction, which a repeated archive leaves in place.
       // Leaving the archive replaces only that terminal text, with the candidate or work graph direction.
       // The projected direction also treats a legacy archive's stored review text as terminal.
-      const terminal = featureBySlug(ctx.db, slug).next_action === ARCHIVED_ACTION;
+      // A paused lane projects the bare resume instruction when it has no direction to resume with:
+      // none stored, or generated review text whose candidate was superseded while paused.
+      const terminal = [ARCHIVED_ACTION, PAUSED_ACTION].includes(featureBySlug(ctx.db, slug).next_action);
       const resumed = ctx.db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(row.id) ? CANDIDATE_REVIEW_ACTION : workGraphAction(workItems(ctx.db, row.id));
       const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
         .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, terminal ? 1 : 0, resumed, stamp, row.id);

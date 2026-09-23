@@ -590,6 +590,113 @@ test('spec and work edits keep an archived lane archived until it is reactivated
   assert.deepEqual(events.slice(-6), ['feature.archived', 'feature.checkpointed', 'work.planned', 'spec.revised', 'work.planned', 'feature.active']);
 });
 
+const PAUSED = 'Paused. Resume the lane with theater_feature_status (status active) before claiming or dispatching work.';
+const READY = 'Start or continue the highest-priority ready work.';
+const REVIEW = 'Review or integrate the exact recorded candidate.';
+const pausedThen = next => `${PAUSED} Then: ${next}`;
+
+function storedDirection(workspace, slug) {
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  try {
+    const row = db.prepare('SELECT id, next_action FROM features WHERE slug = ?').get(slug);
+    return { feature: row.next_action, checkpoint: db.prepare('SELECT next_action FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id).next_action };
+  } finally { db.close(); }
+}
+
+test('a paused lane directs resuming first while its edits keep the post-resume direction', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-pause-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const lane = { workspace_path: workspace, feature: 'held' };
+  const plan = [{ key: 'readme', title: 'Write the README' }];
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Pause', description: 'Exercise paused direction.' });
+  await createFeature({ ...lane, title: 'Held', outcome: 'A documented project.', spec: '# Held\n\nThe README exists.' });
+  await planWork({ ...lane, items: plan });
+  agreeOn(await directions(workspace, 'held'), READY);
+
+  assert.equal((await setFeatureStatus({ ...lane, status: 'paused' })).feature.nextAction, pausedThen(READY));
+  agreeOn(await directions(workspace, 'held'), pausedThen(READY));
+
+  // Spec, plan and work edits stay durable and keep deriving the post-resume direction beneath.
+  assert.equal((await updateSpec({ ...lane, content: '# Held\n\nThe README also describes startup.', rationale: 'Scope startup.' })).changed, true);
+  agreeOn(await directions(workspace, 'held'), pausedThen('Reconcile the work graph with the revised specification.'));
+  const planned = await planWork({ ...lane, items: [...plan, { key: 'startup', title: 'Describe startup' }] });
+  assert.match(planned.next, /held is paused; resume it/);
+  assert.doesNotMatch(planned.next, /^Claim/);
+  assert.deepEqual(planned.workItems.map(item => item.item_key), ['readme', 'startup']);
+  agreeOn(await directions(workspace, 'held'), pausedThen(READY));
+  await updateWork({ ...lane, key: 'readme', status: 'blocked', blocker: 'Needs the parser.' });
+  await updateWork({ ...lane, key: 'startup', status: 'blocked', blocker: 'Needs the parser.' });
+  const stuck = 'Resolve blocked readme: Needs the parser. (+1 more blocked or failed)';
+  agreeOn(await directions(workspace, 'held'), pausedThen(stuck));
+  assert.equal(storedDirection(workspace, 'held').feature, stuck);
+
+  // Explicit checkpoint guidance is shown after the resume instruction, and an echo is not wrapped twice.
+  const note = 'Adopt the parser, then unblock readme.';
+  await checkpointFeature({ ...lane, summary: 'Waiting on the parser.', next_action: note });
+  agreeOn(await directions(workspace, 'held'), pausedThen(note));
+  await checkpointFeature({ ...lane, summary: 'Still waiting on the parser.', next_action: pausedThen(note) });
+  agreeOn(await directions(workspace, 'held'), pausedThen(note));
+  assert.deepEqual(storedDirection(workspace, 'held'), { feature: note, checkpoint: note });
+  assert.equal((await setFeatureStatus({ ...lane, status: 'active' })).feature.nextAction, note);
+  agreeOn(await directions(workspace, 'held'), note);
+
+  // Echoing the bare resume instruction leaves nothing beyond resuming; resuming then derives direction.
+  await setFeatureStatus({ ...lane, status: 'paused' });
+  await checkpointFeature({ ...lane, summary: 'Parked.', next_action: PAUSED });
+  agreeOn(await directions(workspace, 'held'), PAUSED);
+  assert.equal((await setFeatureStatus({ ...lane, status: 'active' })).feature.nextAction, stuck);
+
+  // Leaving a pause for any other status ends the resume-first projection; archiving stays terminal.
+  await setFeatureStatus({ ...lane, status: 'paused' });
+  assert.equal((await setFeatureStatus({ ...lane, status: 'blocked', blocker: 'Waiting on the parser.' })).feature.nextAction, stuck);
+  await setFeatureStatus({ ...lane, status: 'paused' });
+  assert.equal((await setFeatureStatus({ ...lane, status: 'archived', disposition: 'Parked for the parser.' })).feature.nextAction, ARCHIVED);
+  assert.equal((await setFeatureStatus({ ...lane, status: 'paused' })).feature.nextAction, pausedThen(stuck));
+  agreeOn(await directions(workspace, 'held'), pausedThen(stuck));
+  await setFeatureStatus({ ...lane, status: 'active' });
+  await updateWork({ ...lane, key: 'readme', status: 'ready' });
+  assert.match((await planWork({ ...lane, items: plan })).next, /^Claim/);
+});
+
+test('resuming a paused lane drops review direction only for a candidate superseded while paused', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-pause-review-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }];
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Pause review', description: 'Exercise paused candidate review.' });
+  const reviewed = async slug => {
+    const lane = { workspace_path: workspace, feature: slug };
+    await createFeature({ ...lane, title: slug, outcome: 'A reviewed candidate.', spec: '# Reviewed\n\nThe README exists.' });
+    await planWork({ ...lane, items: [{ key: 'readme', title: 'Write the README' }] });
+    await updateChecks({ ...lane, checks: check('Read the committed README') });
+    assert.equal((await runChecks(lane)).verification.ready, true);
+    await recordCandidate({ ...lane, summary: 'Ready.', checks: ['readme receipt'] });
+    return lane;
+  };
+
+  // While its candidate is still ready, a paused lane resumes to review it.
+  const held = await reviewed('held');
+  assert.equal((await setFeatureStatus({ ...held, status: 'paused' })).feature.nextAction, pausedThen(REVIEW));
+  assert.equal((await setFeatureStatus({ ...held, status: 'active' })).feature.nextAction, REVIEW);
+  await setFeatureStatus({ ...held, status: 'paused' });
+  // A contract change supersedes the candidate; the generated review text no longer applies.
+  await updateChecks({ ...held, checks: check('Read the README, revised') });
+  assert.equal((await getFeatureContext(held)).feature.status, 'paused');
+  // Verification leaves the workspace index to the next lane write; the live surfaces already agree.
+  const live = await directions(workspace, 'held');
+  delete live.index;
+  assert.deepEqual(live, { get: PAUSED, list: PAUSED, context: PAUSED });
+  assert.equal((await setFeatureStatus({ ...held, status: 'active' })).feature.nextAction, READY);
+  agreeOn(await directions(workspace, 'held'), READY);
+
+  // Review text that a checkpoint saved deliberately stays authoritative.
+  const kept = await reviewed('kept');
+  await setFeatureStatus({ ...kept, status: 'paused' });
+  await checkpointFeature({ ...kept, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
+  await updateChecks({ ...kept, checks: check('Read the README, revised') });
+  assert.equal((await getFeatureContext(kept)).feature.nextAction, pausedThen(REVIEW));
+  assert.equal((await setFeatureStatus({ ...kept, status: 'active' })).feature.nextAction, REVIEW);
+});
+
 test('rejects repository URLs containing credentials', async t => {
   const { workspace } = await fixture(t);
   await assert.rejects(initializeWorkspace({ workspace_path: workspace, repository: 'https://user:secret@example.com/repo.git' }), /embedded credentials/i);

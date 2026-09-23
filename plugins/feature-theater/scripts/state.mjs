@@ -348,11 +348,24 @@ export function assertBoundCheckout(feature) {
   );
 }
 
-// Whether an explicit checkpoint followed the lane's latest archive; event ids give the exact order.
+export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded candidate.';
+const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
+export const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
+export const PAUSED_ACTION = 'Paused. Resume the lane with theater_feature_status (status active) before claiming or dispatching work.';
+
+// Whether an explicit checkpoint followed the lane's latest archive, and whether a paused lane's
+// stored review direction is generated text whose candidate has since been superseded: no ready
+// candidate remains and no checkpoint since the latest candidate saved it. Event ids give the exact order.
 const FEATURE_COLUMNS = `*, CASE WHEN status = 'archived' THEN EXISTS (
   SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
   AND checkpointed.id > (SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind = 'feature.archived')
-) ELSE 0 END AS checkpointed_after_archive`;
+) ELSE 0 END AS checkpointed_after_archive, CASE WHEN status = 'paused' AND next_action = '${CANDIDATE_REVIEW_ACTION}' THEN NOT EXISTS (
+  SELECT 1 FROM candidates WHERE candidates.feature_id = features.id AND candidates.status = 'ready'
+) AND NOT EXISTS (
+  SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
+  AND json_extract(checkpointed.details_json, '$.nextAction') = features.next_action
+  AND checkpointed.id > COALESCE((SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind = 'candidate.recorded'), 0)
+) ELSE 0 END AS review_superseded`;
 
 export function readFeatureRow(db, slug) {
   const row = db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE slug = ?`).get(slug);
@@ -364,11 +377,14 @@ export function featureBySlug(db, slug) {
   return assertBoundCheckout(readFeatureRow(db, slug));
 }
 
-export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded candidate.';
-const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
-export const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
+// A checkpoint may echo the projected paused direction; only the direction after resume is stored.
+// The bare resume instruction is kept as is, and resuming replaces it with derived direction.
+export function unwrapPausedAction(text) {
+  if (!text.startsWith(PAUSED_ACTION)) return text;
+  return text.slice(PAUSED_ACTION.length).replace(/^\s*Then:\s*/, '').trim() || PAUSED_ACTION;
+}
 
-export function normalizeFeature({ checkpointed_after_archive: checkpointedAfterArchive, ...row }, root = undefined) {
+export function normalizeFeature({ checkpointed_after_archive: checkpointedAfterArchive, review_superseded: reviewSuperseded, ...row }, root = undefined) {
   const feature = {
     ...row,
     priority: Number(row.priority),
@@ -381,6 +397,9 @@ export function normalizeFeature({ checkpointed_after_archive: checkpointedAfter
   // Archiving closes the lane with a disposition, so a recorded candidate is no longer awaiting review.
   // Archives now store the terminal direction; this covers older ones unless a checkpoint followed.
   if (row.status === 'archived' && row.next_action === CANDIDATE_REVIEW_ACTION && !checkpointedAfterArchive) feature.next_action = ARCHIVED_ACTION;
+  // A paused lane dispatches nothing, so resuming comes first; the stored direction still evolves
+  // with edits and is shown as what follows, unless it is review text for a superseded candidate.
+  if (row.status === 'paused') feature.next_action = row.next_action && row.next_action !== PAUSED_ACTION && !reviewSuperseded ? `${PAUSED_ACTION} Then: ${row.next_action}` : PAUSED_ACTION;
   if (root) {
     feature.checkout_location = checkoutLocation(root, row);
     // Only the path under the current root is ever exposed as the lane's checkout.

@@ -428,6 +428,7 @@ test('a confirmed pause blocks dispatch until the lane is made active again', as
   turns().at(-1).status = 'completed';
   const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
   assert.deepEqual({ status: paused.feature.status, agent: paused.feature.agent.status, interrupted: paused.interruption.interrupted }, { status: 'paused', agent: 'idle', interrupted: false });
+  assert.match(paused.feature.nextAction, /^Paused\. Resume the lane/);
   await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'INVALID_TRANSITION');
   await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Keep going.' }), error => error.code === 'INVALID_TRANSITION');
   // Pausing an idle lane again is a plain transition that contacts no backend.
