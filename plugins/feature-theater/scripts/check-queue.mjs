@@ -5,6 +5,9 @@ import { assertAgentIdle, featureChecks, featureContract, runChecks, verificatio
 import { TheaterError, now, requiredText, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 const activeRunners = new Set();
+const HISTORY_LIMIT = 500;
+const RETIRED_EVENT = 'checks.queue_retired';
+const settled = job => ['passed', 'cancelled'].includes(job.status);
 const reserving = job => ['running', 'interrupted'].includes(job.status);
 const resources = job => [`clone:${job.featureId}`, ...job.resources.map(key => `shared:${key}`)];
 const overlaps = (left, right) => resources(left).some(key => resources(right).includes(key));
@@ -75,6 +78,31 @@ async function binding(ctx, job) {
   return feature;
 }
 
+function retiredJob(db, key) {
+  const row = db.prepare(`SELECT details_json FROM events WHERE kind = ? AND json_extract(details_json, '$.job.key') = ?
+    ORDER BY id DESC LIMIT 1`).get(RETIRED_EVENT, key);
+  return row ? JSON.parse(row.details_json).job : null;
+}
+
+// Only settled jobs leave the bounded queue, oldest first. Anything a remaining job depends on, this request names,
+// or the live drain started stays; the full record moves to the event log and its receipts stay in evidence.
+function retirable(queue, jobs, keep, excess) {
+  const since = queue.runner ? Date.parse(queue.runner.startedAt) : Infinity;
+  const retired = new Set();
+  let progress = true;
+  while (progress && retired.size < excess) {
+    progress = false;
+    const remaining = jobs.filter(job => !retired.has(job));
+    const referenced = new Set(remaining.flatMap(job => job.dependsOn));
+    for (const job of remaining) {
+      if (retired.size >= excess) break;
+      if (!settled(job) || keep.has(job) || referenced.has(job.key) || job.attempts.some(attempt => Date.parse(attempt.startedAt) >= since)) continue;
+      retired.add(job); progress = true;
+    }
+  }
+  return retired;
+}
+
 export async function enqueueChecks(args) {
   if (!Array.isArray(args.jobs) || !args.jobs.length || args.jobs.length > 50) throw new TheaterError('Supply 1–50 verification jobs.', 'INVALID_INPUT');
   const root = await resolveWorkspace(args.workspace_path);
@@ -93,14 +121,19 @@ export async function enqueueChecks(args) {
         revision: snapshot.head, contractHash: featureContract(ctx.db, feature),
         dependsOn: keys(input.depends_on ?? [], 'dependency key'), resources: keys(input.resources ?? [], 'resource key', 20),
       };
-      const existing = queue.jobs.find(item => item.key === key);
+      const live = queue.jobs.find(item => item.key === key);
+      const existing = live ?? retiredJob(ctx.db, key);
       if (existing && Object.keys(job).some(field => JSON.stringify(existing[field]) !== JSON.stringify(job[field]))) {
         throw new TheaterError('Job key already binds a different action; use a new key for a new revision or plan.', 'QUEUE_KEY_CONFLICT');
       }
-      additions.push(existing ?? { ...job, status: 'queued', queuedAt: now(), eligibleAt: null, reason: null, attempts: [] });
+      additions.push(live ?? (existing ? { ...existing, retired: true } : { ...job, status: 'queued', queuedAt: now(), eligibleAt: null, reason: null, attempts: [] }));
     }
-    const combined = [...queue.jobs, ...additions.filter(job => !queue.jobs.includes(job))];
-    if (combined.length > 500) throw new TheaterError('Queue history is limited to 500 jobs per workspace.', 'QUEUE_LIMIT');
+    let combined = [...queue.jobs, ...additions.filter(job => !job.retired && !queue.jobs.includes(job))];
+    const retiring = combined.length > HISTORY_LIMIT ? retirable(queue, combined, new Set(additions), combined.length - HISTORY_LIMIT) : new Set();
+    combined = combined.filter(job => !retiring.has(job));
+    if (combined.length > HISTORY_LIMIT) {
+      throw new TheaterError(`The queue retains at most ${HISTORY_LIMIT} jobs and none of the excess is settled, unreferenced history. Review failed, stale or interrupted jobs and retry or cancel them before queueing more.`, 'QUEUE_LIMIT');
+    }
     const visiting = new Set(), visited = new Set();
     function visit(job) {
       if (visiting.has(job.key)) throw new TheaterError('Queue dependencies must be acyclic.', 'INVALID_INPUT');
@@ -108,14 +141,19 @@ export async function enqueueChecks(args) {
       visiting.add(job.key);
       for (const key of job.dependsOn) {
         const dependency = combined.find(item => item.key === key);
-        if (!dependency) throw new TheaterError(`Unknown dependency: ${key}`, 'INVALID_INPUT');
+        if (!dependency) {
+          throw new TheaterError(retiredJob(ctx.db, key) ? `Dependency ${key} settled and was retired from queue history; depend on a fresh job instead.` : `Unknown dependency: ${key}`, 'INVALID_INPUT');
+        }
         visit(dependency);
       }
       visiting.delete(job.key); visited.add(job.key);
     }
     combined.forEach(visit);
+    for (const job of retiring) {
+      recordEvent(ctx.db, { featureId: job.featureId, kind: RETIRED_EVENT, summary: `Retired settled queue job ${job.key} (${job.status}); its receipts remain in evidence.`, details: { job } });
+    }
     queue.jobs = combined;
-    return { jobs: additions };
+    return { jobs: additions, ...(retiring.size ? { retired: [...retiring].map(job => job.key) } : {}) };
   });
 }
 

@@ -63,7 +63,7 @@ export const TOOLS = [
     features: { type: 'array', minItems: 1, maxItems: 8, uniqueItems: true, items: string('Feature slug still awaiting reconciliation; omit already handled idle lanes.') },
     timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
   }, ['workspace_path', 'features']), { readOnlyHint: true, openWorldHint: true }),
-  tool('theater_checks_enqueue', 'Queue authorized verification', 'Bind reviewed configured checks to their current clean commit and full contract. One check per job; stable keys make identical enqueue requests idempotent. Dependencies stop on failure; the same clone and named shared resources serialize. Up to 500 retained jobs per workspace.', object({
+  tool('theater_checks_enqueue', 'Queue authorized verification', 'Bind reviewed configured checks to their current clean commit and full contract. One check per job; stable keys make identical enqueue requests idempotent. Dependencies stop on failure; the same clone and named shared resources serialize. The queue keeps up to 500 jobs; beyond that the oldest unreferenced passed or cancelled jobs are retired to the event log, keeping their receipts.', object({
     ...workspace,
     jobs: { type: 'array', minItems: 1, maxItems: 50, items: object({
       key: string('Unique durable job key. Use a new key for a changed revision or plan.'), ...feature,
