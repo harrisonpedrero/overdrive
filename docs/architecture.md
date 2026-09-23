@@ -1,6 +1,6 @@
 # Architecture
 
-Feature Theater deliberately has no dashboard. Codex is the control surface, GPT-6 Astra is the meta-agent, and a local MCP server exposes deterministic operations.
+OVERDRIVE (originally Feature Theater) deliberately has no dashboard. A Codex or Claude Code conversation is the control surface, its model is the coordinating meta-agent, and a local MCP server exposes deterministic operations. Package, MCP, tool and storage identifiers keep the original `feature-theater`/`theater` names for compatibility.
 
 ## Responsibility boundary
 
@@ -11,13 +11,13 @@ Feature Theater deliberately has no dashboard. Codex is the control surface, GPT
 | MCP runtime | Clone safety, SQLite transactions, work dependencies, leases, exact revisions, checkpoints, safe events, app-server protocol | Product judgment, inferred test adequacy, private reasoning |
 | Git | Application history and diffs | Work status or semantic completion |
 
-Diffmogger's current design uses an adaptive manager and SQLite. Feature Theater carries that model into the native Codex coordinator: a durable graph, explicit ownership, visible failure/repair, isolated checkouts, evidence boundaries, and exact integration candidates.
+Diffmogger's current design uses an adaptive manager and SQLite. OVERDRIVE carries that model into the native coordinator conversation: a durable graph, explicit ownership, visible failure/repair, isolated checkouts, evidence boundaries, and exact integration candidates.
 
 ## Storage
 
 `theater.json` identifies the repository and exact default revision. `.theater/state.sqlite3` is canonical orchestration state, including the complete recorded timeline. `.theater/index.md` is a compact cross-feature projection. `.theater/features/<slug>/spec.md` and `context.md` are feature-scoped recovery inputs. `.theater/events.ndjson` is a supplementary workspace-operation journal, not a database backup; verification and recovery events are read from the canonical timeline. `features/<slug>/repo` is a full independent clone; it does not borrow objects from the hidden mirror.
 
-For a scratch project, `project/` is the managed canonical Git repository. Feature Theater seeds it with only a README, repository instructions, and an initial commit. A completed candidate may advance it only when the candidate contains its current HEAD, so promotion is an inspectable fast-forward rather than an automatic conflict resolution. The private mirror is refreshed afterward and new lanes start at the promoted revision.
+For a scratch project, `project/` is the managed canonical Git repository. OVERDRIVE seeds it with only a README, repository instructions, and an initial commit. A completed candidate may advance it only when the candidate contains its current HEAD, so promotion is an inspectable fast-forward rather than an automatic conflict resolution. The private mirror is refreshed afterward and new lanes start at the promoted revision.
 
 Specs and context projections are plain files so a fresh agent can recover without serializing a chat transcript. SQLite keeps uniqueness, graph, lifecycle, and evidence invariants inspectable.
 
@@ -25,9 +25,9 @@ Planning cannot declare execution complete. Required commands execute through th
 
 ## Context lifecycle
 
-Every feature has its own persisted worker session. The runtime starts it at the feature checkout and injects a feature-specific developer contract. The feature task reads the repository's own instructions and only that lane's spec/context. Worker processes disable apps, hooks, plugins, browser/computer control, and every configured external MCP server. The Theater coordinator cannot appear recursively and external integrations remain coordinator-owned.
+Every feature has its own persisted worker session. The runtime starts it at the feature checkout and injects a feature-specific developer contract. The feature task reads the repository's own instructions and only that lane's spec/context. Worker processes disable apps, hooks, plugins, browser/computer control, and every configured external MCP server. The OVERDRIVE coordinator cannot appear recursively and external integrations remain coordinator-owned.
 
-`theater.json` selects the worker harness. The default is a Codex app-server thread running GPT-6 Astra; `"harness": "claude"` runs each turn as a non-interactive Claude Code process resumed by session ID. A router in `app-server.mjs` binds every thread to the backend that created it, so a workspace only launches the harness it uses and a backend exit affects only its own lanes. Both backends emit the same safe event vocabulary (turn started, visible message, working diff, turn completed), and the Claude backend derives the diff from Git rather than from tool arguments.
+`theater.json` selects the worker harness and worker model. The default is a Codex app-server thread running `codex.laneModels[<slug>]`, else `codex.model`, else `gpt-6-sol`; `"harness": "claude"` runs each turn as a non-interactive Claude Code process resumed by session ID, using `claude.laneModels[<slug>]`, else `claude.model`, else the CLI's configured model. Worker model selection is independent of the coordinator's model; the top-level `model` field is coordinator metadata. A router in `app-server.mjs` binds every thread to the backend that created it, so a workspace only launches the harness it uses and a backend exit affects only its own lanes. Both backends emit the same safe event vocabulary (turn started, visible message, working diff, turn completed), and the Claude backend derives the diff from Git rather than from tool arguments.
 
 Each start or steer schedules one bounded turn. The coordinator reconciles its visible handoff with Git and evidence before deciding whether to continue, rather than attaching an unbounded native goal loop that can retry work against stale orchestration state.
 
@@ -54,6 +54,6 @@ Approval and user-input requests are persisted in sanitized form and surfaced to
 - Managed paths are containment-checked and existing symlinks/junctions are rejected.
 - Full clone creation, lifecycle writes, and agent-state writes use cross-process workspace locks plus SQLite transactions.
 - Setup commands are suggested from repository facts but never auto-executed during initialization.
-- Lane tasks use Codex's `:workspace` permission profile over the feature checkout and its context packet. Apps, hooks, plugins, browser/computer control, image generation, and configured external MCP servers are disabled in their app-server process; broader filesystem or network access still requires a surfaced approval.
+- Codex lane tasks use Codex's `:workspace` permission profile over the feature checkout and its context packet. Apps, hooks, plugins, browser/computer control, image generation, and configured external MCP servers are disabled in their app-server process; broader filesystem or network access still requires a surfaced approval. Claude lane workers use the permission policy in `theater.json` described in the operator guide; their shell commands are not sandboxed.
 - Remote pushes, PRs, conflict-producing merges, and destructive cleanup are outside the runtime.
-- The only built-in integration mutation is an explicitly requested, fast-forward-only promotion into a Feature Theater-created local `project/`; adopted repositories retain their normal review and integration path.
+- The only built-in integration mutation is an explicitly requested, fast-forward-only promotion into an OVERDRIVE-created local `project/`; adopted repositories retain their normal review and integration path.
