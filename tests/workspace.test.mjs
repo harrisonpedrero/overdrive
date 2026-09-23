@@ -737,6 +737,30 @@ test('resuming a paused lane drops review direction only for a candidate superse
   agreeOn(await directions(workspace, 'kept'), pausedThen(REVIEW));
   assert.equal((await setFeatureStatus({ ...kept, status: 'active' })).feature.nextAction, REVIEW);
 
+  // A checkpoint saved before an archive does not; reactivation regenerated that review text.
+  const revived = await reviewed('revived');
+  await checkpointFeature({ ...revived, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
+  await setFeatureStatus({ ...revived, status: 'archived', disposition: 'Shelved.' });
+  assert.equal((await setFeatureStatus({ ...revived, status: 'active' })).feature.nextAction, REVIEW);
+  await setFeatureStatus({ ...revived, status: 'paused' });
+  await updateChecks({ ...revived, checks: check('Read the README, revised') });
+  assert.deepEqual(await persisted(workspace, 'revived'), { context: PAUSED, index: PAUSED });
+  agreeOn(await directions(workspace, 'revived'), PAUSED);
+  assert.equal(storedDirection(workspace, 'revived').feature, REVIEW);
+  assert.equal((await setFeatureStatus({ ...revived, status: 'active' })).feature.nextAction, READY);
+  agreeOn(await directions(workspace, 'revived'), READY);
+  // One saved after the archive is deliberate and survives the pause, the change and resuming.
+  const shelved = await reviewed('shelved');
+  await setFeatureStatus({ ...shelved, status: 'archived', disposition: 'Shelved.' });
+  await checkpointFeature({ ...shelved, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
+  assert.equal((await setFeatureStatus({ ...shelved, status: 'active' })).feature.nextAction, REVIEW);
+  await setFeatureStatus({ ...shelved, status: 'paused' });
+  await updateChecks({ ...shelved, checks: check('Read the README, revised') });
+  assert.deepEqual(await persisted(workspace, 'shelved'), { context: pausedThen(REVIEW), index: pausedThen(REVIEW) });
+  agreeOn(await directions(workspace, 'shelved'), pausedThen(REVIEW));
+  assert.equal((await setFeatureStatus({ ...shelved, status: 'active' })).feature.nextAction, REVIEW);
+  agreeOn(await directions(workspace, 'shelved'), REVIEW);
+
   // A failing check run supersedes the candidate the same way and rewrites the persisted surfaces.
   const failing = await reviewed('failing');
   await setFeatureStatus({ ...failing, status: 'paused' });

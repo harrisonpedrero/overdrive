@@ -355,7 +355,7 @@ export const PAUSED_ACTION = 'Paused. Resume the lane with theater_feature_statu
 
 // Whether an explicit checkpoint followed the lane's latest archive, and whether a paused lane's
 // stored review direction is generated text whose candidate has since been superseded: no ready
-// candidate remains and no checkpoint since the latest candidate saved it. Event ids give the exact order.
+// candidate remains and no checkpoint since the latest candidate or archive saved it. Event ids give the exact order.
 const FEATURE_COLUMNS = `*, CASE WHEN status = 'archived' THEN EXISTS (
   SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
   AND checkpointed.id > (SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind = 'feature.archived')
@@ -364,7 +364,7 @@ const FEATURE_COLUMNS = `*, CASE WHEN status = 'archived' THEN EXISTS (
 ) AND NOT EXISTS (
   SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
   AND json_extract(checkpointed.details_json, '$.nextAction') = features.next_action
-  AND checkpointed.id > COALESCE((SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind = 'candidate.recorded'), 0)
+  AND checkpointed.id > COALESCE((SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind IN ('candidate.recorded', 'feature.archived')), 0)
 ) ELSE 0 END AS review_superseded`;
 
 export function readFeatureRow(db, slug) {
