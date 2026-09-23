@@ -237,7 +237,7 @@ export const TOOLS = [
     summary: string('Optional concise promotion disposition.'),
   }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
 
-  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Astra Codex task, or a Claude Code session when theater.json sets harness to claude) with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call theater_work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
+  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when theater.json sets harness to claude) with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call theater_work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
     ...workspace,
     ...feature,
     instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),

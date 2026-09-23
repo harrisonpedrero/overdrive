@@ -286,7 +286,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   try {
     const result = await bridge.request('turn/start', {
       harness: runtime.harness, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
-      runtimeWorkspaceRoots: runtimeRoots(runtime), model: 'gpt-6-astra', effort, summary: 'concise',
+      runtimeWorkspaceRoots: runtimeRoots(runtime), model: runtime.workerModel, effort, summary: 'concise',
     });
     await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_starting: true }));
     return result;

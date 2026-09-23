@@ -8,7 +8,20 @@ To begin from nothing, say `Start a new Feature Theater project called <name> th
 
 ## Worker harness
 
-Lane workers run under Codex by default. To run them as Claude Code sessions instead, pass `harness: "claude"` to `theater_initialize` or `theater_project_create`, or set `"harness": "claude"` in an existing `theater.json`; the change applies to the next agent start. An optional `claude` object configures the workers:
+Lane workers run under Codex by default, using GPT-6 Sol independently of the coordinator model. Set `codex.model` for a workspace default and `codex.laneModels` for named lane overrides in `theater.json`:
+
+```json
+{
+  "codex": {
+    "model": "gpt-6-sol",
+    "laneModels": { "search-redesign": "gpt-6-luna" }
+  }
+}
+```
+
+The selected model is used when starting or resuming a worker thread and for each new turn. Model names must be nonempty identifiers using letters, numbers, periods, underscores, colons or hyphens.
+
+To run workers as Claude Code sessions instead, pass `harness: "claude"` to `theater_initialize` or `theater_project_create`, or set `"harness": "claude"` in an existing `theater.json`; the change applies to the next agent start. An optional `claude` object configures the workers:
 
 ```json
 {

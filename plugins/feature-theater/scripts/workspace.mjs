@@ -303,15 +303,32 @@ function harnessAddition(harness) {
   return { harness };
 }
 
-// theater.json selects the lane worker harness; `claude.model`, `claude.laneModels[slug]`
-// and the permission fields apply only when harness is claude.
+function codexWorkerModel(config, slug) {
+  const settings = config.codex;
+  if (settings !== undefined && (settings === null || typeof settings !== 'object' || Array.isArray(settings))) {
+    throw new TheaterError('theater.json codex must be an object.', 'INVALID_STATE');
+  }
+  const options = settings ?? {};
+  const laneModels = options.laneModels === undefined ? {} : options.laneModels;
+  if (laneModels === null || typeof laneModels !== 'object' || Array.isArray(laneModels)) {
+    throw new TheaterError('theater.json codex.laneModels must be an object.', 'INVALID_STATE');
+  }
+  for (const model of [options.model, ...Object.values(laneModels)]) {
+    if (model !== undefined && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) {
+      throw new TheaterError('theater.json codex.model and codex.laneModels values must be model names.', 'INVALID_STATE');
+    }
+  }
+  return (Object.hasOwn(laneModels, slug) ? laneModels[slug] : undefined) ?? options.model ?? 'gpt-6-sol';
+}
+
+// theater.json selects the lane worker harness and its workspace or lane model.
 export function workerHarness(config, slug) {
   const harness = config.harness ?? 'codex';
   if (!HARNESSES.has(harness)) throw new TheaterError(`theater.json harness must be codex or claude, not ${JSON.stringify(harness)}.`, 'INVALID_STATE');
-  if (harness === 'codex') return { harness, workerModel: 'gpt-6-astra', harnessOptions: {} };
+  if (harness === 'codex') return { harness, workerModel: codexWorkerModel(config, slug), harnessOptions: {} };
   const settings = config.claude && typeof config.claude === 'object' && !Array.isArray(config.claude) ? config.claude : {};
   const laneModels = settings.laneModels && typeof settings.laneModels === 'object' ? settings.laneModels : {};
-  const model = laneModels[slug] ?? settings.model ?? null;
+  const model = (Object.hasOwn(laneModels, slug) ? laneModels[slug] : undefined) ?? settings.model ?? null;
   if (model !== null && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) throw new TheaterError('theater.json claude.model and claude.laneModels values must be model names.', 'INVALID_STATE');
   const { model: _model, laneModels: _laneModels, ...harnessOptions } = settings;
   return { harness, workerModel: model, harnessOptions };

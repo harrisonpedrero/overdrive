@@ -57,10 +57,18 @@ test('claude worker launch is isolated, resumable and free of nested-session mar
 });
 
 test('theater.json selects the harness and per-lane model', () => {
-  assert.deepEqual(workerHarness({}, 'alpha'), { harness: 'codex', workerModel: 'gpt-6-astra', harnessOptions: {} });
+  assert.deepEqual(workerHarness({}, 'alpha'), { harness: 'codex', workerModel: 'gpt-6-sol', harnessOptions: {} });
+  assert.equal(workerHarness({ codex: { model: 'gpt-6-luna' } }, 'alpha').workerModel, 'gpt-6-luna');
+  assert.equal(workerHarness({ codex: { model: 'gpt-6-luna', laneModels: { alpha: 'gpt-6-sol' } } }, 'alpha').workerModel, 'gpt-6-sol');
+  assert.equal(workerHarness({ codex: { model: 'gpt-6-luna', laneModels: { alpha: 'gpt-6-sol' } } }, 'beta').workerModel, 'gpt-6-luna');
+  assert.equal(workerHarness({ codex: { model: 'gpt-6-sol', laneModels: {} } }, 'constructor').workerModel, 'gpt-6-sol');
+  for (const codex of [null, 'gpt-6-sol', { model: '' }, { model: null }, { model: 'bad model' }, { laneModels: [] }, { laneModels: null }, { laneModels: { beta: 3 } }]) {
+    assert.throws(() => workerHarness({ codex }, 'alpha'), error => error.code === 'INVALID_STATE');
+  }
   const claude = workerHarness({ harness: 'claude', claude: { model: 'opus', laneModels: { beta: 'sonnet' }, permissionMode: 'dontAsk' } }, 'beta');
   assert.deepEqual(claude, { harness: 'claude', workerModel: 'sonnet', harnessOptions: { permissionMode: 'dontAsk' } });
   assert.equal(workerHarness({ harness: 'claude' }, 'alpha').workerModel, null);
+  assert.equal(workerHarness({ harness: 'claude', claude: { model: 'opus', laneModels: {} } }, 'constructor').workerModel, 'opus');
   assert.throws(() => workerHarness({ harness: 'gemini' }, 'alpha'), error => error.code === 'INVALID_STATE');
 });
 

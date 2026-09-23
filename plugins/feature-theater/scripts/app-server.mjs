@@ -207,7 +207,7 @@ export class CodexAppServer extends EventEmitter {
     return this.serverRequests.get(String(requestId)) ?? null;
   }
 
-  async startThread({ cwd, runtimeWorkspaceRoots, developerInstructions, model = 'gpt-6-astra', effort = 'high' }) {
+  async startThread({ cwd, runtimeWorkspaceRoots, developerInstructions, model = 'gpt-6-sol', effort = 'high' }) {
     const response = await this.request('thread/start', {
       cwd,
       runtimeWorkspaceRoots,
@@ -222,7 +222,7 @@ export class CodexAppServer extends EventEmitter {
     return { ...response, requestedEffort: effort };
   }
 
-  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, developerInstructions, model = 'gpt-6-astra' }) {
+  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, developerInstructions, model = 'gpt-6-sol' }) {
     return await this.request('thread/resume', {
       threadId,
       cwd,
@@ -243,7 +243,7 @@ export class CodexAppServer extends EventEmitter {
       input: [{ type: 'text', text: instruction, text_elements: [] }],
       cwd,
       runtimeWorkspaceRoots,
-      model: 'gpt-6-astra',
+      model: 'gpt-6-sol',
       effort,
       summary: 'concise',
     });

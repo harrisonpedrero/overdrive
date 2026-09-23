@@ -8,11 +8,12 @@ import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-run
 import { initializeManagedProject, createFeature, getFeatureContext, checkpointFeature } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 class Bridge extends EventEmitter {
-  constructor() { super(); this.turns = []; this.starts = 0; this.compactions = 0; this.quick = false; }
+  constructor() { super(); this.turns = []; this.starts = 0; this.compactions = 0; this.quick = false; this.requests = []; }
   async ensureStarted() {}
-  async startThread() { return { thread: { id: 'fixture-thread' } }; }
-  async resumeThread() { return { thread: { id: 'fixture-thread' } }; }
-  async request(method) {
+  async startThread(params) { this.startParams = params; return { thread: { id: 'fixture-thread' } }; }
+  async resumeThread(params) { this.resumeParams = params; return { thread: { id: 'fixture-thread' } }; }
+  async request(method, params) {
+    this.requests.push({ method, params });
     if (method === 'turn/start') {
       const turn = { id: `turn-${++this.starts}`, status: 'inProgress', items: [] };
       this.turns.push(turn);
@@ -54,6 +55,29 @@ async function eventually(check) {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
   assert.fail('State did not converge');
+}
+
+for (const [name, codex, expectedModel] of [
+  ['default', undefined, 'gpt-6-sol'],
+  ['workspace override', { model: 'gpt-6-luna' }, 'gpt-6-luna'],
+  ['lane override', { model: 'gpt-6-luna', laneModels: { alpha: 'gpt-6-sol' } }, 'gpt-6-sol'],
+]) {
+  test(`Codex ${name} reaches thread and turn dispatch`, async t => {
+    const args = await fixture(t);
+    if (codex) {
+      const configPath = path.join(args.workspace_path, 'theater.json');
+      const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
+      config.codex = codex;
+      await fs.writeFile(configPath, JSON.stringify(config));
+    }
+    const bridge = new Bridge();
+    const runtime = createAgentRuntime(bridge);
+    t.after(() => runtime.shutdownAgentRuntime());
+    const started = await runtime.startFeatureAgent(args);
+    assert.equal(started.model, expectedModel);
+    assert.equal(bridge.startParams.model, expectedModel);
+    assert.equal(bridge.requests.find(request => request.method === 'turn/start').params.model, expectedModel);
+  });
 }
 
 test('short completion cannot be overwritten by its start response; private items are absent', async t => {
