@@ -747,6 +747,110 @@ test('resuming a paused lane drops review direction only for a candidate superse
   assert.equal((await setFeatureStatus({ ...failing, status: 'active' })).feature.nextAction, READY);
 });
 
+test('superseding a candidate retires only its generated review direction on active, review and done lanes', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-superseded-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }];
+  const revised = check('Read the README, revised');
+  const settled = 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.';
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Superseded', description: 'Exercise superseded candidate direction.' });
+  const reviewed = async (slug, beforeCandidate = async () => {}) => {
+    const lane = { workspace_path: workspace, feature: slug };
+    const created = await createFeature({ ...lane, title: slug, outcome: 'A reviewed candidate.', spec: '# Reviewed\n\nThe README exists.' });
+    await fs.appendFile(path.join(created.feature.checkoutPath, '.git', 'info', 'exclude'), '\n.check-fails\n');
+    await planWork({ ...lane, items: [{ key: 'readme', title: 'Write the README' }] });
+    await beforeCandidate(lane);
+    await updateChecks({ ...lane, checks: check('Read the committed README') });
+    assert.equal((await runChecks(lane)).verification.ready, true);
+    await recordCandidate({ ...lane, summary: 'Ready.', checks: ['readme receipt'] });
+    return lane;
+  };
+  const candidates = slug => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    try { return db.prepare('SELECT c.status FROM candidates c JOIN features f ON f.id = c.feature_id WHERE f.slug = ? ORDER BY c.rowid').all(slug).map(row => row.status); }
+    finally { db.close(); }
+  };
+  // Verification rewrites the saved packet and index itself; read them before anything else can.
+  const saved = async slug => {
+    const packet = await fs.readFile(path.join(workspace, '.theater', 'features', slug, 'context.md'), 'utf8');
+    const row = (await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8')).split('\n').find(line => line.includes(`| ${slug} |`)).split('|');
+    return { ...await persisted(workspace, slug), contextStatus: packet.match(/^Status: (.*)$/m)[1], indexStatus: row[3].trim() };
+  };
+  const retiredTo = (next, status = 'active') => ({ context: next, index: next, contextStatus: status, indexStatus: status });
+
+  // Resubmitting identical checks changes nothing.
+  const review = await reviewed('review');
+  const before = storedDirection(workspace, 'review');
+  assert.equal((await updateChecks({ ...review, checks: check('Read the committed README') })).changed, false);
+  assert.deepEqual(storedDirection(workspace, 'review'), before);
+  assert.deepEqual(candidates('review'), ['ready']);
+  assert.deepEqual(await saved('review'), retiredTo(REVIEW, 'review'));
+  // A changed contract supersedes the candidate and reopens the lane to the work graph's direction.
+  await updateChecks({ ...review, checks: revised });
+  assert.deepEqual(await saved('review'), retiredTo(READY));
+  assert.deepEqual(candidates('review'), ['superseded']);
+  agreeOn(await directions(workspace, 'review'), READY);
+  // The work graph direction keeps following later work updates.
+  await updateWork({ ...review, key: 'readme', status: 'running', owner: 'astra' });
+  agreeOn(await directions(workspace, 'review'), 'Await or reconcile running work: readme.');
+
+  // A done lane reopens without its completed direction.
+  const done = await reviewed('done', async lane => {
+    await updateWork({ ...lane, key: 'readme', status: 'running', owner: 'astra' });
+    await updateWork({ ...lane, key: 'readme', status: 'done', owner: 'astra', summary: 'The README exists.' });
+  });
+  await setFeatureStatus({ ...done, status: 'done' });
+  await updateChecks({ ...done, checks: revised });
+  assert.deepEqual(await saved('done'), retiredTo(settled));
+  assert.deepEqual(candidates('done'), ['superseded']);
+  agreeOn(await directions(workspace, 'done'), settled);
+
+  // An active lane still holding its ready candidate.
+  const active = await reviewed('active');
+  await setFeatureStatus({ ...active, status: 'active' });
+  await updateChecks({ ...active, checks: revised });
+  assert.deepEqual(await saved('active'), retiredTo(READY));
+  agreeOn(await directions(workspace, 'active'), READY);
+
+  // A checkpoint saved since the candidate keeps its text, even word for word the generated one.
+  const after = await reviewed('after');
+  await checkpointFeature({ ...after, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
+  await updateChecks({ ...after, checks: revised });
+  assert.deepEqual(await saved('after'), retiredTo(REVIEW));
+  agreeOn(await directions(workspace, 'after'), REVIEW);
+  // One saved before the candidate was replaced by the candidate's own direction.
+  const early = await reviewed('early', lane => checkpointFeature({ ...lane, summary: 'Review expected soon.', next_action: REVIEW }));
+  await updateChecks({ ...early, checks: revised });
+  assert.deepEqual(await saved('early'), retiredTo(READY));
+  // So was one saved before an archive whose reactivation regenerated the review direction.
+  const revived = await reviewed('revived');
+  await checkpointFeature({ ...revived, summary: 'Candidate kept for a later decision.', next_action: REVIEW });
+  await setFeatureStatus({ ...revived, status: 'archived', disposition: 'Shelved.' });
+  assert.equal((await setFeatureStatus({ ...revived, status: 'active' })).feature.nextAction, REVIEW);
+  await updateChecks({ ...revived, checks: revised });
+  assert.deepEqual(await saved('revived'), retiredTo(READY));
+
+  // A failing run supersedes the candidate the same way.
+  const failing = await reviewed('failing');
+  await fs.writeFile(path.join(workspace, 'features', 'failing', 'repo', '.check-fails'), 'fail');
+  assert.equal((await runChecks(failing)).verification.ready, false);
+  assert.deepEqual(await saved('failing'), retiredTo(READY));
+  assert.deepEqual(candidates('failing'), ['superseded']);
+  agreeOn(await directions(workspace, 'failing'), READY);
+
+  // Blocked and archived lanes keep their stored direction.
+  const blocked = await reviewed('blocked');
+  await setFeatureStatus({ ...blocked, status: 'blocked', blocker: 'Waiting on review.' });
+  await updateChecks({ ...blocked, checks: revised });
+  assert.equal(storedDirection(workspace, 'blocked').feature, REVIEW);
+  assert.equal((await getFeatureContext(blocked)).feature.status, 'blocked');
+  const shelved = await reviewed('shelved');
+  await setFeatureStatus({ ...shelved, status: 'archived', disposition: 'Shelved.' });
+  await updateChecks({ ...shelved, checks: revised });
+  assert.equal(storedDirection(workspace, 'shelved').feature, ARCHIVED);
+  agreeOn(await directions(workspace, 'shelved'), ARCHIVED);
+});
+
 test('rejects repository URLs containing credentials', async t => {
   const { workspace } = await fixture(t);
   await assert.rejects(initializeWorkspace({ workspace_path: workspace, repository: 'https://user:secret@example.com/repo.git' }), /embedded credentials/i);

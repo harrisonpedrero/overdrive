@@ -41,6 +41,7 @@ import {
   ARCHIVED_ACTION,
   CANDIDATE_REVIEW_ACTION,
   PAUSED_ACTION,
+  READY_WORK_ACTION,
   assertBoundCheckout,
   bumpSemanticGeneration,
   featureBySlug,
@@ -55,6 +56,7 @@ import {
   recordEvent,
   transaction,
   unwrapPausedAction,
+  workGraphAction,
   workItems,
 } from './state.mjs';
 
@@ -817,32 +819,6 @@ export function reconcileReady(db, featureId) {
   const statement = db.prepare('UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?');
   for (const update of updates) statement.run(...update);
   return updates.length;
-}
-
-const READY_WORK_ACTION = 'Start or continue the highest-priority ready work.';
-
-function workKeyList(items) {
-  const keys = items.map(item => item.item_key);
-  return keys.length > 3 ? `${keys.slice(0, 3).join(', ')} and ${keys.length - 3} more` : keys.join(', ');
-}
-
-// Default lane direction implied by the work graph. It never claims delivery: settled work still
-// needs lane verification and a candidate.
-function workGraphAction(items) {
-  const having = (...statuses) => items.filter(item => statuses.includes(item.status));
-  if (having('ready').length) return READY_WORK_ACTION;
-  const stuck = having('blocked', 'failed');
-  if (stuck.length) {
-    const [first] = stuck;
-    const reason = String(first.blocker || '').replace(/\s+/g, ' ').trim();
-    const shown = reason.length > 240 ? `${reason.slice(0, 239)}…` : reason;
-    return `Resolve ${first.status} ${first.item_key}${shown ? `: ${shown}` : '.'}${stuck.length > 1 ? ` (+${stuck.length - 1} more blocked or failed)` : ''}`;
-  }
-  if (having('review').length) return `Review work awaiting acceptance: ${workKeyList(having('review'))}.`;
-  if (having('running').length) return `Await or reconcile running work: ${workKeyList(having('running'))}.`;
-  if (having('planned').length) return `Replan work waiting on cancelled dependencies: ${workKeyList(having('planned'))}.`;
-  if (items.length) return 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.';
-  return 'Plan bounded work from the current spec.';
 }
 
 // Refresh the stored direction only while it is still a work-graph default. Spec revisions,

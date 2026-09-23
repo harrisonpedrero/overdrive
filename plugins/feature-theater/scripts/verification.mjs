@@ -3,7 +3,7 @@ import { checkOutcome } from './check-outcome.mjs';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
+import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
 
@@ -63,10 +63,22 @@ export function assertAgentIdle(feature) {
 }
 
 // Reports whether a candidate or the lane status actually changed; callers own the generation bump.
+// An active, review or done lane then trades the review direction its candidate generated for the
+// work graph's, unless a checkpoint since the latest candidate or archive saved that exact text.
+// Event ids give the order. Paused, blocked and archived lanes keep their own direction rules.
 export function invalidateCandidates(db, featureId) {
+  const { status } = db.prepare('SELECT status FROM features WHERE id = ?').get(featureId);
   const superseded = db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId).changes;
   const reopened = db.prepare("UPDATE features SET status = 'active' WHERE id = ? AND status IN ('done','review')").run(featureId).changes;
-  return superseded + reopened > 0;
+  if (!superseded && !reopened) return false;
+  if (['active', 'review', 'done'].includes(status)) {
+    db.prepare(`UPDATE features SET next_action = ? WHERE id = ? AND next_action = ? AND NOT EXISTS (
+      SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
+      AND json_extract(checkpointed.details_json, '$.nextAction') = features.next_action
+      AND checkpointed.id > COALESCE((SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind IN ('candidate.recorded', 'feature.archived')), 0)
+    )`).run(workGraphAction(workItems(db, featureId)), featureId, CANDIDATE_REVIEW_ACTION);
+  }
+  return true;
 }
 
 export function verificationStatus(ctx, feature, revision) {

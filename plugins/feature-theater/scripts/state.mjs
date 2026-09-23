@@ -434,6 +434,32 @@ export function workItems(db, featureId) {
     .map(row => ({ ...row, priority: Number(row.priority), dependencies: byKey.get(row.item_key) ?? [] }));
 }
 
+export const READY_WORK_ACTION = 'Start or continue the highest-priority ready work.';
+
+function workKeyList(items) {
+  const keys = items.map(item => item.item_key);
+  return keys.length > 3 ? `${keys.slice(0, 3).join(', ')} and ${keys.length - 3} more` : keys.join(', ');
+}
+
+// Default lane direction implied by the work graph. It never claims delivery: settled work still
+// needs lane verification and a candidate.
+export function workGraphAction(items) {
+  const having = (...statuses) => items.filter(item => statuses.includes(item.status));
+  if (having('ready').length) return READY_WORK_ACTION;
+  const stuck = having('blocked', 'failed');
+  if (stuck.length) {
+    const [first] = stuck;
+    const reason = String(first.blocker || '').replace(/\s+/g, ' ').trim();
+    const shown = reason.length > 240 ? `${reason.slice(0, 239)}…` : reason;
+    return `Resolve ${first.status} ${first.item_key}${shown ? `: ${shown}` : '.'}${stuck.length > 1 ? ` (+${stuck.length - 1} more blocked or failed)` : ''}`;
+  }
+  if (having('review').length) return `Review work awaiting acceptance: ${workKeyList(having('review'))}.`;
+  if (having('running').length) return `Await or reconcile running work: ${workKeyList(having('running'))}.`;
+  if (having('planned').length) return `Replan work waiting on cancelled dependencies: ${workKeyList(having('planned'))}.`;
+  if (items.length) return 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.';
+  return 'Plan bounded work from the current spec.';
+}
+
 export function recordEvent(db, { featureId = null, workItemId = null, kind, summary, details = {} }) {
   const stamp = now();
   const result = db.prepare(`
