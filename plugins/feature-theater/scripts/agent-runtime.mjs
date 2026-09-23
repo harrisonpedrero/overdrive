@@ -2,22 +2,31 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
 import { summarizePatch, TheaterError, optionalText, parseJsonObject, requiredText, redactString } from './util.mjs';
-import { withAgentControl } from './ownership.mjs';
+import { withAgentControl, withLaneStop } from './ownership.mjs';
 import {
+  attestDescendantsStopped,
   bindAgentSession,
+  clearWorkerGuards,
   featureRuntime,
+  featureStatusInput,
   getFeatureContext,
   markCompacted,
+  markDescendantsUnconfirmed,
   pendingAgentRequest,
+  readUnconfirmedDescendants,
+  readWorkerGuards,
   recordAgentEvent,
+  registerWorkerGuard,
   releaseAgentSession,
   resolveAgentRequestRecord,
   saveAgentSession,
   savePendingAgentRequest,
+  setStoppedFeatureStatus,
   queueCompaction,
 } from './workspace.mjs';
 
-export function createAgentRuntime(bridge = new WorkerBridge()) {
+// stopSettleMs bounds how long a pause or archive waits for an interrupted turn to be recorded as ended.
+export function createAgentRuntime(bridge = new WorkerBridge(), { stopSettleMs = 15_000 } = {}) {
 const ownerToken = randomUUID();
 const registrations = new Map();
 const turnMessages = new Map();
@@ -103,6 +112,8 @@ function requestSummary(method, params) {
   return `Codex agent needs a response for ${method}.`;
 }
 
+const descendantsSummary = turnId => `The worker process of turn ${turnId ?? 'unknown'} was stopped without its process tree, so tools it launched may still be running in the checkout. The lane cannot be paused or archived until the coordinator verifies that none is running.`;
+
 async function onServerRequest(message) {
   const registration = registrations.get(message.params?.threadId);
   if (!registration) {
@@ -132,6 +143,10 @@ async function onNotification({ method, params }) {
   const registration = registrations.get(params.threadId);
   if (!registration) return;
   const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
+  if (method === 'worker/exited') {
+    await clearWorkerGuards({ ...base, guard_id: params.guardId });
+    return;
+  }
   if (method === 'serverRequest/resolved') {
     await resolveAgentRequestRecord({ ...base, thread_id: params.threadId, request_id: params.requestId, ignore_missing: true, summary: 'Codex app-server resolved the pending request.' });
     return;
@@ -171,6 +186,8 @@ async function onNotification({ method, params }) {
   if (method === 'turn/completed') {
     const turn = params.turn || {};
     const turnId = turn.id;
+    // Recorded before the turn's end, so no reader sees the lane stopped without the marker.
+    if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, thread_id: params.threadId, turn_id: turnId ?? null, summary: descendantsSummary(turnId) });
     if (compactionTurns.has(turnId) && compactionWaiters.has(params.threadId)) {
       compactionTurns.delete(turnId);
       await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: null, status: ['failed', 'interrupted'].includes(turn.status) ? turn.status : 'idle' });
@@ -362,15 +379,18 @@ async function reconcileDispatch(runtime, attestation = null) {
 
 async function dispatchTurn(runtime, threadId, instruction, effort, created = false) {
   const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: threadId, owner_token: ownerToken };
+  const guardId = runtime.harness === 'claude' ? randomUUID() : null;
   const previous = runtime.feature;
   await enqueueStateWork(() => created
     ? bindAgentSession({ ...base, harness: runtime.harness, expected_thread_id: previous.thread_id ?? null, compacted: previous.compaction_pending })
     : saveAgentSession({ ...base, status: 'starting' }));
   try {
+    if (guardId && (await registerWorkerGuard({ ...base, guard_id: guardId })).ignored) throw new TheaterError('The Claude worker guard could not be recorded for this session.', 'AGENT_OWNED');
     const result = await bridge.request('turn/start', {
       harness: runtime.harness, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
-      runtimeWorkspaceRoots: runtimeRoots(runtime), model: runtime.workerModel, effort, summary: 'concise',
+      runtimeWorkspaceRoots: runtimeRoots(runtime), model: runtime.workerModel, effort, summary: 'concise', guardId,
     });
+    if (result.treeStoppedGuardId) await clearWorkerGuards({ ...base, guard_id: result.treeStoppedGuardId });
     await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_status: 'starting' }));
     return result;
   } catch (error) {
@@ -603,6 +623,145 @@ async function interruptOwned({ workspace_path, feature }) {
   return { interrupted: true, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id, harness: runtime.harness };
 }
 
+// Resolves true once the backend reports a completed turn on threadId, or false at the deadline.
+// It listens from creation, so a completion that races the interrupt response is not missed.
+function turnCompletion(threadId) {
+  let finish;
+  let timer;
+  const completed = new Promise(resolve => { finish = resolve; });
+  const listener = message => { if (message.method === 'turn/completed' && message.params?.threadId === threadId) finish(true); };
+  bridge.on('notification', listener);
+  return {
+    wait: timeoutMs => { timer = setTimeout(() => finish(false), timeoutMs); return completed; },
+    dispose: () => { clearTimeout(timer); bridge.off('notification', listener); },
+  };
+}
+
+// The lane as recorded once every notification received so far has been applied.
+async function recordedLane(runtime) {
+  await notificationQueue;
+  return (await featureRuntime({ workspace_path: runtime.root, feature: runtime.feature.slug, allow_inactive: true })).feature;
+}
+
+// Settles an interrupted turn whose completion was not delivered from the native session's own
+// record of it. Returns false when the session cannot show that the turn has ended.
+async function settleEndedTurn(runtime, turnId) {
+  let turn;
+  try {
+    const { thread } = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
+    turn = thread.history === 'unavailable' ? null : thread.turns?.find(candidate => candidate.id === turnId);
+  } catch { return false; }
+  if (!turn || !['completed', 'interrupted', 'failed'].includes(turn.status)) return false;
+  const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: runtime.feature.thread_id, owner_token: ownerToken };
+  await enqueueStateWork(async () => {
+    if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, turn_id: turnId, summary: descendantsSummary(turnId) });
+    await saveAgentSession({ ...base, status: turn.status === 'completed' ? 'idle' : turn.status });
+  });
+  return true;
+}
+
+// Records why a pause or archive could not show that the lane's worker stopped and returns the
+// STOP_UNCONFIRMED error to throw; the lifecycle status is left as it was. The refusal is recorded
+// even when another controller owns the lane.
+async function stopUnconfirmed({ workspace_path, feature, lifecycle }, status, reason, details = {}) {
+  const message = `${feature} was not marked ${status} because its worker may still be running: ${reason} The lane stays ${lifecycle}.`;
+  await recordAgentEvent({ workspace_path, feature, kind: 'feature.stop_unconfirmed', summary: message, details: { requestedStatus: status, ...details } });
+  return new TheaterError(message, 'STOP_UNCONFIRMED', details);
+}
+
+const ATTEST_NEXT = 'If you can verify under your existing authority that no worker process for this lane is running (for example by checking the processes whose working directory is its checkout), retry with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline.';
+
+// Stops the active turn of a lane that is being paused or archived. Every path that cannot show
+// the turn has ended throws STOP_UNCONFIRMED.
+async function stopWorker(runtime, status, attestation) {
+  const { slug } = runtime.feature;
+  const base = { workspace_path: runtime.root, feature: slug, owner_token: ownerToken };
+  const unconfirmed = (reason, details) => stopUnconfirmed({ workspace_path: runtime.root, feature: slug, lifecycle: runtime.feature.status }, status, reason, details);
+  try {
+    await reconcileDispatch(runtime, attestation);
+  } catch (error) {
+    if (error.code !== 'DISPATCH_UNCERTAIN') throw error;
+    throw await unconfirmed(`its last turn request has no confirmed outcome and its native session cannot settle it. ${ATTEST_NEXT}`, { agentStatus: 'uncertain' });
+  }
+  const turnId = runtime.feature.active_turn_id;
+  if (!turnId) return { interrupted: false, reason: 'No active turn.' };
+  requireSessionOwner(runtime);
+  const threadId = runtime.feature.thread_id;
+  const completion = turnCompletion(threadId);
+  try {
+    let result;
+    try {
+      await bridge.ensureStarted();
+      await resume(runtime);
+      result = await bridge.request('turn/interrupt', { harness: runtime.harness, threadId, turnId });
+    } catch (error) {
+      throw await unconfirmed(`interrupting turn ${turnId} failed (${redactString(error.message)}). Inspect the lane and retry once its turn has ended.`, { turnId, interruptError: error.code ?? null });
+    }
+    const interrupted = result?.interrupted !== false;
+    if (interrupted) await recordAgentEvent({ ...base, kind: 'coordinator.interrupted', summary: `Interrupted active turn ${turnId}.`, details: {} });
+    // The worker ended but its process tree could not be: the marker makes the stop unconfirmed.
+    if (result?.descendantsUnconfirmed) await enqueueStateWork(() => markDescendantsUnconfirmed({ ...base, thread_id: threadId, turn_id: turnId, summary: descendantsSummary(turnId) }));
+    let lane = await recordedLane(runtime);
+    // A backend that reports nothing to interrupt has already ended the turn, so only its
+    // recorded end is awaited; an acknowledged interrupt gets a bounded wait for the turn to end.
+    if (lane.active_turn_id === turnId && interrupted && await completion.wait(stopSettleMs)) lane = await recordedLane(runtime);
+    if (lane.active_turn_id === turnId && !(await settleEndedTurn(runtime, turnId))) {
+      throw await unconfirmed(`${interrupted
+        ? `turn ${turnId} acknowledged the interrupt but was not recorded as ended within ${Math.round(stopSettleMs / 1000)}s.`
+        : `the backend reported nothing to interrupt, yet turn ${turnId} is not recorded as ended.`} Inspect the lane and retry once its turn has ended.`, { turnId, interruptAcknowledged: interrupted });
+    }
+    return { interrupted, threadId, turnId, harness: runtime.harness, treeStoppedGuardId: result?.treeStoppedGuardId ?? null, ...(result?.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) };
+  } finally { completion.dispose(); }
+}
+
+async function stopForStatus({ prior_turn_attestation = undefined, ...args }, row, busy, foreignOwner) {
+  // Validate the transition before stopping anything, so a refused transition never interrupts
+  // work. Archiving an archived lane stays a no-op transition, as it always was.
+  if (!(row.status === 'archived' && args.status === 'archived')) featureStatusInput(args);
+  const attestation = priorTurnAttestation(prior_turn_attestation);
+  const lane = { workspace_path: args.workspace_path, feature: row.slug, lifecycle: row.status };
+  // An attestation can only speak for processes that could be checked before it was given, so it
+  // clears only the marker generation that already existed, never one this stop records.
+  const priorGeneration = (await readUnconfirmedDescendants(args))?.generation ?? null;
+  // Another live controller may hold a worker process for this session that this one cannot see.
+  if (foreignOwner && !attestation) {
+    throw await stopUnconfirmed(lane, args.status, `its session belongs to another live coordinator session (process ${foreignOwner.pid}), which may still hold a worker process this session cannot see. Pause it from that session. ${ATTEST_NEXT}`, { foreignOwnerPid: foreignOwner.pid });
+  }
+  let interruption;
+  if (busy) {
+    const runtime = await featureRuntime({ workspace_path: args.workspace_path, feature: args.feature, allow_inactive: true });
+    interruption = await stopWorker(runtime, args.status, attestation);
+    if (interruption.treeStoppedGuardId) await clearWorkerGuards({ ...args, guard_id: interruption.treeStoppedGuardId });
+  }
+  // A worker process that outlived its turn, such as one an earlier interrupt could not stop, is
+  // still running work, so the lane is not stopped until the backend holding it sees it exit.
+  if (row.thread_id) {
+    try {
+      const settled = await bridge.settleThread?.({ threadId: row.thread_id });
+      if (settled?.treeStoppedGuardId) await clearWorkerGuards({ ...args, guard_id: settled.treeStoppedGuardId });
+    }
+    catch (error) {
+      if (error.code === 'CLAUDE_DESCENDANTS_UNCONFIRMED') {
+        const recorded = await enqueueStateWork(() => markDescendantsUnconfirmed({ workspace_path: args.workspace_path, feature: row.slug, thread_id: row.thread_id, turn_id: error.details?.turnId ?? null, summary: redactString(error.message) }));
+        if (!recorded.ignored) bridge.acknowledgeDescendants?.({ threadId: row.thread_id, turnId: error.details?.turnId });
+      }
+      throw await stopUnconfirmed(lane, args.status, `a worker process from an earlier turn ${error.code === 'CLAUDE_DESCENDANTS_UNCONFIRMED' ? 'left tools that may still be running' : 'is still running'} (${redactString(error.message)}).`, { lingeringProcess: true });
+    }
+  }
+  const marker = await readUnconfirmedDescendants(args);
+  // A stop that itself left descendants unconfirmed is refused whatever attestation it carries.
+  const attestable = attestation && !interruption?.descendantsUnconfirmed && marker?.generation === priorGeneration;
+  if (marker && !(attestable && (await attestDescendantsStopped({ ...args, evidence: attestation.evidence, generation: marker.generation })).cleared)) {
+    throw await stopUnconfirmed(lane, args.status, `${marker.summary} ${ATTEST_NEXT}`, { descendantsUnconfirmed: true, turnId: marker.turnId ?? null });
+  }
+  const guards = await readWorkerGuards(args);
+  if (guards.length) {
+    if (!attestation || interruption?.descendantsUnconfirmed) throw await stopUnconfirmed(lane, args.status, `a Claude worker process from this lane has no confirmed process-tree exit. ${ATTEST_NEXT}`, { workerGuards: guards.length });
+    await clearWorkerGuards({ ...args, evidence: attestation.evidence });
+  }
+  const result = await setStoppedFeatureStatus(args);
+  return interruption ? { ...result, interruption } : result;
+}
 async function resolveRequestOwned({ workspace_path, feature, request_id, action, response, scope = 'turn' }) {
   if (!['accept', 'accept_session', 'decline', 'cancel', 'respond'].includes(action)) throw new TheaterError('Unknown request action.', 'INVALID_INPUT');
   if (!['turn', 'session'].includes(scope)) throw new TheaterError('scope must be turn or session.', 'INVALID_INPUT');
@@ -649,7 +808,13 @@ const steerFeatureAgent = args => withAgentControl(args, ownerToken, () => steer
 const compactFeatureAgent = args => withAgentControl(args, ownerToken, () => compactOwned(args));
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
 const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));
-return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime };
+// Pausing or archiving holds the lane's control lock from stopping its worker through recording
+// the status, so no turn can start in between and the status is written only after the stop.
+const stopFeatureLane = async args => {
+  if (!['paused', 'archived'].includes(args.status)) throw new TheaterError('Only pausing or archiving stops a lane.', 'INVALID_INPUT');
+  return await withLaneStop(args, ownerToken, (row, busy, foreignOwner) => stopForStatus(args, row, busy, foreignOwner));
+};
+return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, compactOutgoingAfterSwitch, shutdownAgentRuntime };
 }
 
-export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, compactOutgoingAfterSwitch, shutdownAgentRuntime } = createAgentRuntime();
+export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, compactOutgoingAfterSwitch, shutdownAgentRuntime } = createAgentRuntime();

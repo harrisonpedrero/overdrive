@@ -4,12 +4,13 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
 import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
 import { TheaterError, refusedRequest } from '../plugins/feature-theater/scripts/util.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, recordAgentEvent, saveAgentSession, savePendingAgentRequest } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, recordAgentEvent, saveAgentSession, savePendingAgentRequest, setFeatureStatus } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -45,7 +46,15 @@ class NativeBackend extends EventEmitter {
       if (fault?.startsWith('lost')) throw timeout;
       return { turn };
     }
+    // Interrupt faults: 'interrupt-fails' is a backend error; 'interrupt-silent' acknowledges but the
+    // turn keeps running; faults.interruptGate holds any interrupt until its gate opens.
     if (method === 'turn/interrupt') {
+      if (fault === 'interrupt-fails') throw new TheaterError(`${this.harness} interrupt failed`, 'CODEX_TIMEOUT');
+      if (fault === 'interrupt-silent') return { interrupted: true };
+      if (this.faults.interruptGate) {
+        this.faults.interruptGate.reached();
+        await this.faults.interruptGate.gate;
+      }
       const turn = thread.turns.find(candidate => candidate.id === params.turnId);
       if (turn?.status !== 'inProgress') return { interrupted: false };
       turn.status = 'interrupted';
@@ -71,7 +80,7 @@ class NativeBackend extends EventEmitter {
   shutdown() {}
 }
 
-async function fixture(t, harness = 'claude') {
+async function fixture(t, harness = 'claude', runtimeOptions = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-ownership-'));
   await initializeManagedProject({ workspace_path: root, project_name: 'Ownership', description: 'Session routing.', harness });
   const args = { workspace_path: root, feature: 'alpha' };
@@ -81,7 +90,7 @@ async function fixture(t, harness = 'claude') {
   const faults = {};
   const bridge = new WorkerBridge();
   for (const name of Object.keys(stores)) bridge.factories[name] = () => new NativeBackend(name, stores[name], calls, faults);
-  const runtime = createAgentRuntime(bridge);
+  const runtime = createAgentRuntime(bridge, runtimeOptions);
   t.after(async () => {
     await runtime.shutdownAgentRuntime();
     await fs.rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -376,4 +385,157 @@ test('a backend exit during a running turn keeps it uncertain and reconciles it 
   f.bridge.backend('codex').finish(started.threadId);
   await eventually(async () => (await agent(f.args)).status === 'idle');
   assert.equal((await f.runtime.startFeatureAgent(f.args)).turnId, `${started.threadId}-turn-2`);
+});
+
+const lifecycle = async args => {
+  const state = await getFeatureContext({ ...args, timeline_limit: 50 });
+  return { status: state.feature.status, agent: state.feature.agent.status, turnId: state.feature.agent.activeTurnId, events: state.timeline.map(entry => entry.kind) };
+};
+
+test('a pause whose worker cannot be confirmed stopped leaves the lane active and says so', async t => {
+  const f = await fixture(t, 'codex', { stopSettleMs: 200 });
+  const started = await f.runtime.startFeatureAgent(f.args);
+  const nativeTurn = () => f.stores.codex.get(started.threadId).turns.at(-1);
+
+  f.faults.codex = 'interrupt-fails';
+  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && /interrupt failed/.test(error.message) && /stays active/.test(error.message));
+  let lane = await lifecycle(f.args);
+  assert.deepEqual({ status: lane.status, agent: lane.agent, turnId: lane.turnId }, { status: 'active', agent: 'running', turnId: started.turnId });
+  assert.equal(nativeTurn().status, 'inProgress');
+  assert.ok(lane.events.includes('feature.stop_unconfirmed'));
+  assert.ok(!lane.events.includes('feature.paused'));
+
+  // An acknowledged interrupt whose turn never ends is not a pause either.
+  f.faults.codex = 'interrupt-silent';
+  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && /acknowledged the interrupt/.test(error.message));
+  lane = await lifecycle(f.args);
+  assert.deepEqual({ status: lane.status, agent: lane.agent, turnId: lane.turnId }, { status: 'active', agent: 'running', turnId: started.turnId });
+  assert.ok(!lane.events.includes('feature.paused'));
+
+  // Once the backend stops the turn, the pause is recorded after the turn has ended.
+  delete f.faults.codex;
+  const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
+  assert.deepEqual({ status: paused.feature.status, agent: paused.feature.agent.status, turnId: paused.feature.agent.activeTurnId }, { status: 'paused', agent: 'interrupted', turnId: null });
+  assert.deepEqual({ interrupted: paused.interruption.interrupted, turnId: paused.interruption.turnId }, { interrupted: true, turnId: started.turnId });
+  assert.equal(nativeTurn().status, 'interrupted');
+});
+
+test('a confirmed pause blocks dispatch until the lane is made active again', async t => {
+  const f = await fixture(t, 'codex', { stopSettleMs: 200 });
+  const started = await f.runtime.startFeatureAgent(f.args);
+  const turns = () => f.stores.codex.get(started.threadId).turns;
+  // A turn that ended without its completion being delivered is settled from the native session.
+  turns().at(-1).status = 'completed';
+  const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
+  assert.deepEqual({ status: paused.feature.status, agent: paused.feature.agent.status, interrupted: paused.interruption.interrupted }, { status: 'paused', agent: 'idle', interrupted: false });
+  await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'INVALID_TRANSITION');
+  await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Keep going.' }), error => error.code === 'INVALID_TRANSITION');
+  // Pausing an idle lane again is a plain transition that contacts no backend.
+  const calls = f.calls.length;
+  assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' })).interruption, undefined);
+  assert.equal(f.calls.length, calls);
+  assert.equal(turns().length, 1);
+  await setFeatureStatus({ ...f.args, status: 'active' });
+  assert.equal((await f.runtime.startFeatureAgent(f.args)).turnId, `${started.threadId}-turn-2`);
+});
+
+test('dispatch requested while a pause is stopping the worker cannot restart it', async t => {
+  const f = await fixture(t, 'codex', { stopSettleMs: 2_000 });
+  const started = await f.runtime.startFeatureAgent(f.args);
+  let open;
+  let reached;
+  const interrupting = new Promise(resolve => { reached = resolve; });
+  f.faults.interruptGate = { gate: new Promise(resolve => { open = resolve; }), reached };
+  const pausing = f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
+  await interrupting;
+  // Both wait for the lane's control lock; their outcomes are captured as soon as they settle.
+  const outcome = promise => promise.then(() => 'dispatched', error => error.code);
+  const starting = outcome(f.runtime.startFeatureAgent(f.args));
+  const steering = outcome(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Keep going.' }));
+  await new Promise(resolve => setTimeout(resolve, 400));
+  // Until the worker has stopped, the lane does not claim to be paused.
+  assert.equal((await lifecycle(f.args)).status, 'active');
+  open();
+  assert.equal((await pausing).feature.status, 'paused');
+  assert.deepEqual(await Promise.all([starting, steering]), ['INVALID_TRANSITION', 'INVALID_TRANSITION']);
+  assert.equal(f.stores.codex.get(started.threadId).turns.length, 1);
+  assert.ok(!f.calls.some(call => call.method === 'turn/steer'));
+  const lane = await lifecycle(f.args);
+  assert.deepEqual({ status: lane.status, agent: lane.agent, turnId: lane.turnId }, { status: 'paused', agent: 'interrupted', turnId: null });
+});
+
+test('an unsettled turn request blocks a pause until native history or an attestation settles it', async t => {
+  const f = await fixture(t, 'claude', { stopSettleMs: 200 });
+  f.faults.claude = 'lost-unstarted';
+  await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'CODEX_TIMEOUT');
+  delete f.faults.claude;
+  f.stores.claude.get('claude-1').history = 'unavailable';
+  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && /prior_turn_attestation/.test(error.message));
+  assert.deepEqual((({ status, agent }) => ({ status, agent }))(await lifecycle(f.args)), { status: 'active', agent: 'uncertain' });
+  const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused', prior_turn_attestation: { evidence: 'No worker process runs in the alpha checkout.' } });
+  assert.deepEqual({ status: paused.feature.status, agent: paused.feature.agent.status }, { status: 'paused', agent: 'idle' });
+  const reconciled = (await getFeatureContext({ ...f.args, timeline_limit: 50 })).timeline.find(entry => entry.kind === 'agent.dispatch_reconciled');
+  assert.equal(reconciled.details.basis, 'coordinator_attestation');
+});
+
+test('archiving validates before stopping the worker and then stops it like a pause', async t => {
+  const f = await fixture(t, 'codex', { stopSettleMs: 200 });
+  const started = await f.runtime.startFeatureAgent(f.args);
+  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'archived' }), error => error.code === 'INVALID_INPUT');
+  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'blocked', blocker: 'x' }), error => error.code === 'INVALID_INPUT');
+  assert.ok(!f.calls.some(call => call.method === 'turn/interrupt'));
+  assert.equal(f.stores.codex.get(started.threadId).turns.at(-1).status, 'inProgress');
+  const archived = await f.runtime.stopFeatureLane({ ...f.args, status: 'archived', disposition: 'Superseded.' });
+  assert.deepEqual({ status: archived.feature.status, agent: archived.feature.agent.status, interrupted: archived.interruption.interrupted }, { status: 'archived', agent: 'interrupted', interrupted: true });
+  assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'archived' })).unchanged, true);
+});
+
+test('an idle lane owned by another live controller is paused only by its owner or on attestation', async t => {
+  const f = await fixture(t, 'codex', { stopSettleMs: 200 });
+  const started = await f.runtime.startFeatureAgent(f.args);
+  f.bridge.backend('codex').finish(started.threadId);
+  await eventually(async () => (await agent(f.args)).status === 'idle');
+  const other = createAgentRuntime(f.bridge);
+  const pause = extra => other.stopFeatureLane({ ...f.args, status: 'paused', ...extra });
+
+  await assert.rejects(pause(), error => error.code === 'STOP_UNCONFIRMED' && error.details?.foreignOwnerPid === process.pid && /prior_turn_attestation/.test(error.message));
+  let lane = await lifecycle(f.args);
+  assert.equal(lane.status, 'active');
+  assert.ok(lane.events.includes('feature.stop_unconfirmed'));
+  const attested = await pause({ prior_turn_attestation: { evidence: 'The owning controller reports no worker process for this lane.' } });
+  assert.equal(attested.feature.status, 'paused');
+
+  // The owner itself pauses its idle lane as before.
+  await setFeatureStatus({ ...f.args, status: 'active' });
+  assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' })).feature.status, 'paused');
+
+  // Once the owning controller has ended, an ordinary idle pause needs nothing more.
+  await setFeatureStatus({ ...f.args, status: 'active' });
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  f.sql("UPDATE meta SET value = json_object('token', 'ended-controller', 'pid', ?) WHERE key LIKE 'agent-owner:%'", dead);
+  assert.equal((await pause()).feature.status, 'paused');
+  lane = await lifecycle(f.args);
+  assert.deepEqual({ status: lane.status, agent: lane.agent }, { status: 'paused', agent: 'idle' });
+});
+
+test('a late completion cannot recreate an attested descendant marker', async t => {
+  const f = await fixture(t, 'codex');
+  const started = await f.runtime.startFeatureAgent(f.args);
+  f.bridge.backend('codex').finish(started.threadId);
+  await eventually(async () => (await agent(f.args)).status === 'idle');
+  const db = new DatabaseSync(path.join(f.root, '.theater', 'state.sqlite3'));
+  const ownerToken = JSON.parse(db.prepare("SELECT value FROM meta WHERE key LIKE 'agent-owner:%'").get().value).token;
+  db.close();
+  const marker = { ...f.args, thread_id: started.threadId, turn_id: started.turnId, owner_token: ownerToken, summary: 'Worker descendants may still run.' };
+  const first = await markDescendantsUnconfirmed(marker);
+  assert.ok(first.generation);
+  const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused', prior_turn_attestation: { evidence: 'Verified the completed turn has no running processes.' } });
+  assert.equal(paused.feature.status, 'paused');
+  assert.equal(await readUnconfirmedDescendants(f.args), null);
+  assert.deepEqual(await markDescendantsUnconfirmed(marker), { recorded: false, attested: true });
+  assert.equal(await readUnconfirmedDescendants(f.args), null);
+  await setFeatureStatus({ ...f.args, status: 'active' });
+  const next = await f.runtime.startFeatureAgent(f.args);
+  const fresh = await markDescendantsUnconfirmed({ ...marker, turn_id: next.turnId });
+  assert.ok(fresh.generation && fresh.generation !== first.generation);
 });

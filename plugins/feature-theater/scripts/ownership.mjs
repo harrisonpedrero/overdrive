@@ -38,6 +38,37 @@ export function recoverAgentState(ctx, feature) {
   return readFeatureRow(ctx.db, feature.slug);
 }
 
+// 'uncertain': a turn request had no confirmed outcome, so the turn may be running.
+const BUSY_STATUSES = ['starting', 'uncertain', 'compacting', 'waiting_for_user'];
+export const AGENT_BUSY_SQL = `(active_turn_id IS NOT NULL OR agent_status IN (${BUSY_STATUSES.map(status => `'${status}'`).join(', ')}))`;
+
+// Set when a worker process was stopped without its process tree, so tools it launched may
+// still be running; only a recorded coordinator attestation clears it.
+export const descendantsKey = featureId => `agent-descendants:${featureId}`;
+export const DESCENDANTS_CLEAR_SQL = "NOT EXISTS (SELECT 1 FROM meta WHERE key = 'agent-descendants:' || features.id)";
+export const workersKey = featureId => `agent-workers:${featureId}`;
+export const WORKERS_CLEAR_SQL = "NOT EXISTS (SELECT 1 FROM meta WHERE key = 'agent-workers:' || features.id)";
+
+export function unconfirmedDescendants(db, featureId) {
+  return parseJson(meta(db, descendantsKey(featureId)), null);
+}
+
+function agentBusy(row) {
+  return Boolean(row.active_turn_id) || BUSY_STATUSES.includes(row.agent_status);
+}
+
+function claimAgentControl(ctx, row, token) {
+  const previous = agentOwner(ctx.db, row.id);
+  if (previous?.token !== token && agentBusy(row) && ownerAlive(previous)) {
+    throw new TheaterError('This feature is running in another coordinator session. Inspect it there or wait for its current turn to finish.', 'AGENT_OWNED');
+  }
+  if (previous?.token !== token && !ownerAlive(previous)) {
+    ctx.db.prepare(RELEASE_DEAD_OWNER).run(row.id);
+    ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND status = 'pending'").run(now(), row.id);
+  }
+  meta(ctx.db, `agent-owner:${row.id}`, JSON.stringify({ token, pid: process.pid }));
+}
+
 export async function withAgentControl(args, token, fn) {
   const root = await resolveWorkspace(args.workspace_path);
   const slug = safeSlug(args.feature);
@@ -46,18 +77,34 @@ export async function withAgentControl(args, token, fn) {
     try {
       const row = featureBySlug(ctx.db, slug);
       assertCheckReservation(ctx.db, row.id);
-      const previous = agentOwner(ctx.db, row.id);
-      // 'uncertain': a turn request had no confirmed outcome, so the turn may be running.
-      const busy = row.active_turn_id || ['starting', 'uncertain', 'compacting', 'waiting_for_user'].includes(row.agent_status);
-      if (previous?.token !== token && busy && ownerAlive(previous)) {
-        throw new TheaterError('This feature is running in another coordinator session. Inspect it there or wait for its current turn to finish.', 'AGENT_OWNED');
-      }
-      if (previous?.token !== token && !ownerAlive(previous)) {
-        ctx.db.prepare(RELEASE_DEAD_OWNER).run(row.id);
-        ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND status = 'pending'").run(now(), row.id);
-      }
-      meta(ctx.db, `agent-owner:${row.id}`, JSON.stringify({ token, pid: process.pid }));
+      claimAgentControl(ctx, row, token);
     } finally { ctx.db.close(); }
     return fn(root, slug);
+  });
+}
+
+// Holds the lane's control lock for a whole lifecycle stop, so no turn can be dispatched between
+// stopping the worker and recording the new status. The lane is claimed only when a worker may be
+// live and must be stopped here; an idle lane keeps its owner. fn receives the lane row, whether
+// a worker may be live, and the live controller other than this one that owns an idle lane's
+// session, if any: only that controller can know whether a process it launched is still running.
+export async function withLaneStop(args, token, fn) {
+  const root = await resolveWorkspace(args.workspace_path);
+  const slug = safeSlug(args.feature);
+  return withWorkspaceLock(root, `control-${slug}`, async () => {
+    const ctx = await loadWorkspace(root);
+    let row;
+    let busy;
+    let foreignOwner = null;
+    try {
+      row = featureBySlug(ctx.db, slug);
+      busy = agentBusy(row);
+      if (busy) claimAgentControl(ctx, row, token);
+      else {
+        const owner = agentOwner(ctx.db, row.id);
+        if (row.thread_id && owner && owner.token !== token && ownerAlive(owner)) foreignOwner = { pid: owner.pid };
+      }
+    } finally { ctx.db.close(); }
+    return fn(row, busy, foreignOwner);
   });
 }

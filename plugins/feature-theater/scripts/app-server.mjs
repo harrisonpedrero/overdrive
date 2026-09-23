@@ -353,6 +353,19 @@ export class WorkerBridge extends EventEmitter {
     return await this.backend(params.threadId ? this.owner(params.threadId, harness) : harness).request(method, params);
   }
 
+  // Waits for, or stops, a worker process that a loaded session's ended turn left running (such
+  // as one an interrupt could not stop), throwing if it cannot. Sessions not loaded here, and
+  // backends that keep no process of their own, have nothing to settle.
+  async settleThread({ threadId }) {
+    const owner = this.threads.get(threadId);
+    return await this.backends.get(owner)?.settleThread?.({ threadId });
+  }
+
+  acknowledgeDescendants({ threadId, turnId }) {
+    const owner = this.threads.get(threadId);
+    this.backends.get(owner)?.acknowledgeDescendants?.({ threadId, turnId });
+  }
+
   liveRequest(requestId) {
     for (const backend of this.backends.values()) {
       const request = backend.liveRequest(requestId);

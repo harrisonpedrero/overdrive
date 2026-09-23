@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { assertAgentIdle, assertVerified, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
-import { ownsAgent, recoverAgentState } from './ownership.mjs';
+import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, descendantsKey, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -933,44 +933,65 @@ export async function switchFeature({ workspace_path, feature }) {
   });
 }
 
-export async function setFeatureStatus({ workspace_path, feature, status, blocker, disposition }) {
+// Validates a lifecycle transition before anything acts on it, such as stopping a worker.
+export function featureStatusInput({ status, blocker, disposition }) {
   if (!FEATURE_STATUSES.has(status)) throw new TheaterError(`Unknown feature status: ${status}`, 'INVALID_INPUT');
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  return await withCheckoutLock(root, slug, async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      if (row.status === status && status === 'archived') return { feature: summarizeFeature(ctx, row), unchanged: true };
-      const cleanBlocker = optionalText(blocker, 'blocker', { max: 20_000 }) || '';
-      const cleanDisposition = optionalText(disposition, 'disposition', { max: 20_000 }) || '';
-      if (status === 'blocked' && !cleanBlocker) throw new TheaterError('A blocked feature requires a blocker.', 'INVALID_INPUT');
-      if (status === 'archived' && !cleanDisposition) throw new TheaterError('Archiving requires a disposition.', 'INVALID_INPUT');
-      let completionCandidate = null;
-      if (status === 'done') {
-        assertAgentIdle(row);
-        const progress = progressFor(ctx.db, row.id);
-        if (progress.open > 0) throw new TheaterError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
-        completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY rowid DESC LIMIT 1").get(row.id);
-        if (!completionCandidate) throw new TheaterError('Feature completion requires a ready integration candidate.', 'COMPLETION_NOT_PROVEN');
-        const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-        if (!snapshot.clean || snapshot.head !== completionCandidate.revision) throw new TheaterError('The ready candidate must still be the clean checkout HEAD.', 'STALE_CANDIDATE');
-        assertVerified(ctx, row, completionCandidate.revision, completionCandidate);
-        if (row.status === status) return { feature: summarizeFeature(ctx, row), unchanged: true };
-      }
-      const stamp = now();
-      transaction(ctx.db, () => {
-        ctx.db.prepare('UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> \'\' THEN ? ELSE summary END, updated_at = ? WHERE id = ?')
-          .run(status, cleanBlocker, cleanDisposition, cleanDisposition, stamp, row.id);
-        if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
-      });
-      await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: {} });
-      const current = featureBySlug(ctx.db, slug);
-      await writeFeatureContext(ctx, current);
-      await writeIndex(ctx);
-      return { feature: summarizeFeature(ctx, current) };
-    } finally { ctx.db.close(); }
-  });
+  const cleanBlocker = optionalText(blocker, 'blocker', { max: 20_000 }) || '';
+  const cleanDisposition = optionalText(disposition, 'disposition', { max: 20_000 }) || '';
+  if (status === 'blocked' && !cleanBlocker) throw new TheaterError('A blocked feature requires a blocker.', 'INVALID_INPUT');
+  if (status === 'archived' && !cleanDisposition) throw new TheaterError('Archiving requires a disposition.', 'INVALID_INPUT');
+  return { cleanBlocker, cleanDisposition };
+}
+
+export async function setFeatureStatus(args) {
+  if (!FEATURE_STATUSES.has(args.status)) throw new TheaterError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
+  const root = await resolveWorkspace(args.workspace_path);
+  const slug = safeSlug(args.feature);
+  return await withCheckoutLock(root, slug, () => applyFeatureStatus(root, slug, args));
+}
+
+// Records a stopping transition (pause or archive) for a caller that already holds the lane's
+// control lock and has stopped its worker. The write itself refuses a lane whose worker may still
+// be live, so the new status can never claim a stop that did not happen.
+export async function setStoppedFeatureStatus(args) {
+  if (!FEATURE_STATUSES.has(args.status)) throw new TheaterError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
+  const root = await resolveWorkspace(args.workspace_path);
+  const slug = safeSlug(args.feature);
+  return await withWorkspaceLock(root, 'features', () => applyFeatureStatus(root, slug, args, { requireStopped: true }));
+}
+
+async function applyFeatureStatus(root, slug, args, { requireStopped = false } = {}) {
+  const { status } = args;
+  const ctx = await loadWorkspace(root);
+  try {
+    const row = featureBySlug(ctx.db, slug);
+    if (row.status === status && status === 'archived') return { feature: summarizeFeature(ctx, row), unchanged: true };
+    const { cleanBlocker, cleanDisposition } = featureStatusInput(args);
+    let completionCandidate = null;
+    if (status === 'done') {
+      assertAgentIdle(row);
+      const progress = progressFor(ctx.db, row.id);
+      if (progress.open > 0) throw new TheaterError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
+      completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY rowid DESC LIMIT 1").get(row.id);
+      if (!completionCandidate) throw new TheaterError('Feature completion requires a ready integration candidate.', 'COMPLETION_NOT_PROVEN');
+      const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
+      if (!snapshot.clean || snapshot.head !== completionCandidate.revision) throw new TheaterError('The ready candidate must still be the clean checkout HEAD.', 'STALE_CANDIDATE');
+      assertVerified(ctx, row, completionCandidate.revision, completionCandidate);
+      if (row.status === status) return { feature: summarizeFeature(ctx, row), unchanged: true };
+    }
+    const stamp = now();
+    transaction(ctx.db, () => {
+      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
+        .run(status, cleanBlocker, cleanDisposition, cleanDisposition, stamp, row.id);
+      if (!changed.changes) throw new TheaterError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
+      if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
+    });
+    await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: {} });
+    const current = featureBySlug(ctx.db, slug);
+    await writeFeatureContext(ctx, current);
+    await writeIndex(ctx);
+    return { feature: summarizeFeature(ctx, current) };
+  } finally { ctx.db.close(); }
 }
 
 export async function recordEvidence({ workspace_path, feature, work_item, kind, summary, command, artifact, revision, passed }) {
@@ -1251,6 +1272,102 @@ export async function recordAgentEvent({ workspace_path, feature, kind, summary,
       if (!ownsAgent(ctx.db, row.id, owner_token) || (thread_id !== undefined && row.thread_id !== thread_id)) return { ignored: true };
       const cleanSummary = requiredText(summary, 'summary', { max: 100_000 });
       return await addEvent(ctx, { featureId: row.id, kind, summary: cleanSummary, details });
+    } finally { ctx.db.close(); }
+  });
+}
+
+// Records that a worker process of the bound session was stopped without its process tree, so
+// tools it launched may still be running. Guarded like other session writes. Every occurrence
+// gets a new generation, so an attestation about an earlier one cannot cover it; the same turn
+// reported twice (by its interrupt and by its completion) is one occurrence.
+const attestedDescendantsKey = (featureId, threadId, turnId) => `agent-descendants-attested:${featureId}:${threadId}:${turnId}`;
+
+export async function markDescendantsUnconfirmed({ workspace_path, feature, thread_id, turn_id = null, summary, owner_token }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token) || row.thread_id !== thread_id) return { ignored: true };
+      // A completion delivered after attestation must not recreate the marker it cleared.
+      if (turn_id && meta(ctx.db, attestedDescendantsKey(row.id, thread_id, turn_id))) return { recorded: false, attested: true };
+      const previous = unconfirmedDescendants(ctx.db, row.id);
+      if (turn_id && previous?.threadId === thread_id && previous?.turnId === turn_id) return { recorded: false, generation: previous.generation };
+      const cleanSummary = requiredText(summary, 'summary', { max: 20_000 });
+      const generation = randomUUID();
+      meta(ctx.db, descendantsKey(row.id), JSON.stringify({ generation, occurrences: (previous?.occurrences ?? 0) + 1, threadId: thread_id, turnId: turn_id, summary: cleanSummary, at: now() }));
+      await addEvent(ctx, { featureId: row.id, kind: 'agent.descendants_unconfirmed', summary: cleanSummary, details: { threadId: thread_id, turnId: turn_id, generation } });
+      return { recorded: true, generation };
+    } finally { ctx.db.close(); }
+  });
+}
+
+export async function readUnconfirmedDescendants({ workspace_path, feature }) {
+  return await withContext(workspace_path, async ctx => unconfirmedDescendants(ctx.db, featureBySlug(ctx.db, safeSlug(feature)).id));
+}
+
+// Registered before a Claude turn request can reach its worker. A controller restart loses the
+// process handle, so this record remains until its owning bridge observes a clean completed
+// turn and child exit, confirms tree termination, or the coordinator attests it has stopped.
+export async function registerWorkerGuard({ workspace_path, feature, thread_id, guard_id, owner_token }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token) || row.thread_id !== thread_id) return { ignored: true };
+      const guards = parseJson(meta(ctx.db, workersKey(row.id)), []);
+      if (!guards.some(guard => guard.id === guard_id)) guards.push({ id: guard_id, threadId: thread_id });
+      meta(ctx.db, workersKey(row.id), JSON.stringify(guards));
+      return { registered: true };
+    } finally { ctx.db.close(); }
+  });
+}
+
+export async function readWorkerGuards({ workspace_path, feature }) {
+  return await withContext(workspace_path, async ctx => parseJson(meta(ctx.db, workersKey(featureBySlug(ctx.db, safeSlug(feature)).id)), []));
+}
+
+export async function clearWorkerGuards({ workspace_path, feature, guard_id = null, evidence = null }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      const guards = parseJson(meta(ctx.db, workersKey(row.id)), []);
+      const remaining = guard_id ? guards.filter(guard => guard.id !== guard_id) : [];
+      if (remaining.length === guards.length) return { cleared: false };
+      transaction(ctx.db, () => {
+        if (remaining.length) meta(ctx.db, workersKey(row.id), JSON.stringify(remaining));
+        else ctx.db.prepare('DELETE FROM meta WHERE key = ?').run(workersKey(row.id));
+      });
+      await addEvent(ctx, { featureId: row.id, kind: evidence ? 'agent.workers_attested' : 'agent.worker_stopped', summary: evidence ? `The coordinator attested that no worker or tool process for this lane is running: ${evidence}` : 'The owning bridge confirmed the worker stopped.', details: { guardId: guard_id, cleared: guards.length - remaining.length } });
+      return { cleared: true };
+    } finally { ctx.db.close(); }
+  });
+}
+
+// Clears the unconfirmed-descendants marker on the coordinator's evidence that none is running,
+// only if it is still the generation the evidence was given for.
+export async function attestDescendantsStopped({ workspace_path, feature, evidence, generation }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      const marker = unconfirmedDescendants(ctx.db, row.id);
+      if (!marker) return { cleared: false };
+      if (marker.generation !== generation) return { cleared: false, stale: true };
+      transaction(ctx.db, () => {
+        if (marker.turnId) meta(ctx.db, attestedDescendantsKey(row.id, marker.threadId, marker.turnId), marker.generation);
+        ctx.db.prepare('DELETE FROM meta WHERE key = ?').run(descendantsKey(row.id));
+      });
+      await addEvent(ctx, { featureId: row.id, kind: 'agent.descendants_attested', summary: `The coordinator attested that no process launched by the stopped worker is running: ${evidence}`, details: { basis: 'coordinator_attestation', marker } });
+      return { cleared: true };
     } finally { ctx.db.close(); }
   });
 }

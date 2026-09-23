@@ -24,6 +24,7 @@ import {
   resolveFeatureAgentRequest,
   startFeatureAgent,
   steerFeatureAgent,
+  stopFeatureLane,
   waitFeatureAgent,
   waitFeatureAgents,
 } from './agent-runtime.mjs';
@@ -48,6 +49,13 @@ function tool(name, title, description, inputSchema, annotations = {}) {
     annotations: { title, openWorldHint: false, ...annotations },
   };
 }
+
+const priorTurnAttestation = consequence => ({
+  ...object({
+    evidence: string('The process or backend facts you verified, under your existing authority, showing that no worker or tool process for this lane is still running (for example the process check performed and its result).', { minLength: 1, maxLength: 4000 }),
+  }, ['evidence']),
+  description: `Evidence-based coordinator attestation when a turn request, foreign controller, or worker/process-tree stop cannot be confirmed. It is recorded in the timeline, not requested from the user as approval. Readable native history takes precedence for uncertain turn requests, and ${consequence}`,
+});
 
 const workspace = { workspace_path: string('Absolute path to the OVERDRIVE control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
@@ -202,13 +210,14 @@ export const TOOLS = [
     ...feature,
   }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_feature_status', 'Set feature lifecycle state', 'Pause, resume, block, review, complete, or archive a lane without moving its checkout. Completion requires closed work and passing evidence.', object({
+  tool('theater_feature_status', 'Set feature lifecycle state', 'Pause, resume, block, review, complete, or archive a lane without moving its checkout. Completion requires closed work and passing evidence. Pausing or archiving first stops the lane worker and records the status only once no turn is running; if the stop cannot be confirmed the status is unchanged and STOP_UNCONFIRMED explains what is still running. A paused lane dispatches nothing until it is made active again.', object({
     ...workspace,
     ...feature,
     status: string('Lifecycle state.', { enum: ['planned', 'active', 'paused', 'blocked', 'review', 'done', 'archived'] }),
     blocker: string('Required when blocking.'),
     disposition: string('Required when archiving; state what shipped or remains.'),
-  }, ['workspace_path', 'feature', 'status']), { destructiveHint: false }),
+    prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot be paused or archived.'),
+  }, ['workspace_path', 'feature', 'status']), { destructiveHint: false, openWorldHint: true }),
 
   tool('theater_evidence_record', 'Record feature evidence', 'Record an actually executed check, artifact inspection, review, or other evidence at an exact revision when available.', object({
     ...workspace,
@@ -244,12 +253,7 @@ export const TOOLS = [
     instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),
     effort: string('Worker reasoning effort.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
     force_new_session: boolean('Create a replacement task on the currently configured harness instead of resuming the recorded one. A recorded task otherwise always resumes on the harness that created it.'),
-    prior_turn_attestation: {
-      ...object({
-        evidence: string('The process or backend facts you verified, under your existing authority, showing that no worker from the unconfirmed turn request is still running for this lane (for example the process check performed and its result).', { minLength: 1, maxLength: 4000 }),
-      }, ['evidence']),
-      description: 'Evidence-based coordinator attestation for a lane whose agent status is uncertain and whose native history cannot be read. It is recorded in the timeline; it is not a user approval request. Readable native history always takes precedence, and without an attestation such a lane cannot dispatch.',
-    },
+    prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot dispatch.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
   tool('theater_agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
@@ -309,11 +313,7 @@ const handlers = {
   theater_work_update: updateWork,
   theater_checkpoint: checkpointFeature,
   async theater_feature_status(args) {
-    const result = await setFeatureStatus(args);
-    if (['paused', 'archived'].includes(args.status) && result.feature.agent.activeTurnId) {
-      result.interruption = await interruptFeatureAgent(args);
-    }
-    return result;
+    return await (['paused', 'archived'].includes(args.status) ? stopFeatureLane(args) : setFeatureStatus(args));
   },
   theater_evidence_record: recordEvidence,
   theater_candidate_record: recordCandidate,
