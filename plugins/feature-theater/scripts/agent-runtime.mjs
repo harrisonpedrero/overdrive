@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
-import { summarizePatch, TheaterError, optionalText, parseJsonObject, requiredText, redactString } from './util.mjs';
+import { summarizePatch, TheaterError, parseJsonObject, requiredText, redactString } from './util.mjs';
 import { withAgentControl, withLaneStop } from './ownership.mjs';
 import {
   attestDescendantsStopped,
@@ -272,8 +272,9 @@ function harnessParams(runtime) {
   return { harness: runtime.harness, model: runtime.workerModel, harnessOptions: runtime.harnessOptions };
 }
 
+// Callers validate the instruction before any native session or lane state changes.
 function runPrompt(runtime, instruction) {
-  const direction = optionalText(instruction, 'instruction', { max: 100_000 }) || runtime.feature.next_action || 'Choose and complete the highest-priority ready work.';
+  const direction = instruction || runtime.feature.next_action || 'Choose and complete the highest-priority ready work.';
   return `Continue the ${runtime.feature.slug} feature lane.\n\nUser/coordinator direction:\n${direction}\n\nFirst load the feature context and spec named in your developer instructions, then inspect current Git state. Reconcile the request with the durable work graph. Work toward the smallest coherent verified result; do not silently broaden scope. Keep visible progress updates safe and concise. End with a handoff containing the exact resulting revision or dirty-state description, checks actually run and their outcomes, unresolved issues, and the next useful action. Do not include private chain-of-thought.`;
 }
 
@@ -417,7 +418,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   }
 }
 
-async function startOwned({ workspace_path, feature, instruction, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }) {
+async function startOwned({ workspace_path, feature, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }, direction) {
   if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new TheaterError('Unsupported reasoning effort.', 'INVALID_INPUT');
   const attestation = priorTurnAttestation(prior_turn_attestation);
   const runtime = await featureRuntime({ workspace_path, feature, force_new_session });
@@ -445,7 +446,7 @@ async function startOwned({ workspace_path, feature, instruction, effort = 'high
     register(threadId, runtime.root, runtime.feature.slug);
     await bridge.request('thread/name/set', { harness: runtime.harness, threadId, name: `OVERDRIVE · ${runtime.feature.title}` }).catch(() => {});
   }
-  const turn = await dispatchTurn(runtime, threadId, instruction, effort, created);
+  const turn = await dispatchTurn(runtime, threadId, direction, effort, created);
   return {
     feature: runtime.feature.slug,
     threadId,
@@ -803,7 +804,12 @@ async function shutdownAgentRuntime() {
   return { unstopped: stopped?.unstopped ?? [] };
 }
 
-const startFeatureAgent = args => withAgentControl(args, ownerToken, () => startOwned(args));
+// An omitted instruction falls back to the checkpoint next action; a supplied one, even an empty
+// string, must be valid before the lane's control lock or native session is touched.
+const startFeatureAgent = async args => {
+  const direction = args.instruction === undefined || args.instruction === null ? undefined : requiredText(args.instruction, 'instruction', { max: 100_000 });
+  return await withAgentControl(args, ownerToken, () => startOwned(args, direction));
+};
 const steerFeatureAgent = args => withAgentControl(args, ownerToken, () => steerOwned(args));
 const compactFeatureAgent = args => withAgentControl(args, ownerToken, () => compactOwned(args));
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));

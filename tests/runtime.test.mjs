@@ -80,6 +80,45 @@ for (const [name, codex, expectedModel] of [
   });
 }
 
+test('an invalid start instruction creates no native task and leaves the lane startable', async t => {
+  const args = await fixture(t);
+  const bridge = new Bridge();
+  let threadStarts = 0;
+  const startThread = bridge.startThread.bind(bridge);
+  bridge.startThread = params => (threadStarts++, startThread(params));
+  let resumes = 0;
+  const resumeThread = bridge.resumeThread.bind(bridge);
+  bridge.resumeThread = params => (resumes++, resumeThread(params));
+  const runtime = createAgentRuntime(bridge);
+  t.after(() => runtime.shutdownAgentRuntime());
+  for (const instruction of ['', '   ', '\n\t', 42, 'a\0b']) {
+    await assert.rejects(runtime.startFeatureAgent({ ...args, instruction }), error => error.code === 'INVALID_INPUT');
+  }
+  assert.equal(threadStarts, 0);
+  assert.deepEqual(bridge.requests, []);
+  const untouched = (await getFeatureContext(args)).feature;
+  assert.deepEqual(untouched.agent, { status: 'not_started', threadId: null, harness: null, activeTurnId: null });
+
+  bridge.quick = true;
+  const started = await runtime.startFeatureAgent({ ...args, instruction: '  Build the fixture.  ' });
+  assert.equal(threadStarts, 1);
+  assert.equal(started.createdSession, true);
+  assert.match(bridge.requests.find(request => request.method === 'turn/start').params.input[0].text, /direction:\nBuild the fixture\.\n/);
+  await eventually(async () => (await getFeatureContext(args)).feature.agent.status === 'idle');
+
+  const requests = bridge.requests.length;
+  for (const instruction of ['', ' ']) {
+    await assert.rejects(runtime.startFeatureAgent({ ...args, instruction }), error => error.code === 'INVALID_INPUT');
+  }
+  assert.equal(resumes, 0);
+  assert.equal(bridge.requests.length, requests);
+  assert.deepEqual((await getFeatureContext(args)).feature.agent, { status: 'idle', threadId: 'fixture-thread', harness: 'codex', activeTurnId: null });
+
+  const { nextAction } = (await getFeatureContext(args)).feature;
+  await runtime.startFeatureAgent(args);
+  assert.ok(bridge.requests.findLast(request => request.method === 'turn/start').params.input[0].text.includes(`direction:\n${nextAction || 'Choose and complete the highest-priority ready work.'}\n`));
+});
+
 test('short completion cannot be overwritten by its start response; private items are absent', async t => {
   const args = await fixture(t);
   const bridge = new Bridge();
