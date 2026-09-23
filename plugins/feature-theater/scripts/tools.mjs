@@ -99,7 +99,7 @@ export const TOOLS = [
     work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
     page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
   }, ['workspace_path']), { destructiveHint: false }),
-  tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Changes invalidate earlier candidates; execute through theater_checks_run or the verification queue.', object({
+  tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Commands execute in the submitted order, so list setup before dependent checks; reordering changes the contract. Changes invalidate earlier candidates; execute through theater_checks_run or the verification queue.', object({
     ...workspace, ...feature,
     checks: { type: 'array', maxItems: 50, items: object({
       key: string('Stable check key.'), purpose: string('Behavior this command verifies.'),

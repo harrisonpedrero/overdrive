@@ -37,6 +37,39 @@ test('latest required receipt and current specification gate delivery; dirty che
   assert.equal((await git(repo, 'status', '--porcelain')).stdout.includes('unexpected.txt'), true);
 });
 
+test('checks execute in saved order and reordering changes the contract', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-order-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'order' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Order', description: 'Setup precedes dependent checks.' });
+  const lane = await createFeature({ ...args, title: 'Order', outcome: 'Setup runs first.', spec: '# Order\n\nSetup precedes tests.' });
+  const repo = lane.feature.checkoutPath;
+  await fs.appendFile(path.join(repo, '.git', 'info', 'exclude'), '\n.prepared\n');
+  const prepare = { key: 'z-prepare', purpose: 'Prepare ignored output', argv: [process.execPath, '-e', "require('node:fs').writeFileSync('.prepared', 'ok')"] };
+  const dependent = { key: 'a-test', purpose: 'Use prepared output', argv: [process.execPath, '-e', "require('node:fs').readFileSync('.prepared')"] };
+  const saved = await updateChecks({ ...args, checks: [prepare, dependent] });
+  assert.deepEqual(saved.checks.map(check => check.key), ['z-prepare', 'a-test']);
+  const full = await runChecks(args);
+  assert.deepEqual(full.receipts.map(receipt => [receipt.key, receipt.passed]), [['z-prepare', true], ['a-test', true]]);
+  assert.equal(full.verification.ready, true);
+  assert.deepEqual(full.verification.checks.map(check => check.key), ['z-prepare', 'a-test']);
+  await fs.rm(path.join(repo, '.prepared'));
+  const selected = await runChecks({ ...args, check_keys: ['a-test', 'z-prepare'] });
+  assert.deepEqual(selected.receipts.map(receipt => [receipt.key, receipt.passed]), [['z-prepare', true], ['a-test', true]]);
+  const unchanged = await updateChecks({ ...args, checks: [prepare, dependent] });
+  assert.equal(unchanged.changed, false);
+  assert.equal(unchanged.contractHash, saved.contractHash);
+  const reordered = await updateChecks({ ...args, checks: [dependent, prepare] });
+  assert.equal(reordered.changed, true);
+  assert.notEqual(reordered.contractHash, saved.contractHash);
+  assert.deepEqual((await getFeatureContext(args)).verification.checks.map(check => [check.key, check.status]), [['a-test', 'missing'], ['z-prepare', 'missing']]);
+  await fs.rm(path.join(repo, '.prepared'));
+  const stopped = await runChecks(args);
+  assert.deepEqual(stopped.receipts.map(receipt => [receipt.key, receipt.passed]), [['a-test', false]]);
+  assert.deepEqual(stopped.completion.notRunCheckKeys, ['z-prepare']);
+  assert.equal(stopped.verification.ready, false);
+});
+
 test('version-2 data migrates without turning historical claims into current proof', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-migration-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));

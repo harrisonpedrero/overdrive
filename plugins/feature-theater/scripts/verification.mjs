@@ -206,7 +206,8 @@ export async function updateChecks(args) {
     }
     const paths = artifactPaths(check.artifact_paths);
     return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}), ...(check.reuse_same_revision ? { reuse_same_revision: true } : {}), ...(scope ? { work_scope: scope } : {}) };
-  }).sort((a, b) => a.key.localeCompare(b.key));
+  });
+  // Submitted order is the execution order and part of the contract, so setup can precede dependent checks.
   if (new Set(checks.map(check => check.key)).size !== checks.length) throw new TheaterError('Check keys must be unique.', 'INVALID_INPUT');
   return withFeature(args, async (ctx, feature) => {
     assertAgentIdle(feature);
