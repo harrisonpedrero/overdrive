@@ -105,7 +105,7 @@ Switching lanes automatically compacts the outgoing feature task when it is idle
 
 If Codex restarted during an approval prompt, the old callback cannot safely be answered. Inspect the feature, resume or steer it, and let it issue a fresh request.
 
-An ended controller is detected by its persisted process owner; inspection clears stale activity and preserves the checkout. A running lane owned by another live coordinator cannot be started again from a competing session. Pausing requests interruption; switching focus alone preserves lifecycle state. The existing desktop coordinator still needs the explicit `/compact` command at substantial context boundaries.
+An ended controller is detected by its persisted process owner; inspection clears stale activity and preserves the checkout. A running lane owned by another live coordinator cannot be started again from a competing session. Pausing requests interruption; switching focus alone preserves lifecycle state. A paused lane refuses candidate recording with `INVALID_TRANSITION` and leaves its status, direction and candidates unchanged; resume it with the feature-status tool first. The existing desktop coordinator still needs the explicit `/compact` command at substantial context boundaries.
 
 Inspect `theater_checks_queue` after a restart. Completed jobs retain their receipts; an interrupted command remains uncertain and reserves its clone and declared resources until explicitly resolved. Controller death does not prove child-process termination. Establish that the command processes stopped before using `theater_checks_resolve` with a reason and `execution_stopped: true` to retry or cancel interrupted work. Resume eligible saved jobs instead of submitting duplicate work.
 

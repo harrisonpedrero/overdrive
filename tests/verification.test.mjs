@@ -62,6 +62,33 @@ test('an archived lane refuses candidates until it is explicitly reactivated', a
   assert.equal((await listFeatures({ workspace_path: workspace })).features.some(feature => feature.slug === 'shelved'), true);
 });
 
+test('a paused lane refuses candidates until it is explicitly resumed', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-paused-candidate-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'held' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Pause', description: 'Pause stays a boundary.' });
+  await createFeature({ ...args, title: 'Held', outcome: 'Stays paused.', spec: '# Held\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(args)).verification.ready, true);
+  await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
+  await setFeatureStatus({ ...args, status: 'paused' });
+  const paused = await getFeatureContext(args);
+  assert.equal(paused.verification.ready, true);
+  await assert.rejects(recordCandidate({ ...args, summary: 'Slip past the pause.', checks: ['README receipt'] }), error => error.code === 'INVALID_TRANSITION' && /paused/.test(error.message) && /resume/i.test(error.message));
+  const after = await getFeatureContext(args);
+  assert.equal(after.feature.status, 'paused');
+  assert.equal(after.feature.summary, paused.feature.summary);
+  assert.equal(after.feature.nextAction, paused.feature.nextAction);
+  assert.deepEqual(after.candidates, paused.candidates);
+  assert.deepEqual(after.timeline, paused.timeline);
+  await setFeatureStatus({ ...args, status: 'active' });
+  const resumed = await recordCandidate({ ...args, summary: 'Ready after resuming.', checks: ['README receipt'] });
+  assert.equal(resumed.feature.status, 'review');
+  const reviewed = await getFeatureContext(args);
+  assert.equal(reviewed.candidates.filter(candidate => candidate.status === 'ready').length, 1);
+  assert.equal(reviewed.candidates.find(candidate => candidate.status === 'ready').summary, 'Ready after resuming.');
+});
+
 test('checks execute in saved order and reordering changes the contract', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-order-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));

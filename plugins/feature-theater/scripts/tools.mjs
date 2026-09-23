@@ -232,7 +232,7 @@ export const TOOLS = [
     passed: boolean('Whether this is passing or failing evidence; omit for a neutral note.'),
   }, ['workspace_path', 'feature', 'kind', 'summary']), { destructiveHint: false }),
 
-  tool('theater_candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate with executed checks. Does not push, open a PR, or merge.', object({
+  tool('theater_candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate with executed checks. A paused or archived lane is refused until it is made active again. Does not push, open a PR, or merge.', object({
     ...workspace,
     ...feature,
     revision: string('Candidate commit; defaults to HEAD.'),
