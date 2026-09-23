@@ -3,7 +3,7 @@ import { checkOutcome } from './check-outcome.mjs';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { assertCheckReservation, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
+import { assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
 
@@ -62,9 +62,11 @@ export function assertAgentIdle(feature) {
   }
 }
 
+// Reports whether a candidate or the lane status actually changed; callers own the generation bump.
 export function invalidateCandidates(db, featureId) {
-  db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId);
-  db.prepare("UPDATE features SET status = CASE WHEN status IN ('done','review') THEN 'active' ELSE status END WHERE id = ?").run(featureId);
+  const superseded = db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId).changes;
+  const reopened = db.prepare("UPDATE features SET status = 'active' WHERE id = ? AND status IN ('done','review')").run(featureId).changes;
+  return superseded + reopened > 0;
 }
 
 export function verificationStatus(ctx, feature, revision) {
@@ -218,6 +220,7 @@ export async function updateChecks(args) {
       captureContract(ctx.db, feature, definition);
       meta(ctx.db, `checks:${feature.id}`, JSON.stringify(checks));
       invalidateCandidates(ctx.db, feature.id);
+      bumpSemanticGeneration(ctx.db, feature.id);
       ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(now(), feature.id);
       recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.updated', summary: `Configured ${checks.length} verification command(s).` });
     });
@@ -248,6 +251,12 @@ export async function runChecks(args, execution = {}) {
       throw new TheaterError('Queued verification no longer matches the exact commit and full contract.', 'STALE_QUEUE_JOB');
     }
     captureContract(ctx.db, feature, definition);
+    // Receipts are live evidence; only a superseded candidate or reopened lane is a semantic change.
+    const invalidateUnverified = () => {
+      if (!verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head).ready && invalidateCandidates(ctx.db, feature.id)) {
+        bumpSemanticGeneration(ctx.db, feature.id);
+      }
+    };
     const receipts = [];
     for (const check of selectedChecks) {
       let artifact = null;
@@ -266,17 +275,22 @@ export async function runChecks(args, execution = {}) {
       const unchanged = after.clean && after.head === before.head;
       const passed = result.exitCode === 0 && !result.timedOut && !result.overflow && unchanged && !artifactError;
       const summary = `${check.purpose}: ${passed ? 'passed' : 'failed'}${result.timedOut ? ' (timed out)' : result.overflow ? ' (output limit)' : !unchanged ? ' (checkout changed during verification)' : ` (exit ${result.exitCode ?? 'unavailable'})`}${artifactError ? ' (artifact collection failed; remaining checks stopped)' : ''}${archived?.unchanged ? ` (${archived.unchanged} archived artifact file(s) unchanged since before this run)` : ''}.`;
-      ctx.db.prepare(`INSERT INTO evidence(id, feature_id, kind, summary, command, revision, passed, created_at, source, spec_revision, contract_hash, check_key, argv_json, exit_code, output, duration_ms, artifact)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        id, feature.id, check.kind, summary, redactString(JSON.stringify(check.argv)), before.head, passed ? 1 : 0, now(),
-        feature.spec_revision, contract, check.key, redactString(JSON.stringify(result.argv ?? check.argv)), result.exitCode ?? null,
-        redactString(`${result.stdout}\n${result.stderr}${artifactError ? `\nArtifact collection failed: ${artifactError}` : ''}`).slice(-24_000), result.durationMs, artifact,
-      );
+      // A failing receipt commits with the invalidation it causes, so a crash cannot leave its candidate standing.
+      transaction(ctx.db, () => {
+        ctx.db.prepare(`INSERT INTO evidence(id, feature_id, kind, summary, command, revision, passed, created_at, source, spec_revision, contract_hash, check_key, argv_json, exit_code, output, duration_ms, artifact)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'executed', ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          id, feature.id, check.kind, summary, redactString(JSON.stringify(check.argv)), before.head, passed ? 1 : 0, now(),
+          feature.spec_revision, contract, check.key, redactString(JSON.stringify(result.argv ?? check.argv)), result.exitCode ?? null,
+          redactString(`${result.stdout}\n${result.stderr}${artifactError ? `\nArtifact collection failed: ${artifactError}` : ''}`).slice(-24_000), result.durationMs, artifact,
+        );
+        if (!passed) invalidateUnverified();
+      });
       receipts.push({ id, key: check.key, passed, summary, exitCode: result.exitCode, durationMs: result.durationMs, artifact });
       if (!passed) break;
     }
     const verification = verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head);
-    if (!verification.ready) invalidateCandidates(ctx.db, feature.id);
+    // Passing receipts can still leave this commit unverified; that is settled once the run ends.
+    if (!verification.ready) transaction(ctx.db, invalidateUnverified);
     const selectedCheckKeys = selectedChecks.map(check => check.key);
     const completion = checkOutcome(selectedCheckKeys, receipts);
     recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `Run finished at ${before.head.slice(0, 12)}: ${receipts.length} executed, ${completion.failedCheckKeys.length} failed, ${completion.notRunCheckKeys.length} not run.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys, completion } });

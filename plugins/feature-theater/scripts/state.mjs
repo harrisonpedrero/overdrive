@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { checkoutPath } from './git.mjs';
 import { TheaterError, contained, ensureManagedPath, now, readJson } from './util.mjs';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 export const CHECK_QUEUE_META = 'checks:queue';
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
@@ -53,6 +53,7 @@ function schema(db) {
       active_turn_id TEXT,
       agent_status TEXT NOT NULL DEFAULT 'not_started',
       compaction_pending INTEGER NOT NULL DEFAULT 0,
+      semantic_generation INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -102,6 +103,7 @@ function schema(db) {
       summary TEXT NOT NULL,
       next_action TEXT NOT NULL,
       unresolved_json TEXT NOT NULL DEFAULT '[]',
+      semantic_generation INTEGER,
       created_at TEXT NOT NULL
     );
 
@@ -183,7 +185,9 @@ function migrate(db, currentVersion) {
       DROP TABLE pending_agent_requests_v1;
     `);
     const additions = {
-      features: { thread_harness: 'TEXT' },
+      // Checkpoints saved before generations existed stay NULL and never prove freshness.
+      features: { thread_harness: 'TEXT', semantic_generation: 'INTEGER NOT NULL DEFAULT 0' },
+      checkpoints: { semantic_generation: 'INTEGER' },
       evidence: {
         source: "TEXT NOT NULL DEFAULT 'reported'", spec_revision: 'INTEGER NOT NULL DEFAULT -1',
         contract_hash: "TEXT NOT NULL DEFAULT ''", check_key: 'TEXT', argv_json: 'TEXT',
@@ -197,19 +201,22 @@ function migrate(db, currentVersion) {
         if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${declaration}`);
       }
     }
-    // Native sessions saved before ownership was recorded keep a backend only when that is
-    // provable: schemas before 3 predate Claude workers, and only Codex emits native requests.
-    // Anything else stays unknown and must be replaced explicitly rather than guessed.
-    db.prepare(`UPDATE features SET thread_harness = 'codex'
-      WHERE thread_id IS NOT NULL AND thread_harness IS NULL AND (? < 3 OR EXISTS (
-        SELECT 1 FROM pending_agent_requests WHERE feature_id = features.id AND thread_id = features.thread_id
-      ))`).run(currentVersion);
-    db.exec(`
-      UPDATE features SET status = 'active' WHERE status IN ('done','review') AND id IN (
-        SELECT feature_id FROM candidates WHERE contract_hash = '' AND status IN ('ready','accepted')
-      );
-      UPDATE candidates SET status = 'superseded' WHERE contract_hash = '' AND status IN ('ready','accepted');
-    `);
+    // These backfills repair schemas before 4; later upgrades only add columns.
+    if (currentVersion < 4) {
+      // Native sessions saved before ownership was recorded keep a backend only when that is
+      // provable: schemas before 3 predate Claude workers, and only Codex emits native requests.
+      // Anything else stays unknown and must be replaced explicitly rather than guessed.
+      db.prepare(`UPDATE features SET thread_harness = 'codex'
+        WHERE thread_id IS NOT NULL AND thread_harness IS NULL AND (? < 3 OR EXISTS (
+          SELECT 1 FROM pending_agent_requests WHERE feature_id = features.id AND thread_id = features.thread_id
+        ))`).run(currentVersion);
+      db.exec(`
+        UPDATE features SET status = 'active' WHERE status IN ('done','review') AND id IN (
+          SELECT feature_id FROM candidates WHERE contract_hash = '' AND status IN ('ready','accepted')
+        );
+        UPDATE candidates SET status = 'superseded' WHERE contract_hash = '' AND status IN ('ready','accepted');
+      `);
+    }
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
@@ -406,6 +413,13 @@ export function recordEvent(db, { featureId = null, workItemId = null, kind, sum
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(featureId, workItemId, kind, summary, JSON.stringify(details ?? {}), stamp);
   return { id: Number(result.lastInsertRowid), created_at: stamp };
+}
+
+// Counts semantic lane changes (spec, work graph, lifecycle, verification definition, candidates).
+// Call it inside the transaction that makes the change, so a checkpoint that recorded the previous
+// generation is provably stale even when timestamps tie or the controller dies before logging.
+export function bumpSemanticGeneration(db, featureId) {
+  db.prepare('UPDATE features SET semantic_generation = semantic_generation + 1 WHERE id = ?').run(featureId);
 }
 
 export function newId(prefix) {

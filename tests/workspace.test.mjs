@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { git, now, sleep } from '../plugins/feature-theater/scripts/util.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { git } from '../plugins/feature-theater/scripts/util.mjs';
 import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
 import {
   checkpointFeature,
@@ -291,44 +292,143 @@ test('checkpoints and switches focus without moving active clones', async t => {
   assert.match(index, /Focused feature: beta/);
 });
 
-// Checkpoint freshness compares millisecond timestamps strictly; step past the latest stamp so a change cannot tie it.
-async function advanceClock() {
-  const start = now();
-  while (now() === start) await sleep(1);
+// A frozen clock gives every change the checkpoint's millisecond, so only the semantic generation can tell them apart.
+const freezeClock = t => t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+
+function switchRequiresCheckpoint(workspace, feature, reason = 'changed') {
+  return assert.rejects(
+    switchFeature({ workspace_path: workspace, feature }),
+    error => error.code === 'CHECKPOINT_REQUIRED' && error.details.reason === reason,
+  );
 }
 
-test('keeps checkpoints fresh across focus round-trips until the lane changes', async t => {
+test('keeps checkpoints fresh across focus round-trips until the lane changes, even when timestamps tie', async t => {
   const { source, workspace } = await fixture(t);
+  freezeClock(t);
+  const alpha = { workspace_path: workspace, feature: 'alpha' };
+  const roundTrip = async () => {
+    assert.equal((await switchFeature({ workspace_path: workspace, feature: 'beta' })).focus, 'beta');
+    assert.equal((await switchFeature(alpha)).focus, 'alpha');
+  };
   await initializeWorkspace({ workspace_path: workspace, repository: source });
-  await createFeature({ workspace_path: workspace, feature: 'alpha', title: 'Alpha', outcome: 'Alpha outcome.' });
+  await createFeature({ ...alpha, title: 'Alpha', outcome: 'Alpha outcome.' });
   await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
-  await switchFeature({ workspace_path: workspace, feature: 'alpha' });
-  await checkpointFeature({ workspace_path: workspace, feature: 'alpha', summary: 'Alpha is scoped.', next_action: 'Implement alpha.' });
+  await switchFeature(alpha);
+  await checkpointFeature({ ...alpha, summary: 'Alpha is scoped.', next_action: 'Implement alpha.' });
   const toBeta = await switchFeature({ workspace_path: workspace, feature: 'beta' });
   assert.equal(toBeta.from.compactionPending, true);
   await checkpointFeature({ workspace_path: workspace, feature: 'beta', summary: 'Beta is scoped.', next_action: 'Implement beta.' });
-  assert.equal((await switchFeature({ workspace_path: workspace, feature: 'alpha' })).focus, 'alpha');
-  const again = await switchFeature({ workspace_path: workspace, feature: 'beta' });
-  assert.equal(again.focus, 'beta');
-  assert.equal(again.from.compactionPending, true);
+  assert.equal((await switchFeature(alpha)).focus, 'alpha');
+  await roundTrip();
 
-  await switchFeature({ workspace_path: workspace, feature: 'alpha' });
-  await advanceClock();
-  await updateSpec({ workspace_path: workspace, feature: 'alpha', content: '# Alpha\n\nRevised after round-trip.\n', rationale: 'Exercise checkpoint freshness.' });
-  await assert.rejects(
-    switchFeature({ workspace_path: workspace, feature: 'beta' }),
-    error => error.code === 'CHECKPOINT_REQUIRED',
-  );
-  await checkpointFeature({ workspace_path: workspace, feature: 'alpha', summary: 'Alpha spec is revised.', next_action: 'Implement revised alpha.' });
+  const spec = { ...alpha, content: '# Alpha\n\nRevised after round-trip.\n', rationale: 'Exercise checkpoint freshness.' };
+  await updateSpec(spec);
+  await switchRequiresCheckpoint(workspace, 'beta');
+  await checkpointFeature({ ...alpha, summary: 'Alpha spec is revised.', next_action: 'Implement revised alpha.' });
+  assert.equal((await updateSpec(spec)).changed, false);
+  await roundTrip();
+
+  const plan = { ...alpha, items: [{ key: 'build', title: 'Build' }] };
+  await planWork(plan);
+  await switchRequiresCheckpoint(workspace, 'beta');
+  // Re-planning overwrites the checkpoint's direction with the graph default; only an identical result is a no-op.
+  const { feature: planned } = await getFeatureContext(alpha);
+  await checkpointFeature({ ...alpha, summary: 'Alpha is planned.', next_action: planned.nextAction });
+  await planWork(plan);
+  await roundTrip();
+  await checkpointFeature({ ...alpha, summary: 'Alpha is planned.', next_action: 'Build alpha.' });
+  await planWork(plan);
+  await switchRequiresCheckpoint(workspace, 'beta');
+  await checkpointFeature({ ...alpha, summary: 'Alpha is planned.', next_action: 'Build alpha.' });
+
+  const claim = { ...alpha, key: 'build', status: 'running', owner: 'worker' };
+  await updateWork(claim);
+  await switchRequiresCheckpoint(workspace, 'beta');
+  await checkpointFeature({ ...alpha, summary: 'Alpha build is claimed.', next_action: 'Await the build.' });
+  // Renewing the lease is bookkeeping, not a lane change.
+  await updateWork(claim);
+  await roundTrip();
+
+  await checkpointFeature({ ...alpha, summary: 'First tied checkpoint.', next_action: 'Continue.' });
+  await checkpointFeature({ ...alpha, summary: 'Second tied checkpoint.', next_action: 'Continue.' });
+  const context = await getFeatureContext({ ...alpha, timeline_limit: 200 });
+  assert.equal(context.checkpoint.summary, 'Second tied checkpoint.');
+  assert.equal(new Set(context.timeline.map(event => event.createdAt)).size, 1);
+  await roundTrip();
+
+  // Repairing inconsistent readiness on a read is still a work-status change.
+  await planWork({ ...alpha, items: [{ key: 'docs', title: 'Docs' }] });
+  await checkpointFeature({ ...alpha, summary: 'Docs are planned.', next_action: 'Continue.' });
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  db.prepare("UPDATE work_items SET status = 'planned' WHERE item_key = 'docs'").run();
+  db.close();
+  assert.equal((await getFeatureContext(alpha)).workItems.find(item => item.item_key === 'docs').status, 'ready');
+  await switchRequiresCheckpoint(workspace, 'beta');
+});
+
+test('verification reopens a checkpointed lane only when it supersedes a candidate', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-freshness-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  freezeClock(t);
+  const alpha = { workspace_path: workspace, feature: 'alpha' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Freshness', description: 'Exercise verification freshness.' });
+  const lane = await createFeature({ ...alpha, title: 'Alpha', outcome: 'Verified behavior.', spec: '# Alpha\n\nThe README exists.' });
+  await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
+  const failMarker = path.join(lane.feature.checkoutPath, '.check-fails');
+  await fs.appendFile(path.join(lane.feature.checkoutPath, '.git', 'info', 'exclude'), '\n.check-fails\n');
+  const checks = [{ key: 'actual', purpose: 'Read the committed README and fixture state', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }];
+  await updateChecks({ ...alpha, checks });
+  await switchFeature(alpha);
+  assert.equal((await runChecks(alpha)).verification.ready, true);
+  await recordCandidate({ ...alpha, summary: 'Ready.', checks: ['README receipt'] });
+  await checkpointFeature({ ...alpha, summary: 'Candidate awaits review.', next_action: 'Review the candidate.' });
+
+  // A passing receipt is live evidence only.
+  assert.equal((await runChecks(alpha)).verification.ready, true);
   assert.equal((await switchFeature({ workspace_path: workspace, feature: 'beta' })).focus, 'beta');
+  await switchFeature(alpha);
 
-  await switchFeature({ workspace_path: workspace, feature: 'alpha' });
-  await advanceClock();
-  await planWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'build', title: 'Build' }] });
-  await assert.rejects(
-    switchFeature({ workspace_path: workspace, feature: 'beta' }),
-    error => error.code === 'CHECKPOINT_REQUIRED',
-  );
+  await fs.writeFile(failMarker, 'fail');
+  assert.equal((await runChecks(alpha)).verification.ready, false);
+  assert.equal((await getFeatureContext(alpha)).feature.status, 'active');
+  await switchRequiresCheckpoint(workspace, 'beta');
+  await checkpointFeature({ ...alpha, summary: 'Candidate was superseded by a failing check.', next_action: 'Repair alpha.' });
+
+  // With nothing left to supersede, a failing receipt alone changes no lane state.
+  assert.equal((await runChecks(alpha)).verification.ready, false);
+  assert.equal((await switchFeature({ workspace_path: workspace, feature: 'beta' })).focus, 'beta');
+  await switchFeature(alpha);
+
+  await updateChecks({ ...alpha, checks: [{ ...checks[0], purpose: 'Read the README with a revised purpose' }] });
+  await switchRequiresCheckpoint(workspace, 'beta');
+});
+
+test('checkpoints saved before semantic generations must be renewed after upgrade', async t => {
+  const { source, workspace } = await fixture(t);
+  freezeClock(t);
+  const alpha = { workspace_path: workspace, feature: 'alpha' };
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  await createFeature({ ...alpha, title: 'Alpha', outcome: 'Alpha outcome.' });
+  await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
+  await switchFeature(alpha);
+  await checkpointFeature({ ...alpha, summary: 'Saved by schema 4.', next_action: 'Continue.' });
+  const file = path.join(workspace, '.theater', 'state.sqlite3');
+  let db = new DatabaseSync(file);
+  const { id } = db.prepare('SELECT id FROM features WHERE slug = ?').get('alpha');
+  db.exec('ALTER TABLE checkpoints DROP COLUMN semantic_generation; ALTER TABLE features DROP COLUMN semantic_generation');
+  // A session of unknown backend with a request would be reclassified by the schema-3 backfill.
+  db.prepare("UPDATE features SET thread_id = 'unknown-thread', thread_harness = NULL WHERE id = ?").run(id);
+  db.prepare("INSERT INTO pending_agent_requests(request_id, feature_id, thread_id, method, summary, payload_json, status, created_at, resolved_at) VALUES ('old', ?, 'unknown-thread', 'item/tool/requestUserInput', 'Old request.', '{}', 'resolved', ?, ?)").run(id, new Date().toISOString(), new Date().toISOString());
+  db.exec("UPDATE meta SET value = '4' WHERE key = 'schema_version'");
+  db.close();
+
+  await switchRequiresCheckpoint(workspace, 'beta', 'legacy_checkpoint');
+  db = new DatabaseSync(file);
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '5');
+  assert.deepEqual({ ...db.prepare('SELECT semantic_generation, thread_harness FROM features WHERE id = ?').get(id) }, { semantic_generation: 0, thread_harness: null });
+  db.close();
+  assert.equal((await checkpointFeature({ ...alpha, summary: 'Renewed after upgrade.', next_action: 'Continue.' })).semanticGeneration, 0);
+  assert.equal((await switchFeature({ workspace_path: workspace, feature: 'beta' })).focus, 'beta');
 });
 
 test('rejects repository URLs containing credentials', async t => {

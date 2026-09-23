@@ -36,6 +36,7 @@ import {
 import {
   CANDIDATE_REVIEW_ACTION,
   assertBoundCheckout,
+  bumpSemanticGeneration,
   featureBySlug,
   initializeDatabase,
   listFeatureRows,
@@ -89,9 +90,26 @@ function latestSpec(db, featureId) {
   return db.prepare('SELECT revision, content, rationale, created_at FROM spec_revisions WHERE feature_id = ? ORDER BY revision DESC LIMIT 1').get(featureId);
 }
 
+// Insertion order, not the timestamp, identifies the latest checkpoint; milliseconds can tie.
 function latestCheckpoint(db, featureId) {
-  const row = db.prepare('SELECT * FROM checkpoints WHERE feature_id = ? ORDER BY created_at DESC LIMIT 1').get(featureId);
+  const row = db.prepare('SELECT * FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(featureId);
   return row ? { ...row, unresolved: parseJson(row.unresolved_json, []) } : undefined;
+}
+
+// A checkpoint is fresh only when it recorded the lane's current semantic generation. Checkpoints
+// saved before generations existed cannot prove that and must be renewed.
+function assertCheckpointFresh(db, feature) {
+  const checkpoint = latestCheckpoint(db, feature.id);
+  const current = Number(db.prepare('SELECT semantic_generation FROM features WHERE id = ?').get(feature.id).semantic_generation);
+  const recorded = checkpoint?.semantic_generation ?? null;
+  if (recorded !== null && Number(recorded) === current) return;
+  throw new TheaterError(`Checkpoint ${feature.slug} after its latest change before switching.`, 'CHECKPOINT_REQUIRED', {
+    feature: feature.slug,
+    reason: !checkpoint ? 'missing' : recorded === null ? 'legacy_checkpoint' : 'changed',
+    checkpointId: checkpoint?.id ?? null,
+    checkpointGeneration: recorded === null ? null : Number(recorded),
+    currentGeneration: current,
+  });
 }
 
 function evidenceRows(db, featureId, limit = 50) {
@@ -502,7 +520,8 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
         `).run(id, slug, cleanTitle, cleanOutcome, priority, base, clone.branch, clone.destination, initialSpec ? 1 : 0, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', created, created);
         if (initialSpec) ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, 1, ?, ?, ?)')
           .run(newId('spec'), id, initialSpec, 'Initial feature specification.', created);
-        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, summary, next_action, unresolved_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        // The creation checkpoint covers the lane's initial generation, including any initial spec.
+        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, summary, next_action, unresolved_json, semantic_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)')
           .run(newId('checkpoint'), id, base, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', '[]', created);
         if (!meta(ctx.db, 'focus')) meta(ctx.db, 'focus', slug);
       });
@@ -572,7 +591,10 @@ export async function listFeatures({ workspace_path, include_archived = false, r
 export async function getFeatureContext({ workspace_path, feature, timeline_limit = 20 }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
-    reconcileReady(ctx.db, row.id);
+    // Repairing inconsistent readiness here is still a work-status change.
+    transaction(ctx.db, () => {
+      if (reconcileReady(ctx.db, row.id)) bumpSemanticGeneration(ctx.db, row.id);
+    });
     const projection = await writeFeatureContext(ctx, row);
     const spec = latestSpec(ctx.db, row.id);
     const timeline = timelineRows(ctx.db, row.id, timeline_limit);
@@ -611,6 +633,7 @@ export async function updateSpec({ workspace_path, feature, content, rationale =
           .run(newId('spec'), row.id, revision, cleanContent, cleanRationale, stamp);
         ctx.db.prepare('UPDATE features SET spec_revision = ?, updated_at = ?, next_action = ? WHERE id = ?')
           .run(revision, stamp, 'Reconcile the work graph with the revised specification.', row.id);
+        bumpSemanticGeneration(ctx.db, row.id);
       });
       const diff = lineDiff(previous, cleanContent);
       await atomicWrite(root, contained(root, '.theater', 'features', slug, 'spec.md'), `${cleanContent}\n`);
@@ -744,6 +767,8 @@ export async function planWork({ workspace_path, feature, items }) {
         const existing = workItems(ctx.db, row.id);
         const byKey = new Map(existing.map(item => [item.item_key, item]));
         const immutable = new Set();
+        // Re-submitting the current plan is not a lane change; anything it alters is.
+        let changed = false;
         for (const item of normalized) {
           const found = byKey.get(item.key);
           if (found) {
@@ -758,6 +783,7 @@ export async function planWork({ workspace_path, feature, items }) {
               immutable.add(item.key);
               continue;
             }
+            changed ||= definitionChanged;
             ctx.db.prepare(`UPDATE work_items SET title = ?, description = ?, kind = ?, status = ?, priority = ?, acceptance = ?, updated_at = ? WHERE id = ?`)
               .run(item.title, item.description, item.kind, found.status, item.priority, item.acceptance, stamp, found.id);
           } else {
@@ -765,6 +791,7 @@ export async function planWork({ workspace_path, feature, items }) {
             ctx.db.prepare(`INSERT INTO work_items(id, feature_id, item_key, title, description, kind, status, priority, acceptance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
               .run(id, row.id, item.key, item.title, item.description, item.kind, 'planned', item.priority, item.acceptance, stamp, stamp);
             byKey.set(item.key, { id, item_key: item.key, status: 'planned' });
+            changed = true;
           }
         }
         for (const item of normalized) {
@@ -778,10 +805,12 @@ export async function planWork({ workspace_path, feature, items }) {
           }
         }
         validateWorkGraph(ctx.db, row.id);
-        reconcileReady(ctx.db, row.id);
-        if (previousContract !== featureContract(ctx.db, row)) invalidateCandidates(ctx.db, row.id);
+        if (reconcileReady(ctx.db, row.id)) changed = true;
+        if (previousContract !== featureContract(ctx.db, row) && invalidateCandidates(ctx.db, row.id)) changed = true;
         nextAction = workGraphAction(workItems(ctx.db, row.id));
+        if (ctx.db.prepare('SELECT next_action FROM features WHERE id = ?').get(row.id).next_action !== nextAction) changed = true;
         ctx.db.prepare('UPDATE features SET next_action = ?, updated_at = ? WHERE id = ?').run(nextAction, stamp, row.id);
+        if (changed) bumpSemanticGeneration(ctx.db, row.id);
       });
       await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key), nextAction } });
       const current = featureBySlug(ctx.db, slug);
@@ -841,9 +870,14 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       transaction(ctx.db, () => {
         ctx.db.prepare(`UPDATE work_items SET status = ?, owner = ?, result_summary = ?, blocker = ?, result_revision = CASE WHEN ? THEN NULL ELSE COALESCE(?, result_revision) END, lease_expires_at = ?, updated_at = ? WHERE id = ?`)
           .run(status, status === 'running' ? cleanOwner : item.owner, cleanSummary, cleanBlocker, clearResultRevision ? 1 : 0, revision ?? null, lease, stamp, item.id);
-        reconcileReady(ctx.db, row.id);
+        // A lease renewal alone is bookkeeping; every other field here is lane state.
+        const saved = ctx.db.prepare('SELECT status, owner, result_summary, blocker, result_revision FROM work_items WHERE id = ?').get(item.id);
+        let changed = Object.keys(saved).some(field => saved[field] !== item[field]);
+        if (reconcileReady(ctx.db, row.id)) changed = true;
         nextAction = refreshWorkAction(ctx.db, row.id, featureWork);
+        if (nextAction) changed = true;
         ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(stamp, row.id);
+        if (changed) bumpSemanticGeneration(ctx.db, row.id);
       });
       await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${cleanSummary ? `: ${cleanSummary}` : cleanBlocker ? `: ${cleanBlocker}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease, ...(nextAction ? { nextAction } : {}) } });
       const current = featureBySlug(ctx.db, slug);
@@ -870,19 +904,26 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
+      // Verification holds only the lane's control lock, so it can change the lane during the Git
+      // snapshot. The checkpoint covers the generation seen before it and refuses to bless a later one.
+      const semanticGeneration = Number(row.semantic_generation);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       const stamp = now();
       const id = newId('checkpoint');
       transaction(ctx.db, () => {
-        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, dirty_summary, summary, next_action, unresolved_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, row.id, snapshot.head, snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`, cleanSummary, next, JSON.stringify(openQuestions), stamp);
+        const current = Number(ctx.db.prepare('SELECT semantic_generation FROM features WHERE id = ?').get(row.id).semantic_generation);
+        if (current !== semanticGeneration) {
+          throw new TheaterError(`${slug} changed while it was being checkpointed; review its current state and checkpoint again.`, 'CHECKPOINT_CONFLICT', { feature: slug, observedGeneration: semanticGeneration, currentGeneration: current });
+        }
+        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, dirty_summary, summary, next_action, unresolved_json, semantic_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(id, row.id, snapshot.head, snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`, cleanSummary, next, JSON.stringify(openQuestions), semanticGeneration, stamp);
         ctx.db.prepare('UPDATE features SET summary = ?, next_action = ?, compaction_pending = 1, updated_at = ? WHERE id = ?').run(cleanSummary, next, stamp, row.id);
       });
       await addEvent(ctx, { featureId: row.id, kind: 'feature.checkpointed', summary: cleanSummary, details: { head: snapshot.head, clean: snapshot.clean, nextAction: next, unresolved: openQuestions } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
-      return { checkpointId: id, feature: summarizeFeature(ctx, current), git: snapshot, compaction: { featureSession: Boolean(row.thread_id), metaSession: 'recommended_at_switch' } };
+      return { checkpointId: id, semanticGeneration, feature: summarizeFeature(ctx, current), git: snapshot, compaction: { featureSession: Boolean(row.thread_id), metaSession: 'recommended_at_switch' } };
     } finally { ctx.db.close(); }
   });
 }
@@ -900,15 +941,14 @@ export async function switchFeature({ workspace_path, feature }) {
         const packet = await writeFeatureContext(ctx, destination);
         return { changed: false, focus: slug, feature: summarizeFeature(ctx, destination), git: packet.snapshot, coordinatorCompactionRecommended: false };
       }
-      let outgoing = null;
-      if (outgoingSlug) {
-        outgoing = featureBySlug(ctx.db, outgoingSlug);
-        const checkpoint = latestCheckpoint(ctx.db, outgoing.id);
-        if (!checkpoint || checkpoint.created_at < outgoing.updated_at) throw new TheaterError(`Checkpoint ${outgoing.slug} after its latest change before switching.`, 'CHECKPOINT_REQUIRED');
-      }
+      const outgoing = outgoingSlug ? featureBySlug(ctx.db, outgoingSlug) : null;
       transaction(ctx.db, () => {
-        // Compaction scheduling is housekeeping, not a lane change; leave updated_at so the outgoing checkpoint stays fresh.
-        if (outgoing) ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(outgoing.id);
+        if (outgoing) {
+          // Checked inside the transaction: verification writes hold only the lane's control lock.
+          assertCheckpointFresh(ctx.db, outgoing);
+          // Compaction scheduling is housekeeping, not a lane change, so it leaves the generation alone.
+          ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(outgoing.id);
+        }
         meta(ctx.db, 'focus', slug);
       });
       await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoing?.slug ?? null, to: slug } });
@@ -981,10 +1021,13 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
     }
     const stamp = now();
     transaction(ctx.db, () => {
+      const previous = ctx.db.prepare('SELECT status, blocker, summary FROM features WHERE id = ?').get(row.id);
       const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
         .run(status, cleanBlocker, cleanDisposition, cleanDisposition, stamp, row.id);
       if (!changed.changes) throw new TheaterError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
       if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
+      const saved = ctx.db.prepare('SELECT status, blocker, summary FROM features WHERE id = ?').get(row.id);
+      if (completionCandidate || Object.keys(saved).some(field => saved[field] !== previous[field])) bumpSemanticGeneration(ctx.db, row.id);
     });
     await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: {} });
     const current = featureBySlug(ctx.db, slug);
@@ -1049,6 +1092,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
         ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
         ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, next_action = ?, updated_at = ? WHERE id = ?")
           .run(cleanSummary, CANDIDATE_REVIEW_ACTION, stamp, row.id);
+        bumpSemanticGeneration(ctx.db, row.id);
       });
       await addEvent(ctx, { featureId: row.id, kind: 'candidate.recorded', summary: `Recorded candidate ${resolved.slice(0, 12)} with ${cleanChecks.length} check(s).`, details: { candidateId: id, checks: cleanChecks, clean: snapshot.clean } });
       const current = featureBySlug(ctx.db, slug);
@@ -1130,6 +1174,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
         if (!alreadyIncluded) {
           ctx.db.prepare('UPDATE features SET summary = ?, next_action = ?, updated_at = ? WHERE id = ?')
             .run(cleanSummary || candidate.summary, 'Create the next feature lane from the promoted managed-project revision.', stamp, row.id);
+          bumpSemanticGeneration(ctx.db, row.id);
         }
       });
       await writeJson(root, contained(root, 'theater.json'), ctx.config);
