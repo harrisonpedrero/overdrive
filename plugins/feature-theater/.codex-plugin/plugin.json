@@ -1,19 +1,19 @@
 {
   "name": "feature-theater",
   "version": "0.1.0+codex.20260915160611",
-  "description": "Native Astra feature lanes with isolated clones, durable specs, live steering, executed verification, and an inline work graph.",
+  "description": "OVERDRIVE runs each feature in an isolated repository clone and orchestrates the lane workers, with durable specs, live steering, executed verification, and an inline work graph.",
   "author": {
     "name": "Harrison Pedrero"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Feature Theater",
-    "shortDescription": "Coordinate feature clones and see their work graph in Codex.",
-    "longDescription": "Adopt a repository or begin a managed project from scratch, then develop it through isolated feature lanes. GPT-6 Astra refines specs, coordinates work, steers live agents, and checkpoints context. A native work graph shows dependencies, progress, and blockers; all interaction stays in the existing conversation. Required checks execute against exact commits and the current feature contract. Feature Theater combines Diffmogger's durable work graph and evidence boundaries with Agent Diff Theater's live steering, entirely inside the Codex harness.",
+    "displayName": "OVERDRIVE",
+    "shortDescription": "Isolated feature clones, orchestrated from Codex.",
+    "longDescription": "OVERDRIVE develops a repository through isolated feature clones orchestrated from one conversation. Adopt a repository or begin a managed project from scratch; every feature lane gets its own full clone, durable spec, and context packet. GPT-6 Astra refines specs, dispatches and steers lane workers, and checkpoints context. A native work graph shows dependencies, progress, and blockers; all interaction stays in the existing conversation. Required checks execute against exact commits and the current feature contract before a lane is accepted.",
     "developerName": "Harrison Pedrero",
     "category": "Productivity",
     "capabilities": [
-      "Feature isolation",
+      "Isolated feature clones",
       "Spec iteration",
       "Agent orchestration",
       "Progress and steering",
@@ -21,7 +21,7 @@
       "Executed verification"
     ],
     "defaultPrompt": [
-      "Set up Feature Theater for this repository.",
+      "Set up OVERDRIVE for this repository.",
       "Start a managed project from a product brief.",
       "Create a feature lane and refine its spec.",
       "Show this feature's work graph and what is blocked."

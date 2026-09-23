@@ -1,11 +1,11 @@
 {
   "name": "feature-theater",
   "version": "0.1.0",
-  "description": "Coordinate isolated feature clones, durable specs, live worker steering and executed verification from Claude Code.",
+  "description": "OVERDRIVE: run each feature in an isolated repository clone and orchestrate its worker from Claude Code, with durable specs, live steering and executed verification.",
   "author": {
     "name": "Harrison Pedrero"
   },
-  "keywords": ["orchestration", "feature-lanes", "verification"],
+  "keywords": ["overdrive", "orchestration", "feature-clones", "feature-lanes", "verification"],
   "mcpServers": {
     "feature_theater": {
       "command": "node",

@@ -210,7 +210,7 @@ export function openDatabase(root) {
   const current = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
   if (current && Number(current.value) > SCHEMA_VERSION) {
     db.close();
-    throw new TheaterError('This workspace was created by a newer Feature Theater version.', 'NEWER_SCHEMA');
+    throw new TheaterError('This workspace was created by a newer OVERDRIVE version.', 'NEWER_SCHEMA');
   }
   migrate(db, current ? Number(current.value) : 2);
   db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -247,7 +247,7 @@ export async function loadWorkspace(root) {
   const configFile = await ensureManagedPath(root, contained(root, 'theater.json'));
   let config;
   try { config = await readJson(configFile); } catch (error) {
-    if (error?.code === 'ENOENT') throw new TheaterError('Feature Theater is not initialized in this workspace.', 'NOT_INITIALIZED');
+    if (error?.code === 'ENOENT') throw new TheaterError('OVERDRIVE is not initialized in this workspace.', 'NOT_INITIALIZED');
     throw error;
   }
   if (config?.formatVersion !== 1 || typeof config.workspaceId !== 'string' || typeof config.repository !== 'string') {
@@ -255,7 +255,7 @@ export async function loadWorkspace(root) {
   }
   const databaseFile = await ensureManagedPath(root, contained(root, '.theater', 'state.sqlite3'));
   try { await fs.access(databaseFile); } catch {
-    throw new TheaterError('Feature Theater state database is missing.', 'INVALID_STATE');
+    throw new TheaterError('OVERDRIVE state database is missing.', 'INVALID_STATE');
   }
   const db = openDatabase(root);
   if (meta(db, 'workspace_id') !== config.workspaceId) {

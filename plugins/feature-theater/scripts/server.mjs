@@ -31,8 +31,8 @@ async function handle(message) {
     return result(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'feature-theater', title: 'Feature Theater', version: '0.1.0' },
-      instructions: 'Use Feature Theater to isolate feature clones and context. Persist only safe summaries and evidence; never expose private reasoning.',
+      serverInfo: { name: 'overdrive', title: 'OVERDRIVE', version: '0.1.0' },
+      instructions: 'Use OVERDRIVE to run features in isolated clones and orchestrate their lane workers. Persist only safe summaries and evidence; never expose private reasoning.',
     });
   }
   if (method === 'notifications/initialized' || method === 'notifications/cancelled') return;

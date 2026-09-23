@@ -30,7 +30,7 @@ let shuttingDown = false;
 function enqueueStateWork(work) {
   const next = notificationQueue.then(work);
   notificationQueue = next.catch(error => {
-    process.stderr.write(`[feature-theater] event handling failed: ${redactString(error.message)}\n`);
+    process.stderr.write(`[overdrive] event handling failed: ${redactString(error.message)}\n`);
   });
   return next;
 }
@@ -104,7 +104,7 @@ function requestSummary(method, params) {
 async function onServerRequest(message) {
   const registration = registrations.get(message.params?.threadId);
   if (!registration) {
-    try { bridge.respondToServer(message.id, undefined, 'Feature Theater cannot route this request to a registered feature.'); } catch { /* process may be exiting */ }
+    try { bridge.respondToServer(message.id, undefined, 'OVERDRIVE cannot route this request to a registered feature.'); } catch { /* process may be exiting */ }
     return;
   }
   const payload = safePayload(message.params);
@@ -198,7 +198,7 @@ async function onNotification({ method, params }) {
     compactionTurns.delete(turnId);
     const runtime = await featureRuntime({ ...base, allow_inactive: true });
     if (!shuttingDown && runtime.feature.compaction_pending && status === 'idle') {
-      setTimeout(() => { if (!shuttingDown) void compactFeatureAgent(base).catch(error => process.stderr.write(`[feature-theater] deferred compaction: ${redactString(error.message)}\n`)); }, 0);
+      setTimeout(() => { if (!shuttingDown) void compactFeatureAgent(base).catch(error => process.stderr.write(`[overdrive] deferred compaction: ${redactString(error.message)}\n`)); }, 0);
     }
   }
 }
@@ -320,7 +320,7 @@ async function startOwned({ workspace_path, feature, instruction, effort = 'high
     threadId = started.thread.id;
     created = true;
     register(threadId, runtime.root, runtime.feature.slug);
-    await bridge.request('thread/name/set', { harness: runtime.harness, threadId, name: `Theater · ${runtime.feature.title}` }).catch(() => {});
+    await bridge.request('thread/name/set', { harness: runtime.harness, threadId, name: `OVERDRIVE · ${runtime.feature.title}` }).catch(() => {});
   }
   const turn = await dispatchTurn(runtime, threadId, instruction, effort, created);
   return {

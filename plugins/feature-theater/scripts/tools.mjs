@@ -49,7 +49,7 @@ function tool(name, title, description, inputSchema, annotations = {}) {
   };
 }
 
-const workspace = { workspace_path: string('Absolute path to the Feature Theater control workspace.') };
+const workspace = { workspace_path: string('Absolute path to the OVERDRIVE control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
 const state = {
   ...workspace, ...feature,
@@ -113,13 +113,13 @@ export const TOOLS = [
 
   tool('theater_agent_wait', 'Wait for a feature result', 'Wait up to 60 seconds for a feature completion or input request and return compact progress. Use after dispatch when the coordinator is continuing the work; no repeated model polling is needed.', object({ ...workspace, ...feature, timeout_seconds: integer('Bounded wait; defaults to 30 seconds.', 1, 60) }, ['workspace_path', 'feature']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('theater_initialize', 'Initialize Feature Theater', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
+  tool('theater_initialize', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
     harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'repository']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize Feature Theater against it.', object({
+  tool('theater_project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize OVERDRIVE against it.', object({
     ...workspace,
     project_name: string('Human-readable project name.'),
     description: string('Concrete product brief for the new project.'),
@@ -127,7 +127,7 @@ export const TOOLS = [
     harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'project_name', 'description']), { destructiveHint: false, idempotentHint: true }),
 
-  tool('theater_doctor', 'Check Feature Theater', 'Check the local Git, Node, Codex, state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('theater_doctor', 'Check OVERDRIVE', 'Check the local Git, Node, Codex, state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
   tool('theater_feature_create', 'Create feature lane', 'Create an independent full repository clone at an exact commit and initialize its isolated spec/context packet.', object({
     ...workspace,
@@ -230,7 +230,7 @@ export const TOOLS = [
     allow_dirty: boolean('Deprecated: true is refused because evidence must describe a clean commit.'),
   }, ['workspace_path', 'feature', 'summary', 'checks']), { destructiveHint: false }),
 
-  tool('theater_candidate_promote', 'Promote managed-project candidate', 'Fast-forward a Feature Theater-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
+  tool('theater_candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
     ...workspace,
     ...feature,
     revision: string('Accepted candidate revision; defaults to the latest accepted candidate.'),
@@ -248,7 +248,7 @@ export const TOOLS = [
   tool('theater_agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
     ...workspace,
     ...feature,
-    include_thread: boolean('Read the persisted native worker task as well as local Theater state.'),
+    include_thread: boolean('Read the persisted native worker task as well as local OVERDRIVE state.'),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
 
   tool('theater_agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. This does not claim work items. Before dispatching or resuming an existing bounded item, claim its exact key as running under a stable owner with theater_work_update, then include its key and outcome in instruction; do not claim unrelated ready items.', object({

@@ -67,7 +67,8 @@ test('MCP server advertises the native Feature Theater command surface', async t
     server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
   });
   const initialized = await request(1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
-  assert.equal(initialized.result.serverInfo.name, 'feature-theater');
+  assert.equal(initialized.result.serverInfo.name, 'overdrive');
+  assert.equal(initialized.result.serverInfo.title, 'OVERDRIVE');
   const listed = await request(2, 'tools/list');
   const names = listed.result.tools.map(tool => tool.name);
   for (const expected of ['theater_initialize', 'theater_project_create', 'theater_feature_create', 'theater_spec_update', 'theater_feature_switch', 'theater_agent_start', 'theater_agent_steer', 'theater_candidate_promote', 'theater_checks_update', 'theater_checks_run', 'theater_state', 'theater_view', 'theater_agent_wait']) assert.ok(names.includes(expected));

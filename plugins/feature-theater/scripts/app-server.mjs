@@ -118,7 +118,7 @@ export class CodexAppServer extends EventEmitter {
       child.once('error', reject);
     });
     await this.request('initialize', {
-      clientInfo: { name: 'feature-theater', title: 'Feature Theater', version: '0.1.0' },
+      clientInfo: { name: 'overdrive', title: 'OVERDRIVE', version: '0.1.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
     }, 30_000, true);
     this.notify('initialized', {});

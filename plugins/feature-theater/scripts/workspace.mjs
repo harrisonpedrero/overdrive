@@ -131,20 +131,20 @@ async function ensureWorkspaceFiles(root, config) {
   const missing = required.filter(line => !ignore.split(/\r?\n/).includes(line));
   if (missing.length) {
     const prefix = ignore && !ignore.endsWith('\n') ? '\n' : '';
-    await atomicWrite(root, ignoreFile, `${ignore}${prefix}\n# Feature Theater local state\n${missing.join('\n')}\n`);
+    await atomicWrite(root, ignoreFile, `${ignore}${prefix}\n# OVERDRIVE local state\n${missing.join('\n')}\n`);
   }
   const agentsFile = contained(root, 'AGENTS.md');
   if (!await exists(agentsFile)) {
-    await atomicWrite(root, agentsFile, `# Feature Theater coordinator\n\nUse the feature-theater skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nOn a feature switch, checkpoint the outgoing lane, call the switch tool, honor its compaction directive, then load only the destination context packet. Recover from .theater/index.md, the focused context, live Git state, and the saved agent session. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
+    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the feature-theater skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nOn a feature switch, checkpoint the outgoing lane, call the switch tool, honor its compaction directive, then load only the destination context packet. Recover from .theater/index.md, the focused context, live Git state, and the saved agent session. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
   }
 }
 
 function featureAgentInstructions(root, feature) {
   const contextFile = contained(root, '.theater', 'features', feature.slug, 'context.md');
   const specFile = contained(root, '.theater', 'features', feature.slug, 'spec.md');
-  return `# Feature Theater lane: ${feature.slug}
+  return `# OVERDRIVE lane: ${feature.slug}
 
-You are the implementation director for exactly one feature lane. Work only inside repo/; Feature Theater context lives outside the application checkout. You are a lane worker, not the Theater coordinator: do not invoke Feature Theater tools, alter other lanes, or recursively inspect or steer this task. Apps, hooks, plugins, browser/computer control, and external MCP servers are deliberately unavailable; route cross-lane and external-system needs through your visible handoff.
+You are the implementation director for exactly one feature lane. Work only inside repo/; OVERDRIVE context lives outside the application checkout. You are a lane worker, not the OVERDRIVE coordinator: do not invoke OVERDRIVE (theater_*) tools, alter other lanes, or recursively inspect or steer this task. Apps, hooks, plugins, browser/computer control, and external MCP servers are deliberately unavailable; route cross-lane and external-system needs through your visible handoff.
 
 Before each turn, read:
 
@@ -152,7 +152,7 @@ Before each turn, read:
 2. ${specFile}
 3. the repository's applicable AGENTS.md, CLAUDE.md and other local instructions under repo/
 
-Use the durable work graph in the context packet to choose the next useful work. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit Feature Theater state files directly. Do not put coordination artifacts into application commits.
+Use the durable work graph in the context packet to choose the next useful work. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit OVERDRIVE state files directly. Do not put coordination artifacts into application commits.
 
 The coordinator owns work-item claims, lease renewals and status changes; follow the assigned work key when provided. If that assigned item still appears ready or unowned, report the bookkeeping mismatch once and continue the authorized implementation without trying to claim it yourself. Surface a conflicting assignment or unmet prerequisite before proceeding with the affected work; your final report does not itself mark work done or create execution receipts.
 
@@ -203,7 +203,7 @@ export async function writeIndex(ctx) {
   const managedLine = ctx.config.managedProject
     ? `Managed project: ${ctx.config.managedProject.name} · ${ctx.config.defaultBranch} @ ${ctx.config.defaultRevision.slice(0, 12)}\n`
     : '';
-  const body = `# Feature Theater index
+  const body = `# OVERDRIVE index
 
 Focused feature: ${focus || 'none'}
 ${managedLine}Updated: ${now()}
@@ -271,7 +271,7 @@ async function initializeSource(root, normalized, additions = {}) {
   try {
     await addEvent(ctx, {
       kind: additions.managedProject ? 'workspace.project_created' : 'workspace.initialized',
-      summary: `${additions.managedProject ? 'Created managed project' : 'Initialized Feature Theater'} at ${mirror.defaultRevision.slice(0, 12)}.`,
+      summary: `${additions.managedProject ? 'Created managed project' : 'Initialized OVERDRIVE'} at ${mirror.defaultRevision.slice(0, 12)}.`,
       details: { defaultBranch: mirror.defaultBranch, ecosystems: profile.ecosystems },
     });
     await writeJson(root, existingConfig, config);
@@ -372,15 +372,15 @@ export async function initializeManagedProject({ workspace_path, project_name, d
     if (await exists(project)) throw new TheaterError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
     await fs.mkdir(project);
     await atomicWrite(root, contained(project, 'README.md'), `# ${name}\n\n${brief}\n`);
-    await atomicWrite(root, contained(project, 'AGENTS.md'), `# Project instructions\n\nThis is the canonical source repository for ${name}. Implement only the currently selected Feature Theater specification, preserve unrelated work, and report exact checks and revisions. Do not add orchestration state to application commits.\n`);
+    await atomicWrite(root, contained(project, 'AGENTS.md'), `# Project instructions\n\nThis is the canonical source repository for ${name}. Implement only the currently selected OVERDRIVE specification, preserve unrelated work, and report exact checks and revisions. Do not add orchestration state to application commits.\n`);
     await run(['git', 'init', '-b', branch], { cwd: project });
     await run(['git', 'add', '--', 'README.md', 'AGENTS.md'], { cwd: project });
     await run([
       'git',
       '-c', `core.hooksPath=${contained(root, '.theater', 'disabled-hooks')}`,
       '-c', 'commit.gpgSign=false',
-      '-c', 'user.name=Feature Theater',
-      '-c', 'user.email=feature-theater@local.invalid',
+      '-c', 'user.name=OVERDRIVE',
+      '-c', 'user.email=overdrive@local.invalid',
       'commit', '-m', `Initialize ${name}`,
     ], { cwd: project });
     const normalized = await normalizeRepositorySource(project);
@@ -988,7 +988,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
     try {
       const managed = ctx.config.managedProject;
       if (!managed) {
-        throw new TheaterError('Candidate promotion is built in only for projects created by Feature Theater. Use the repository\'s normal review and integration flow for an adopted repository.', 'NOT_MANAGED_PROJECT');
+        throw new TheaterError('Candidate promotion is built in only for projects created by OVERDRIVE. Use the repository\'s normal review and integration flow for an adopted repository.', 'NOT_MANAGED_PROJECT');
       }
       const project = await ensureManagedPath(root, contained(root, 'project'));
       if (path.resolve(managed.path) !== project) throw new TheaterError('Managed project path does not match this workspace.', 'INVALID_STATE');
@@ -1019,7 +1019,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
       if (!alreadyIncluded) {
         const canFastForward = await isGitAncestor(project, projectSnapshot.head, candidate.revision);
         if (!canFastForward) {
-          throw new TheaterError('The managed project and candidate have diverged. Rebase or repair the feature lane; Feature Theater will not synthesize or resolve a merge silently.', 'PROMOTION_NOT_FAST_FORWARD');
+          throw new TheaterError('The managed project and candidate have diverged. Rebase or repair the feature lane; OVERDRIVE will not synthesize or resolve a merge silently.', 'PROMOTION_NOT_FAST_FORWARD');
         }
         await run(['git', '-c', `core.hooksPath=${contained(root, '.theater', 'disabled-hooks')}`, 'merge', '--ff-only', candidateRef], { cwd: project });
       }
