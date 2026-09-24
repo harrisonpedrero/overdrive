@@ -83,6 +83,51 @@ test('initializes a repository and creates independent feature lanes', async t =
   assert.equal(listed.features[0].git.clean, true);
 });
 
+test('an exact sibling revision seeds a lane while canonical source is unavailable', async t => {
+  const { parent, source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  const canonicalBase = (await git(source, 'rev-parse', 'HEAD')).stdout;
+  await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Supplies a sibling base.' });
+  const lane = path.join(workspace, 'features', 'lane', 'repo');
+  await git(lane, 'config', 'user.name', 'Feature Theater Test');
+  await git(lane, 'config', 'user.email', 'feature-theater@example.invalid');
+  await fs.writeFile(path.join(lane, 'app.js'), 'export const value = 2;\n');
+  await git(lane, 'commit', '-am', 'selected');
+  const selected = (await git(lane, 'rev-parse', 'HEAD')).stdout;
+  // The sibling advances and gets dirty after the revision was selected.
+  await fs.writeFile(path.join(lane, 'app.js'), 'export const value = 3;\n');
+  await git(lane, 'commit', '-am', 'later');
+  await fs.writeFile(path.join(lane, 'app.js'), 'export const value = 4;\n');
+  await fs.writeFile(path.join(lane, 'dirty.txt'), 'uncommitted\n');
+
+  const offline = path.join(parent, 'source-offline');
+  await fs.rename(source, offline);
+  await assert.rejects(createFeature({ workspace_path: workspace, feature: 'plain', outcome: 'Needs canonical source.' }));
+  await assert.rejects(createFeature({ workspace_path: workspace, feature: 'canonical', outcome: 'Explicit canonical base.', base_revision: canonicalBase }));
+  for (const slug of ['plain', 'canonical']) assert.equal(await fs.stat(path.join(workspace, 'features', slug)).catch(() => null), null);
+
+  const derived = await createFeature({ workspace_path: workspace, feature: 'derived', outcome: 'Builds on the sibling offline.', base_feature: 'lane', base_revision: selected });
+  assert.equal(derived.feature.baseRevision, selected);
+  assert.equal(derived.canonicalSource.status, 'cached');
+  assert.equal(derived.canonicalSource.defaultRevision, canonicalBase);
+  const derivedRepo = path.join(workspace, 'features', 'derived', 'repo');
+  assert.equal((await git(derivedRepo, 'rev-parse', 'HEAD')).stdout, selected);
+  assert.equal((await fs.readFile(path.join(derivedRepo, 'app.js'), 'utf8')).replaceAll('\r\n', '\n'), 'export const value = 2;\n');
+  assert.equal(await fs.stat(path.join(derivedRepo, 'dirty.txt')).catch(() => null), null);
+  assert.equal((await git(derivedRepo, 'status', '--porcelain')).stdout, '');
+  assert.equal(await fs.stat(path.join(derivedRepo, '.git', 'objects', 'info', 'alternates')).catch(() => null), null);
+  assert.equal((await git(derivedRepo, 'remote', 'get-url', 'origin')).stdout, source);
+
+  await fs.rename(offline, source);
+  await fs.writeFile(path.join(source, 'app.js'), 'export const value = 9;\n');
+  await git(source, 'commit', '-am', 'canonical advance');
+  const latest = (await git(source, 'rev-parse', 'HEAD')).stdout;
+  const recovered = await createFeature({ workspace_path: workspace, feature: 'plain', outcome: 'Needs canonical source.' });
+  assert.equal(recovered.canonicalSource.status, 'refreshed');
+  assert.equal(recovered.feature.baseRevision, latest);
+  assert.equal((await git(path.join(workspace, 'features', 'plain', 'repo'), 'rev-parse', 'HEAD')).stdout, latest);
+});
+
 test('an invalid spec is rejected before any feature clone and a corrected retry succeeds', async t => {
   const { source, workspace } = await fixture(t);
   await initializeWorkspace({ workspace_path: workspace, repository: source });

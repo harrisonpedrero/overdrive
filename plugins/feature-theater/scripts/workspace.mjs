@@ -722,11 +722,16 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       if (selectedBase && selectedBase.toLowerCase() !== base_revision.toLowerCase()) {
         throw new TheaterError('base_revision must identify the exact source commit, not a hexadecimal ref name.', 'INVALID_REVISION');
       }
-      const refreshed = await refreshMirror(root);
+      // An exact sibling commit needs the cache only as a clone seed, so canonical source may be unavailable;
+      // its default HEAD and profile hints are then reported as cached rather than refreshed.
+      const canonicalSource = selectedBase ? 'cached' : 'refreshed';
+      const refreshed = selectedBase ? await inspectMirror(root) : await refreshMirror(root);
       const profile = await profileRepository(root, refreshed.defaultRevision);
-      ctx.config.defaultRevision = refreshed.defaultRevision;
-      ctx.config.defaultBranch = refreshed.defaultBranch;
-      ctx.config.repositoryProfile = profile;
+      if (!selectedBase) {
+        ctx.config.defaultRevision = refreshed.defaultRevision;
+        ctx.config.defaultBranch = refreshed.defaultBranch;
+        ctx.config.repositoryProfile = profile;
+      }
       const base = selectedBase || await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
       const clone = await createFeatureCheckout(root, ctx.config, slug, base, baseRepository);
       let fingerprint;
@@ -736,8 +741,10 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const id = newId('feature');
       const creationCheckpoint = newId('checkpoint');
       transaction(ctx.db, () => {
-        meta(ctx.db, 'default_revision', refreshed.defaultRevision);
-        meta(ctx.db, 'default_branch', refreshed.defaultBranch);
+        if (!selectedBase) {
+          meta(ctx.db, 'default_revision', refreshed.defaultRevision);
+          meta(ctx.db, 'default_branch', refreshed.defaultBranch);
+        }
         ctx.db.prepare(`
           INSERT INTO features(id, slug, title, outcome, status, priority, base_revision, branch, checkout_path, spec_revision, summary, next_action, created_at, updated_at)
           VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -763,6 +770,7 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
         feature: summarizeFeature(ctx, row),
         baseFeature: baseSlug,
         repositoryProfile: profile,
+        canonicalSource: { status: canonicalSource, defaultRevision: refreshed.defaultRevision, defaultBranch: refreshed.defaultBranch },
         contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
         specPath: contained(root, '.theater', 'features', slug, 'spec.md'),
         next: initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call theater_spec_update.',
