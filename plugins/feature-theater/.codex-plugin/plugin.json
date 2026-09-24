@@ -1,6 +1,6 @@
 {
   "name": "feature-theater",
-  "version": "0.1.0+codex.20260923235828",
+  "version": "0.1.0+codex.20260924002010",
   "description": "OVERDRIVE runs each feature in an isolated repository clone and orchestrates the lane workers, with durable specs, live steering, executed verification, and an inline work graph.",
   "author": {
     "name": "Harrison Pedrero"
