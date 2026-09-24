@@ -362,6 +362,77 @@ test('checkpoints and switches focus without moving active clones', async t => {
   assert.match(index, /Focused feature: beta/);
 });
 
+test('archiving the focused lane clears focus so active lanes switch without checkpointing it', async t => {
+  const { source, workspace } = await fixture(t);
+  const lane = feature => ({ workspace_path: workspace, feature });
+  const focusOf = async () => (await listFeatures({ workspace_path: workspace, include_archived: true })).features.filter(item => item.focused).map(item => item.slug);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  for (const slug of ['alpha', 'beta', 'gamma']) await createFeature({ ...lane(slug), title: slug, outcome: `${slug} outcome.` });
+  await switchFeature(lane('alpha'));
+  await updateSpec({ ...lane('alpha'), content: '# Alpha\n\nRevised before archiving.\n', rationale: 'Leave alpha unchecked.' });
+
+  // Archiving another lane leaves focus and the focused lane's checkpoint rule in place.
+  const other = await setFeatureStatus({ ...lane('gamma'), status: 'archived', disposition: 'Dropped.' });
+  assert.equal(other.focusCleared, undefined);
+  assert.deepEqual(await focusOf(), ['alpha']);
+  await switchRequiresCheckpoint(workspace, 'beta');
+
+  const archived = await setFeatureStatus({ ...lane('alpha'), status: 'archived', disposition: 'Shelved.' });
+  assert.equal(archived.focusCleared, true);
+  assert.equal(archived.feature.status, 'archived');
+  const listed = await listFeatures({ workspace_path: workspace });
+  assert.deepEqual(listed.features.map(item => [item.slug, item.focused]), [['beta', false]]);
+  assert.deepEqual(await focusOf(), []);
+  assert.match(await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8'), /Focused feature: none/);
+  const history = await getFeatureContext({ ...lane('alpha'), timeline_limit: 50 });
+  assert.equal(history.feature.status, 'archived');
+  assert.equal(history.feature.summary, 'Shelved.');
+  assert.deepEqual(history.timeline.find(event => event.kind === 'feature.archived').details, { focusCleared: true });
+  assert.ok(history.timeline.some(event => event.kind === 'spec.revised'));
+  await assert.rejects(switchFeature(lane('alpha')), error => error.code === 'INVALID_TRANSITION');
+
+  const toBeta = await switchFeature(lane('beta'));
+  assert.equal(toBeta.focus, 'beta');
+  assert.equal(toBeta.from, null);
+  assert.equal(toBeta.coordinatorCompactionRecommended, false);
+  // Re-archiving an archived lane is a no-op that leaves the live focus alone.
+  assert.equal((await setFeatureStatus({ ...lane('alpha'), status: 'archived', disposition: 'Shelved.' })).unchanged, true);
+  assert.deepEqual(await focusOf(), ['beta']);
+
+  // Once focused again, ordinary active-lane switches still require a fresh checkpoint.
+  await createFeature({ ...lane('delta'), title: 'delta', outcome: 'delta outcome.' });
+  await updateSpec({ ...lane('beta'), content: '# Beta\n\nRevised while focused.\n', rationale: 'Leave beta unchecked.' });
+  await switchRequiresCheckpoint(workspace, 'delta');
+  await checkpointFeature({ ...lane('beta'), summary: 'Beta is scoped.', next_action: 'Implement beta.' });
+  assert.equal((await switchFeature(lane('delta'))).from.slug, 'beta');
+});
+
+test('an unfocused workspace gives its focus to the next created lane', async t => {
+  const { source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  await createFeature({ workspace_path: workspace, feature: 'alpha', title: 'Alpha', outcome: 'Alpha outcome.' });
+  await setFeatureStatus({ workspace_path: workspace, feature: 'alpha', status: 'archived', disposition: 'Shelved.' });
+  await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
+  const listed = await listFeatures({ workspace_path: workspace, include_archived: true });
+  assert.deepEqual(listed.features.filter(item => item.focused).map(item => item.slug), ['beta']);
+});
+
+test('a workspace that still focuses an archived lane switches without checkpointing it', async t => {
+  const { source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  await createFeature({ workspace_path: workspace, feature: 'alpha', title: 'Alpha', outcome: 'Alpha outcome.' });
+  await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
+  await setFeatureStatus({ workspace_path: workspace, feature: 'alpha', status: 'archived', disposition: 'Shelved.' });
+  // Archives recorded before focus clearing left the archived lane focused.
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  try { db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('focus', 'alpha')").run(); } finally { db.close(); }
+  const switched = await switchFeature({ workspace_path: workspace, feature: 'beta' });
+  assert.equal(switched.focus, 'beta');
+  assert.equal(switched.from, null);
+  const { timeline } = await getFeatureContext({ workspace_path: workspace, feature: 'beta' });
+  assert.deepEqual(timeline.find(event => event.kind === 'focus.switched').details, { from: 'alpha', to: 'beta' });
+});
+
 // A frozen clock gives every change the checkpoint's millisecond, so only the semantic generation can tell them apart.
 const freezeClock = t => t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
 

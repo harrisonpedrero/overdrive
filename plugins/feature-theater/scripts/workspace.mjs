@@ -1197,7 +1197,9 @@ export async function switchFeature({ workspace_path, feature, accept_unverified
         const packet = await writeFeatureContext(ctx, destination);
         return { changed: false, focus: slug, feature: summarizeFeature(ctx, destination), git: packet.snapshot, coordinatorCompactionRecommended: false };
       }
-      const outgoing = outgoingSlug ? featureBySlug(ctx.db, outgoingSlug) : null;
+      // An archived lane has no live work to checkpoint; an older workspace may still focus one.
+      const focused = outgoingSlug ? featureBySlug(ctx.db, outgoingSlug) : null;
+      const outgoing = focused?.status === 'archived' ? null : focused;
       let observation = null;
       if (outgoing) {
         // Semantic freshness takes precedence and is cheap, so a stale lane fails before any Git scan.
@@ -1217,7 +1219,7 @@ export async function switchFeature({ workspace_path, feature, accept_unverified
         meta(ctx.db, 'focus', slug);
       });
       const freshnessEvent = checkoutFreshness && { status: checkoutFreshness.status, changed: checkoutFreshness.changed, worker: checkoutFreshness.worker, accepted: checkoutFreshness.accepted, caveat: checkoutFreshness.caveat };
-      await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoing?.slug ?? null, to: slug, ...(freshnessEvent ? { checkoutFreshness: freshnessEvent } : {}) } });
+      await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoingSlug, to: slug, ...(freshnessEvent ? { checkoutFreshness: freshnessEvent } : {}) } });
       const current = featureBySlug(ctx.db, slug);
       const packet = await writeFeatureContext(ctx, current);
       if (outgoing) await writeFeatureContext(ctx, outgoing.slug);
@@ -1288,6 +1290,7 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       if (row.status === status) return { feature: summarizeFeature(ctx, row), unchanged: true };
     }
     const stamp = now();
+    let focusCleared = false;
     transaction(ctx.db, () => {
       const previous = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
       // Archiving ends the lane's work, so its direction becomes terminal; a later checkpoint may
@@ -1318,12 +1321,19 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
       const saved = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
       if (completionCandidate || Object.keys(saved).some(field => saved[field] !== previous[field])) bumpSemanticGeneration(ctx.db, row.id);
+      // An archived lane cannot hold focus, so archiving the focused lane leaves the workspace unfocused
+      // rather than making the next switch checkpoint a terminal lane. Other lanes keep their focus.
+      if (status === 'archived' && meta(ctx.db, 'focus') === slug) {
+        ctx.db.prepare("DELETE FROM meta WHERE key = 'focus'").run();
+        meta(ctx.db, 'updated_at', stamp);
+        focusCleared = true;
+      }
     });
-    await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: {} });
+    await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: focusCleared ? { focusCleared: true } : {} });
     const current = featureBySlug(ctx.db, slug);
     await writeFeatureContext(ctx, current);
     await writeIndex(ctx);
-    return { feature: summarizeFeature(ctx, current) };
+    return { feature: summarizeFeature(ctx, current), ...(focusCleared ? { focusCleared: true } : {}) };
   } finally { ctx.db.close(); }
 }
 
