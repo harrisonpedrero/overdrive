@@ -121,6 +121,119 @@ test('claude harness turn records only visible handoff and working diff, accepts
   assert.match((await getFeatureContext(args)).feature.summary, /^Handoff 3: wrote worker-3\.txt\./);
 });
 
+test('a failed Claude turn keeps a bounded, redacted diagnostic and stays resumable', async t => {
+  const cases = [
+    { instruction: 'fail-fields', progress: true, detail: /^Claude Code reported a failed result \(error_during_execution\): API Error: Connection error\. connect ECONNREFUSED 127\.0\.0\.1:9/, secret: /fake-bearer-secret-value|end-of-noise/ },
+    { instruction: 'fail-stderr', progress: true, detail: /^Claude Code reported a failed result \(error_during_execution\); its stderr ended with:\n[\s\S]*Error: connect ECONNREFUSED 127\.0\.0\.1:9/, secret: /fake-stderr-secret-value/ },
+    { instruction: 'fail-result', progress: false, detail: /^API Error: connect ECONNREFUSED 127\.0\.0\.1:9 api_key=\[redacted\] noise[\s\S]* \[truncated\]$/, secret: /fake-result-secret-value|end-of-noise/ },
+    { instruction: 'fail-exit', progress: false, detail: /^Claude worker exited \(1\) before completing the turn\. startup-noise\n[\s\S]*Error: connect ECONNREFUSED 127\.0\.0\.1:9 password=\[redacted\]$/, secret: /fake-exit-secret-value/ },
+  ];
+  for (const { instruction, progress, detail, secret } of cases) {
+    const { args, argsFile, bridge, runtime } = await fixture(t);
+    const started = await runtime.startFeatureAgent({ ...args, instruction });
+    await eventually(async () => (await agentStatus(args)) === 'failed');
+    const [turn] = (await bridge.request('thread/read', { harness: 'claude', threadId: started.threadId })).thread.turns;
+    assert.equal(turn.status, 'failed');
+    const reported = turn.items.map(item => item.text).join('\n');
+    assert.match(reported, detail);
+    assert.doesNotMatch(reported, secret);
+    assert.ok(reported.length < 2_000, `diagnostic is bounded (${reported.length})`);
+    const state = await getFeatureContext(args);
+    assert.equal(state.feature.agent.activeTurnId, null);
+    assert.match(state.feature.summary, detail);
+    assert.doesNotMatch(state.feature.summary, secret);
+    // Visible progress text from before a failure without a result string follows the diagnostic.
+    assert.equal(/Working on message 1\./.test(state.feature.summary), progress);
+    assert.doesNotMatch(JSON.stringify(state), /private-do-not-persist/);
+    // Failure is not retried or masked; an explicit start resumes the same session.
+    const again = await runtime.startFeatureAgent({ ...args, instruction: 'Continue.' });
+    assert.equal(again.threadId, started.threadId);
+    assert.ok(JSON.parse(await fs.readFile(argsFile, 'utf8')).args.includes('--resume'));
+    await eventually(async () => (await agentStatus(args)) === 'idle');
+    assert.match((await getFeatureContext(args)).feature.summary, /^Handoff 1: wrote worker-1\.txt\./);
+  }
+});
+
+test('a failed Claude result prefers its result string, then falls back to a generic reason', async t => {
+  const failures = [
+    [{ result: 'Credit balance is too low', errors: ['ignored'] }, /^Credit balance is too low$/],
+    [{ result: '  ' }, /^Claude Code reported a failed result \(error_during_execution\) without diagnostic detail\.$/],
+    [{ result: '', error: { type: 'api_error', error: { message: 'Overloaded (token=abc123 retry later)' } } }, /^Claude Code reported a failed result \(error_during_execution\): Overloaded \(token=\[redacted\] retry later\)$/],
+    // A secret at the clip boundary is redacted before the clip, so no part of it survives.
+    [{ result: '', errors: [`${'x'.repeat(1_190)} sk-abcdefghijklmnopqrstuvwxyz`] }, /^Claude Code reported a failed result \(error_during_execution\): x{1190} \[redacted \[truncated\]$/],
+  ];
+  for (const [fields, expected] of failures) {
+    const result = JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, ...fields });
+    const script = `process.stdin.once('data', () => process.stdout.write(${JSON.stringify(result)} + '\\n')); process.stdin.on('end', () => process.exit(0));`;
+    const { completed } = await bridgeTurn(t, { input: 'go', launchArgs: ['-e', script, '--'] });
+    await eventually(() => completed.length === 1);
+    assert.equal(completed[0].status, 'failed');
+    assert.equal(completed[0].items.length, 1);
+    assert.match(completed[0].items[0].text, expected);
+  }
+});
+
+test('a failed Claude result waiting for stderr refuses steering and ends within its bound', async t => {
+  // Reports a blank failed result, writes its reason to stderr, then ignores the stdin close.
+  const result = JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '' });
+  const script = `process.stdin.once('data', () => process.stdout.write(${JSON.stringify(result)} + '\\n', () => process.stderr.write('connect ECONNREFUSED 127.0.0.1:9\\n'))); process.stdin.resume(); setInterval(() => {}, 1000);`;
+  const { bridge, threadId, turnId, child, completed } = await bridgeTurn(t, { input: 'go', treeKill: treeKiller, launchArgs: ['-e', script, '--'] });
+  await eventually(() => Boolean(bridge.threads.get(threadId).active?.failedResult));
+  await assert.rejects(bridge.request('turn/steer', { threadId, expectedTurnId: turnId, input: 'more' }), error => error.code === 'TURN_MISMATCH');
+  await eventually(() => completed.length === 1);
+  assert.equal(child.exitCode, null, 'the worker still runs, so the bound ended the turn');
+  assert.equal(completed[0].status, 'failed');
+  assert.match(completed[0].items[0].text, /its stderr ended with:\nconnect ECONNREFUSED 127\.0\.0\.1:9$/);
+  assert.equal(bridge.threads.get(threadId).active, null);
+  assert.equal((await bridge.request('thread/read', { threadId })).thread.status, 'idle');
+  // The lingering worker is stopped before the next turn, which runs normally.
+  assert.ok((await bridge.request('turn/start', { threadId, input: 'again' })).turn.id);
+});
+
+test('an interrupt during a failed result stderr wait decides the turn by termination', async t => {
+  const result = JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '' });
+  const report = `process.stdout.write(${JSON.stringify(result)} + '\\n', () => process.stderr.write('connect ECONNREFUSED 127.0.0.1:9 token=fake-wait-secret\\n', after))`;
+  // Keeps running after its report; the wait therefore lasts its whole bound.
+  const stays = `const after = () => {}; process.stdin.once('data', () => ${report}); process.stdin.resume(); setInterval(() => {}, 1000);`;
+  // Exits after its report while a detached helper holds its stderr open, so the exit is seen
+  // before stderr closes.
+  const exits = `const after = () => process.exit(0); process.stdin.once('data', () => { require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: ['ignore', 'ignore', 'inherit'], detached: true, windowsHide: true }); ${report}; });`;
+  const diagnostic = /^Claude Code reported a failed result \(error_during_execution\); its stderr ended with:\nconnect ECONNREFUSED 127\.0\.0\.1:9 token=\[redacted\]$/;
+  const waiting = async (bridge, threadId, child, exitFirst) => {
+    await eventually(() => {
+      const turn = bridge.threads.get(threadId).active;
+      return Boolean(turn?.failedResult) && turn.stderrTail.includes('ECONNREFUSED') && (!exitFirst || child.exitCode !== null);
+    });
+  };
+  const settled = async (bridge, threadId, completed, status) => {
+    // Past the one-second wait bound, the turn has still been decided only once.
+    await eventually(() => completed.length === 1);
+    await new Promise(resolve => setTimeout(resolve, 1_500));
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].status, status);
+    assert.equal((await bridge.request('thread/read', { threadId })).thread.turns.at(-1).status, status);
+    assert.equal(bridge.threads.get(threadId).active, null);
+    assert.doesNotMatch(JSON.stringify(completed[0]), /fake-wait-secret/);
+  };
+
+  // A stopped worker: the interrupt succeeds and the turn is interrupted, keeping the diagnostic.
+  for (const [script, exitFirst] of [[stays, false], [exits, true]]) {
+    const { bridge, threadId, turnId, child, completed } = await bridgeTurn(t, { input: 'go', treeKill: treeKiller, launchArgs: ['-e', script, '--'] });
+    await waiting(bridge, threadId, child, exitFirst);
+    assert.deepEqual(await bridge.request('turn/interrupt', { threadId, turnId }), { interrupted: true });
+    await settled(bridge, threadId, completed, 'interrupted');
+    assert.match(completed[0].items[0].text, diagnostic);
+  }
+
+  // A worker that cannot be stopped outlasts the wait bound; the interrupt fails and so does the turn.
+  const { bridge, threadId, turnId, child, completed } = await bridgeTurn(t, { input: 'go', treeKill: stalledKiller, terminationTimeoutMs: 1_500, launchArgs: ['-e', stays, '--'] });
+  await waiting(bridge, threadId, child, false);
+  child.kill = () => false;
+  await assert.rejects(bridge.request('turn/interrupt', { threadId, turnId }), error => error.code === 'CLAUDE_TERMINATION_FAILED');
+  await settled(bridge, threadId, completed, 'failed');
+  assert.match(completed[0].items[0].text, /^Interrupt could not stop Claude worker process \d+/);
+});
+
 test('claude harness interrupt ends a hanging turn as interrupted', async t => {
   const { args, runtime } = await fixture(t);
   await runtime.startFeatureAgent({ ...args, instruction: 'hang' });

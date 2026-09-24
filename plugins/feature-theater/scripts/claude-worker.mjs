@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { TheaterError, now, refusedRequest, run } from './util.mjs';
+import { TheaterError, now, redactString, refusedRequest, run } from './util.mjs';
 
 // Workers get no MCP servers, hooks, skills, plugins or browser integration; the Theater
 // coordinator therefore cannot be called recursively from a lane.
@@ -23,6 +23,9 @@ const DIFF_DEBOUNCE_MS = 4_000;
 const RESULT_GRACE_MS = 15_000;
 const TERMINATION_TIMEOUT_MS = 5_000;
 const EXIT_DRAIN_MS = 1_000;
+const STDERR_TAIL_CHARS = 8_000;
+const DIAGNOSTIC_CHARS = 1_200;
+const DIAGNOSTIC_STDERR_LINES = 12;
 
 function toolList(value, name) {
   if (value === undefined) return undefined;
@@ -82,6 +85,42 @@ function textOf(input) {
   if (typeof input === 'string') return input;
   if (Array.isArray(input)) return input.map(part => (typeof part === 'string' ? part : part?.text ?? '')).join('\n');
   return '';
+}
+
+function errorFieldText(value, depth = 0) {
+  if (typeof value === 'string') return value.trim();
+  if (depth > 3) return '';
+  if (Array.isArray(value)) return value.slice(0, 10).map(item => errorFieldText(item, depth + 1)).filter(Boolean).join('\n');
+  if (value && typeof value === 'object') return errorFieldText(value.message ?? value.error, depth + 1);
+  return '';
+}
+
+// Failure text reaches turn notifications and thread reads before the runtime sees it, so it is
+// redacted here, always before it is clipped: a clip cannot expose part of a secret the
+// redaction would have matched.
+function boundedHead(text) {
+  const safe = redactString(text);
+  return safe.length > DIAGNOSTIC_CHARS ? `${safe.slice(0, DIAGNOSTIC_CHARS)} [truncated]` : safe;
+}
+
+// The last lines of captured stderr. A tail cut at the capture limit may start mid-line, so that
+// partial line is dropped.
+function stderrExcerpt(tail) {
+  const lines = tail.split(/\r?\n/).slice(tail.length >= STDERR_TAIL_CHARS ? 1 : 0).map(line => line.trimEnd()).filter(line => line.trim());
+  const safe = redactString(lines.slice(-DIAGNOSTIC_STDERR_LINES).join('\n'));
+  return safe.length > DIAGNOSTIC_CHARS ? `[truncated] ${safe.slice(-DIAGNOSTIC_CHARS)}` : safe;
+}
+
+// A nonblank result string is the failure report; otherwise the reason can only be in error
+// fields or on stderr. Only those are read, never transcript content.
+export function failedResultDiagnostic(message, stderrTail = '') {
+  if (typeof message.result === 'string' && message.result.trim()) return boundedHead(message.result.trim());
+  const kind = typeof message.subtype === 'string' && /^[\w-]{1,40}$/.test(message.subtype) ? ` (${message.subtype})` : '';
+  const fields = errorFieldText([message.errors, message.error]);
+  if (fields) return `Claude Code reported a failed result${kind}: ${boundedHead(fields)}`;
+  const stderr = stderrExcerpt(stderrTail);
+  if (stderr) return `Claude Code reported a failed result${kind}; its stderr ended with:\n${stderr}`;
+  return `Claude Code reported a failed result${kind} without diagnostic detail.`;
 }
 
 const exited = child => child.exitCode !== null || child.signalCode !== null;
@@ -314,19 +353,24 @@ export class ClaudeWorkerBridge extends EventEmitter {
         this.#event(meta, turn, message);
       }
     });
-    child.stderr.on('data', chunk => { turn.stderrTail = (turn.stderrTail + chunk).slice(-8_000); });
+    child.stderr.on('data', chunk => { turn.stderrTail = (turn.stderrTail + chunk).slice(-STDERR_TAIL_CHARS); });
     // A dead worker surfaces through its exit; a write to its closed stdin must not crash the host.
     child.stdin.on('error', () => {});
     child.on('error', error => {
       // Before spawn this is a launch failure; afterwards it is a failed kill, which termination reports.
-      if (child.pid === undefined) void this.#finish(meta, turn, 'failed', `Unable to launch the Claude worker: ${error.message}`);
+      if (child.pid === undefined) void this.#finish(meta, turn, 'failed', `Unable to launch the Claude worker: ${boundedHead(error.message)}`);
     });
     child.once('exit', code => {
       this.#reportCleanExit(meta, turn);
       // stdout can still hold the final result when the process exits; let it drain briefly.
       const settle = () => {
         if (turn.status !== 'inProgress') return;
-        void this.#finish(meta, turn, turn.interrupted ? 'interrupted' : 'failed', turn.interrupted ? undefined : `Claude worker exited (${code}) before completing the turn. ${turn.stderrTail.trim()}`.trim());
+        // An interrupted turn is decided by its termination, even while a failed result waits for
+        // stderr; that result's redacted diagnostic is kept. Otherwise the failed result's own
+        // finish waits for stderr.
+        if (turn.interrupted) return this.#finishInterrupted(meta, turn);
+        if (turn.failedResult) return;
+        void this.#finish(meta, turn, 'failed', `Claude worker exited (${code}) before completing the turn. ${stderrExcerpt(turn.stderrTail)}`.trim());
       };
       if (child.stdout.readableEnded) return settle();
       const timer = setTimeout(settle, EXIT_DRAIN_MS);
@@ -354,7 +398,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   #steer({ threadId, expectedTurnId, input }) {
     const meta = this.#thread(threadId);
     const turn = meta.active;
-    if (!turn || turn.id !== expectedTurnId || turn.interrupted) throw new TheaterError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
+    if (!turn || turn.id !== expectedTurnId || turn.interrupted || turn.failedResult) throw new TheaterError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
     turn.pendingResults += 1;
     clearTimeout(turn.graceTimer);
     this.#send(turn, textOf(input));
@@ -406,7 +450,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   #event(meta, turn, message) {
-    if (turn.status !== 'inProgress' || turn.interrupted) return;
+    if (turn.status !== 'inProgress' || turn.interrupted || turn.failedResult) return;
     if (message.type === 'system' && message.subtype === 'init') {
       meta.persisted = true;
       clearTimeout(turn.graceTimer);
@@ -432,14 +476,50 @@ export class ClaudeWorkerBridge extends EventEmitter {
       }
       turn.final = typeof message.result === 'string' ? message.result : null;
       const failed = message.is_error === true || (message.subtype && message.subtype !== 'success');
-      if (turn.pendingResults <= 0 || failed) {
-        void this.#finish(meta, turn, failed ? 'failed' : 'completed');
+      if (failed) {
+        this.#finishFailedResult(meta, turn, message);
+        return;
+      }
+      if (turn.pendingResults <= 0) {
+        void this.#finish(meta, turn, 'completed');
         return;
       }
       // A steer was queued; the CLI normally starts a new response for it. If nothing
       // follows, the queued message was folded into this response and the turn is done.
       turn.graceTimer = setTimeout(() => { if (!turn.interrupted) void this.#finish(meta, turn, 'completed'); }, RESULT_GRACE_MS);
     }
+  }
+
+  // A nonblank result string is the whole failure report. Otherwise the diagnostic precedes the
+  // turn's visible text. Without a reason in error fields it comes from stderr, which may still be
+  // arriving, so the worker's input is closed and the turn ends once stderr closes or after a short
+  // bound; steering is refused meanwhile. The turn fails and is not retried, unless an interrupt
+  // begins during that wait: then, as for any interrupt, termination decides the turn.
+  #finishFailedResult(meta, turn, message) {
+    clearTimeout(turn.graceTimer);
+    if (typeof message.result === 'string' && message.result.trim()) return void this.#finish(meta, turn, 'failed', failedResultDiagnostic(message));
+    const failWith = () => void this.#finish(meta, turn, 'failed', [failedResultDiagnostic(message, turn.stderrTail), ...turn.text].join('\n'));
+    if (errorFieldText([message.errors, message.error])) return failWith();
+    turn.failedResult = message;
+    const child = turn.child;
+    const stderr = child?.stderr;
+    let timer;
+    const done = () => {
+      clearTimeout(timer);
+      stderr?.off('close', done);
+      if (!turn.interrupted) return failWith();
+      // If the worker exited first, its exit handler has already passed this turn by.
+      if (child && exited(child)) this.#finishInterrupted(meta, turn);
+    };
+    if (!stderr || stderr.readableEnded || stderr.destroyed) return done();
+    timer = setTimeout(done, EXIT_DRAIN_MS);
+    stderr.once('close', done);
+    try { turn.child.stdin.end(); } catch { /* process already gone */ }
+  }
+
+  // An interrupted turn keeps the redacted diagnostic of a failed result it was still waiting on.
+  #finishInterrupted(meta, turn) {
+    void this.#finish(meta, turn, 'interrupted', turn.failedResult ? redactString([failedResultDiagnostic(turn.failedResult, turn.stderrTail), ...turn.text].join('\n')) : undefined);
   }
 
   #scheduleDiff(meta, turn) {
@@ -486,7 +566,8 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (patch) this.emit('notification', { method: 'turn/diff/updated', params: { threadId: meta.id, turnId: turn.id, diff: patch } });
     const items = [];
     const text = failureText ?? turn.final ?? turn.text.join('\n');
-    if (text) items.push({ type: 'agentMessage', text });
+    // Failure text is bounded where it is produced; any failed-turn text is redacted here too.
+    if (text) items.push({ type: 'agentMessage', text: status === 'failed' ? redactString(text) : text });
     if (turn.descendantsUnconfirmed && status === 'interrupted') items.push({ type: 'agentMessage', text: 'The worker process tree could not be ended as a whole, so only the worker process itself was terminated; tools it launched may still be running.' });
     if (turn.denials.length) items.push({ type: 'agentMessage', text: `Worker permission policy denied ${turn.denials.length} tool call(s): ${[...new Set(turn.denials)].join(', ')}. Route those needs through the coordinator.` });
     turn.items = items;

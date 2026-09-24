@@ -36,6 +36,27 @@ function respond(message) {
   send({ type: 'system', subtype: 'init', session_id: sessionId, model: 'fake-model' });
   if (/hang/.test(text)) return new Promise(() => {});
   send({ type: 'assistant', session_id: sessionId, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'private-do-not-persist' }, { type: 'text', text: `Working on message ${n}.` }] } });
+  // Failures, each with a secret and oversized noise: a failed result whose reason is its result
+  // string, only in error fields, or only on stderr (partly written after the result), and an
+  // exit before any result.
+  if (/fail-result/.test(text)) {
+    send({ type: 'result', subtype: 'success', is_error: true, result: `API Error: connect ECONNREFUSED 127.0.0.1:9 api_key=fake-result-secret-value ${'noise '.repeat(2_000)}end-of-noise`, session_id: sessionId });
+    return Promise.resolve();
+  }
+  if (/fail-exit/.test(text)) {
+    process.stderr.write(`${'startup-noise\n'.repeat(400)}Error: connect ECONNREFUSED 127.0.0.1:9 password=fake-exit-secret-value\n`, () => process.exit(1));
+    return new Promise(() => {});
+  }
+  if (/fail-fields/.test(text)) {
+    send({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '', session_id: sessionId, errors: ['API Error: Connection error. connect ECONNREFUSED 127.0.0.1:9 Authorization: Bearer fake-bearer-secret-value', `${'noise '.repeat(2_000)}end-of-noise`] });
+    return Promise.resolve();
+  }
+  if (/fail-stderr/.test(text)) {
+    process.stderr.write(`${'startup-noise\n'.repeat(700)}`);
+    send({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '', session_id: sessionId });
+    process.stderr.write('Error: connect ECONNREFUSED 127.0.0.1:9 (api_key=fake-stderr-secret-value)\n');
+    return Promise.resolve();
+  }
   return new Promise(resolve => setTimeout(() => {
     const file = `worker-${n}.txt`;
     fs.writeFileSync(path.join(process.cwd(), file), `turn ${n}\n`);
@@ -65,4 +86,4 @@ process.stdin.on('data', chunk => {
   }
   void drain();
 });
-process.stdin.on('end', () => process.exit(0));
+process.stdin.on('end', () => process.stdout.write('', () => process.stderr.write('', () => process.exit(0))));
