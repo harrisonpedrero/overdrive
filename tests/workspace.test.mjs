@@ -380,6 +380,59 @@ test('keeps checkpoints fresh across focus round-trips until the lane changes, e
   await switchRequiresCheckpoint(workspace, 'beta');
 });
 
+test('renewing running work without new text keeps its saved progress and checkpoint', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-renewal-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  freezeClock(t);
+  const alpha = { workspace_path: workspace, feature: 'alpha' };
+  const beta = { workspace_path: workspace, feature: 'beta' };
+  const build = async () => (await getFeatureContext(alpha)).workItems.find(item => item.item_key === 'build');
+  const generation = () => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'), { readOnly: true });
+    try { return Number(db.prepare("SELECT semantic_generation FROM features WHERE slug = 'alpha'").get().semantic_generation); } finally { db.close(); }
+  };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Renewal', description: 'Exercise lease renewal.' });
+  await createFeature({ ...alpha, title: 'Alpha', outcome: 'Alpha outcome.' });
+  await createFeature({ ...beta, title: 'Beta', outcome: 'Beta outcome.' });
+  await switchFeature(alpha);
+  await planWork({ ...alpha, items: [{ key: 'build', title: 'Build' }] });
+  const claim = { ...alpha, key: 'build', status: 'running', owner: 'worker' };
+  await updateWork({ ...claim, summary: 'Implementation underway', blocker: 'Waiting on a fixture.' });
+  await checkpointFeature({ ...alpha, summary: 'Build is running.', next_action: 'Await the build.' });
+  const checkpointed = generation();
+
+  const renewed = await updateWork(claim);
+  assert.equal(renewed.item.result_summary, 'Implementation underway');
+  assert.equal(renewed.item.blocker, 'Waiting on a fixture.');
+  assert.equal(generation(), checkpointed);
+  const { timeline } = await getFeatureContext(alpha);
+  assert.equal(timeline[0].summary, 'build is running: Implementation underway');
+  assert.equal((await switchFeature(beta)).focus, 'beta');
+  assert.equal((await switchFeature(alpha)).focus, 'alpha');
+
+  await updateWork({ ...claim, summary: 'Parser is done.' });
+  assert.equal((await build()).result_summary, 'Parser is done.');
+  assert.equal((await build()).blocker, 'Waiting on a fixture.');
+  await switchRequiresCheckpoint(workspace, 'beta');
+  await checkpointFeature({ ...alpha, summary: 'Parser is done.', next_action: 'Finish the build.' });
+  await updateWork({ ...claim, blocker: 'Waiting on review.' });
+  assert.equal((await build()).result_summary, 'Parser is done.');
+  assert.equal((await build()).blocker, 'Waiting on review.');
+  assert.equal((await getFeatureContext(alpha)).timeline[0].summary, 'build is running: blocker: Waiting on review.');
+  await switchRequiresCheckpoint(workspace, 'beta');
+
+  // Blank text still clears, and another owner taking over an expired lease starts fresh.
+  await updateWork({ ...claim, summary: '', blocker: null });
+  assert.equal((await build()).result_summary, '');
+  assert.equal((await build()).blocker, '');
+  await updateWork({ ...claim, summary: 'Half done.', blocker: 'Waiting on a fixture.', lease_seconds: 60 });
+  t.mock.timers.tick(61_000);
+  const takeover = await updateWork({ ...claim, owner: 'relief' });
+  assert.equal(takeover.item.owner, 'relief');
+  assert.equal(takeover.item.result_summary, '');
+  assert.equal(takeover.item.blocker, '');
+});
+
 test('verification reopens a checkpointed lane only when it supersedes a candidate', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-freshness-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));

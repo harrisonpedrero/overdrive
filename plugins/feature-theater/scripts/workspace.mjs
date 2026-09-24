@@ -975,8 +975,10 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       if (!item) throw new TheaterError(`Unknown work item: ${itemKey}`, 'WORK_ITEM_NOT_FOUND');
       if (!ALLOWED_WORK_TRANSITIONS[item.status]?.has(status)) throw new TheaterError(`Invalid work transition: ${item.status} -> ${status}`, 'INVALID_TRANSITION');
       const cleanOwner = optionalText(owner, 'owner', { max: 200 });
-      const cleanSummary = optionalText(summary, 'summary', { max: 50_000 }) || '';
-      const cleanBlocker = optionalText(blocker, 'blocker', { max: 20_000 }) || '';
+      // An owner renewing running work keeps whichever saved text it omits; blank text still clears it.
+      const renewing = item.status === 'running' && status === 'running' && item.owner === cleanOwner;
+      const cleanSummary = renewing && summary === undefined ? item.result_summary : optionalText(summary, 'summary', { max: 50_000 }) || '';
+      const cleanBlocker = renewing && blocker === undefined ? item.blocker : optionalText(blocker, 'blocker', { max: 20_000 }) || '';
       if (status === 'running' && !cleanOwner) throw new TheaterError('Running work requires an owner.', 'INVALID_INPUT');
       if (status === 'done' && !cleanSummary) throw new TheaterError('Completed work requires a result summary.', 'INVALID_INPUT');
       if (['blocked', 'failed'].includes(status) && !cleanBlocker) throw new TheaterError(`${status} work requires a blocker or failure description.`, 'INVALID_INPUT');
@@ -993,6 +995,9 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       const lease = status === 'running' ? new Date(Date.now() + lease_seconds * 1000).toISOString() : null;
       const clearResultRevision = ['planned', 'ready', 'running'].includes(status);
       const stamp = now();
+      const detail = renewing && cleanSummary === item.result_summary && cleanBlocker !== item.blocker
+        ? (cleanBlocker ? `blocker: ${cleanBlocker}` : 'blocker cleared')
+        : cleanSummary || cleanBlocker;
       let nextAction = null;
       transaction(ctx.db, () => {
         ctx.db.prepare(`UPDATE work_items SET status = ?, owner = ?, result_summary = ?, blocker = ?, result_revision = CASE WHEN ? THEN NULL ELSE COALESCE(?, result_revision) END, lease_expires_at = ?, updated_at = ? WHERE id = ?`)
@@ -1006,7 +1011,7 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
         ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(stamp, row.id);
         if (changed) bumpSemanticGeneration(ctx.db, row.id);
       });
-      await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${cleanSummary ? `: ${cleanSummary}` : cleanBlocker ? `: ${cleanBlocker}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease, ...(nextAction ? { nextAction } : {}) } });
+      await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${detail ? `: ${detail}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease, ...(nextAction ? { nextAction } : {}) } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
