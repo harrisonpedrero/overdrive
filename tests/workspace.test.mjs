@@ -272,6 +272,16 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
     promoteManagedCandidate({ workspace_path: workspace, feature: 'alpha' }),
     error => error.code === 'NOT_MANAGED_PROJECT',
   );
+  // A done lane gains no running claim, even from a reclaimable item a legacy build left behind.
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  try { db.prepare("UPDATE work_items SET status = 'failed', blocker = 'Legacy failure.' WHERE item_key = 'validate'").run(); } finally { db.close(); }
+  await assert.rejects(
+    updateWork({ workspace_path: workspace, feature: 'alpha', key: 'validate', status: 'running', owner: 'astra' }),
+    error => error.code === 'INVALID_TRANSITION' && error.message.includes('alpha is done'),
+  );
+  const refusedContext = await getFeatureContext({ workspace_path: workspace, feature: 'alpha' });
+  assert.equal(refusedContext.feature.status, 'done');
+  assert.equal(refusedContext.workItems.find(item => item.item_key === 'validate').status, 'failed');
 });
 
 async function planBELoop(workspace) {
@@ -431,6 +441,73 @@ test('renewing running work without new text keeps its saved progress and checkp
   assert.equal(takeover.item.owner, 'relief');
   assert.equal(takeover.item.result_summary, '');
   assert.equal(takeover.item.blocker, '');
+});
+
+test('paused and archived lanes refuse new running claims but keep renewal and outcome bookkeeping', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-inactive-claim-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  freezeClock(t);
+  const alpha = { workspace_path: workspace, feature: 'alpha' };
+  const item = async key => (await getFeatureContext(alpha)).workItems.find(candidate => candidate.item_key === key);
+  // Everything a refused claim must leave untouched, read without rewriting the packet.
+  const laneState = async () => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'), { readOnly: true });
+    try {
+      const feature = db.prepare("SELECT id, status, next_action, semantic_generation, updated_at FROM features WHERE slug = 'alpha'").get();
+      return {
+        feature: { ...feature },
+        work: db.prepare('SELECT item_key, status, owner, result_summary, blocker, lease_expires_at, updated_at FROM work_items WHERE feature_id = ? ORDER BY item_key').all(feature.id).map(row => ({ ...row })),
+        events: Number(db.prepare('SELECT COUNT(*) AS count FROM events WHERE feature_id = ?').get(feature.id).count),
+        packet: await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8'),
+      };
+    } finally { db.close(); }
+  };
+  const refused = async (update, status) => {
+    const before = await laneState();
+    await assert.rejects(updateWork({ ...alpha, ...update, status: 'running' }), error => error.code === 'INVALID_TRANSITION' && error.message.includes(`alpha is ${status}`));
+    assert.deepEqual(await laneState(), before);
+  };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Inactive', description: 'Exercise inactive-lane claims.' });
+  await createFeature({ ...alpha, title: 'Alpha', outcome: 'Alpha outcome.' });
+  await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
+  await planWork({ ...alpha, items: ['build', 'docs', 'extra'].map(key => ({ key, title: key })) });
+  const build = { key: 'build', owner: 'worker' };
+  await updateWork({ ...alpha, ...build, status: 'running', summary: 'Parser underway.', lease_seconds: 60 });
+  await updateWork({ ...alpha, key: 'docs', status: 'running', owner: 'writer' });
+  await setFeatureStatus({ ...alpha, status: 'paused' });
+
+  // A paused lane refuses a fresh claim and a takeover of an expired lease by another owner.
+  await refused({ key: 'extra', owner: 'intruder' }, 'paused');
+  t.mock.timers.tick(61_000);
+  await refused({ key: 'build', owner: 'relief' }, 'paused');
+
+  // Its current owner still renews, keeping saved text without a semantic change.
+  const generation = (await laneState()).feature.semantic_generation;
+  const renewed = await updateWork({ ...alpha, ...build, status: 'running' });
+  assert.equal(renewed.feature.status, 'paused');
+  assert.equal(renewed.item.owner, 'worker');
+  assert.equal(renewed.item.result_summary, 'Parser underway.');
+  assert.ok(renewed.item.lease_expires_at > new Date().toISOString());
+  assert.equal((await laneState()).feature.semantic_generation, generation);
+
+  // A stopped worker's outcome is still recorded, but blocked work is not reclaimed while paused.
+  assert.equal((await updateWork({ ...alpha, key: 'docs', owner: 'writer', status: 'done', summary: 'Docs written.' })).item.status, 'done');
+  assert.equal((await updateWork({ ...alpha, ...build, status: 'blocked', blocker: 'Needs the fixture.' })).item.status, 'blocked');
+  await refused(build, 'paused');
+  assert.equal((await item('extra')).status, 'ready');
+
+  // Resuming restores normal claims.
+  await setFeatureStatus({ ...alpha, status: 'active' });
+  assert.equal((await updateWork({ ...alpha, key: 'extra', status: 'running', owner: 'intruder' })).item.owner, 'intruder');
+  assert.equal((await updateWork({ ...alpha, ...build, status: 'running' })).item.status, 'running');
+
+  // An archived lane refuses every running update, including its owner's renewal.
+  await setFeatureStatus({ ...alpha, status: 'archived', disposition: 'Shelved.' });
+  await planWork({ ...alpha, items: [{ key: 'later', title: 'later' }] });
+  assert.equal((await item('later')).status, 'ready');
+  await refused({ key: 'later', owner: 'intruder' }, 'archived');
+  await refused(build, 'archived');
+  assert.equal((await updateWork({ ...alpha, key: 'extra', owner: 'intruder', status: 'failed', blocker: 'Shelved mid-run.' })).item.status, 'failed');
 });
 
 test('verification reopens a checkpointed lane only when it supersedes a candidate', async t => {

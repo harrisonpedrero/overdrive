@@ -185,7 +185,7 @@ export const TOOLS = [
     },
   }, ['workspace_path', 'feature', 'items']), { destructiveHint: false }),
 
-  tool('theater_work_update', 'Update work item', 'Change one work item state, enforce ownership leases, and record result or blocker details.', object({
+  tool('theater_work_update', 'Update work item', 'Change one work item state, enforce ownership leases, and record result or blocker details. A paused, done or archived lane refuses new running claims; while paused, its current owner may still renew and non-running outcomes can still be recorded.', object({
     ...workspace,
     ...feature,
     key: string('Stable work item key.'),

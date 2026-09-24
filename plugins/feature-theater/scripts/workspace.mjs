@@ -980,6 +980,10 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       const cleanSummary = renewing && summary === undefined ? item.result_summary : optionalText(summary, 'summary', { max: 50_000 }) || '';
       const cleanBlocker = renewing && blocker === undefined ? item.blocker : optionalText(blocker, 'blocker', { max: 20_000 }) || '';
       if (status === 'running' && !cleanOwner) throw new TheaterError('Running work requires an owner.', 'INVALID_INPUT');
+      // An inactive lane gains no new running claim; while paused its current owner may still renew.
+      if (status === 'running' && (['done', 'archived'].includes(row.status) || (row.status === 'paused' && !renewing))) {
+        throw new TheaterError(`Feature ${slug} is ${row.status}; ${row.status === 'paused' ? 'resume' : 'reactivate'} it with theater_feature_status before claiming running work.`, 'INVALID_TRANSITION');
+      }
       if (status === 'done' && !cleanSummary) throw new TheaterError('Completed work requires a result summary.', 'INVALID_INPUT');
       if (['blocked', 'failed'].includes(status) && !cleanBlocker) throw new TheaterError(`${status} work requires a blocker or failure description.`, 'INVALID_INPUT');
       if (status === 'running') {
