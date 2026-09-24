@@ -128,6 +128,61 @@ test('an exact sibling revision seeds a lane while canonical source is unavailab
   assert.equal((await git(path.join(workspace, 'features', 'plain', 'repo'), 'rev-parse', 'HEAD')).stdout, latest);
 });
 
+test('setup and check hints describe each lane\'s selected base while the canonical profile stays cached', async t => {
+  const { parent, source, workspace } = await fixture(t);
+  // Canonical default is a Rust project; Node appears only in a sibling commit and Go only off-default.
+  await git(source, 'rm', '-q', 'package.json', 'package-lock.json');
+  await fs.writeFile(path.join(source, 'Cargo.toml'), '[package]\nname = "app"\n');
+  await git(source, 'add', '.');
+  await git(source, 'commit', '-m', 'rust');
+  await git(source, 'checkout', '-q', '-b', 'side');
+  await git(source, 'rm', '-q', 'Cargo.toml');
+  await fs.writeFile(path.join(source, 'go.mod'), 'module app\n');
+  await git(source, 'add', '.');
+  await git(source, 'commit', '-m', 'go');
+  const side = (await git(source, 'rev-parse', 'HEAD')).stdout;
+  await git(source, 'checkout', '-q', 'main');
+  const rust = { ecosystems: ['rust'], setupCandidates: [['cargo', 'fetch']], checkCandidates: [['cargo', 'test']] };
+  const hints = profile => ({ ecosystems: profile.ecosystems, setupCandidates: profile.setupCandidates, checkCandidates: profile.checkCandidates });
+  const cachedProfile = async () => JSON.parse(await fs.readFile(path.join(workspace, 'theater.json'), 'utf8')).repositoryProfile;
+
+  const initialized = await initializeWorkspace({ workspace_path: workspace, repository: source });
+  assert.deepEqual(hints(initialized.repositoryProfile), rust);
+  const lane = await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Supplies a sibling base.' });
+  assert.deepEqual(lane.repositoryProfile, initialized.repositoryProfile);
+  const laneRepo = path.join(workspace, 'features', 'lane', 'repo');
+  await git(laneRepo, 'config', 'user.name', 'Feature Theater Test');
+  await git(laneRepo, 'config', 'user.email', 'feature-theater@example.invalid');
+  await fs.writeFile(path.join(laneRepo, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+  await git(laneRepo, 'add', 'package.json');
+  await git(laneRepo, 'commit', '-m', 'node');
+  const selected = (await git(laneRepo, 'rev-parse', 'HEAD')).stdout;
+  // Later working-tree edits in the sibling are not part of the selected commit.
+  await fs.writeFile(path.join(laneRepo, 'package.json'), JSON.stringify({ scripts: { lint: 'eslint .' } }));
+  await fs.writeFile(path.join(laneRepo, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+
+  const offline = path.join(parent, 'source-offline');
+  await fs.rename(source, offline);
+  const derived = await createFeature({ workspace_path: workspace, feature: 'derived', outcome: 'Adds Node tooling.', base_feature: 'lane', base_revision: selected });
+  assert.equal(derived.canonicalSource.status, 'cached');
+  assert.deepEqual(hints(derived.repositoryProfile), {
+    ecosystems: ['node', 'rust'],
+    setupCandidates: [['npm', 'install'], ['cargo', 'fetch']],
+    checkCandidates: [['npm', 'run', 'test'], ['cargo', 'test']],
+  });
+  assert.deepEqual(await cachedProfile(), initialized.repositoryProfile);
+  await fs.rename(offline, source);
+
+  const explicit = await createFeature({ workspace_path: workspace, feature: 'explicit', outcome: 'Starts off-default.', base_revision: side });
+  assert.equal(explicit.feature.baseRevision, side);
+  assert.deepEqual(hints(explicit.repositoryProfile), { ecosystems: ['go'], setupCandidates: [['go', 'mod', 'download']], checkCandidates: [['go', 'test', './...']] });
+  assert.deepEqual(await cachedProfile(), initialized.repositoryProfile);
+
+  const plain = await createFeature({ workspace_path: workspace, feature: 'plain', outcome: 'Starts from default.' });
+  assert.deepEqual(plain.repositoryProfile, initialized.repositoryProfile);
+  assert.deepEqual(await cachedProfile(), initialized.repositoryProfile);
+});
+
 test('an invalid spec is rejected before any feature clone and a corrected retry succeeds', async t => {
   const { source, workspace } = await fixture(t);
   await initializeWorkspace({ workspace_path: workspace, repository: source });

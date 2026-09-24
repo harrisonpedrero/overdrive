@@ -66,16 +66,18 @@ export async function resolveMirrorRevision(root, revision) {
   }
 }
 
-async function showFromMirror(root, revision, file) {
+async function showFromGitDir(root, gitDir, revision, file) {
   try {
-    return (await run(['git', '--git-dir', mirrorPath(root), 'show', `${revision}:${file}`], { cwd: root, maxOutput: 500_000 })).stdout;
+    return (await run(['git', '--git-dir', gitDir, 'show', `${revision}:${file}`], { cwd: root, maxOutput: 500_000 })).stdout;
   } catch {
     return undefined;
   }
 }
 
-export async function profileRepository(root, revision) {
-  const names = (await run(['git', '--git-dir', mirrorPath(root), 'ls-tree', '-r', '--name-only', revision], { cwd: root, maxOutput: 5_000_000 })).stdout
+// Profiles a committed tree, never a working tree, so hints describe exactly the selected revision.
+// The cache is the default object store; a feature clone's .git holds commits the cache lacks.
+export async function profileRepository(root, revision, gitDir = mirrorPath(root)) {
+  const names = (await run(['git', '--git-dir', gitDir, 'ls-tree', '-r', '--name-only', revision], { cwd: root, maxOutput: 5_000_000 })).stdout
     .split(/\r?\n/).filter(Boolean);
   const files = new Set(names);
   const profile = {
@@ -92,7 +94,7 @@ export async function profileRepository(root, revision) {
     else if (files.has('package-lock.json') || files.has('npm-shrinkwrap.json')) profile.setupCandidates.push(['npm', 'ci']);
     else if (files.has('bun.lock') || files.has('bun.lockb')) profile.setupCandidates.push(['bun', 'install', '--frozen-lockfile']);
     else profile.setupCandidates.push(['npm', 'install']);
-    const raw = await showFromMirror(root, revision, 'package.json');
+    const raw = await showFromGitDir(root, gitDir, revision, 'package.json');
     if (raw) {
       try {
         const pkg = JSON.parse(raw);

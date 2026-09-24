@@ -768,17 +768,23 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
         throw new TheaterError('base_revision must identify the exact source commit, not a hexadecimal ref name.', 'INVALID_REVISION');
       }
       // An exact sibling commit needs the cache only as a clone seed, so canonical source may be unavailable;
-      // its default HEAD and profile hints are then reported as cached rather than refreshed.
+      // its default HEAD is reported as cached rather than refreshed.
       const canonicalSource = selectedBase ? 'cached' : 'refreshed';
       const refreshed = selectedBase ? await inspectMirror(root) : await refreshMirror(root);
-      const profile = await profileRepository(root, refreshed.defaultRevision);
+      // The cached default profile describes only the refreshed canonical default.
+      const defaultProfile = selectedBase ? null : await profileRepository(root, refreshed.defaultRevision);
       if (!selectedBase) {
         ctx.config.defaultRevision = refreshed.defaultRevision;
         ctx.config.defaultBranch = refreshed.defaultBranch;
-        ctx.config.repositoryProfile = profile;
+        ctx.config.repositoryProfile = defaultProfile;
       }
       const base = selectedBase || await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
       const clone = await createFeatureCheckout(root, ctx.config, slug, base, baseRepository);
+      // Setup and check hints describe the lane's own committed base, which may be a sibling-only
+      // or nondefault commit; the new clone is the one object store guaranteed to contain it.
+      const profile = defaultProfile && base === refreshed.defaultRevision
+        ? defaultProfile
+        : await profileRepository(root, base, path.join(clone.destination, '.git'));
       let fingerprint;
       try { fingerprint = await checkoutFingerprint(clone.destination); }
       catch (error) { fingerprint = unavailableFingerprint(error); }
