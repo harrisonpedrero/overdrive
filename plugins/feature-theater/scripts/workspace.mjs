@@ -34,6 +34,7 @@ import {
   inspectMirror,
   mirrorPath,
   profileRepository,
+  readCommitIdentity,
   refreshMirror,
   repositorySnapshot,
   resolveMirrorRevision,
@@ -470,6 +471,13 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
   catch (error) { snapshot = { unavailable: error.message }; }
+  let identity = null;
+  if (!snapshot.unavailable) {
+    try { identity = await readCommitIdentity(feature.checkout_path); } catch { identity = null; }
+  }
+  const identityLine = identity
+    ? `- Commit identity: ${identity.summary}${identity.automation || !identity.author || !identity.committer ? `. Lane-local override: run ${identity.override.map(command => `\`${command}\``).join(' then ')}` : ''}\n`
+    : '';
   const detailFiles = await writeWorkDetails(ctx, feature, work);
   const workLines = work.length
     ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}${detailFiles.has(item.item_key) ? `\n  - ${item.item_key} description and acceptance: ${detailFiles.get(item.item_key)}` : ''}`).join('\n')
@@ -477,9 +485,9 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
-  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${caveat ? `- CHECKOUT FRESHNESS CAVEAT: ${caveat.message}\n` : ''}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}${caveat ? `- CHECKOUT FRESHNESS CAVEAT: ${caveat.message}\n` : ''}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'context.md'), packet);
-  return { feature, work, checkpoint, evidence, pending, snapshot, checkoutCaveat: caveat };
+  return { feature, work, checkpoint, evidence, pending, snapshot, commitIdentity: identity, checkoutCaveat: caveat };
 }
 
 async function existingInitialization(root, normalized) {
@@ -813,7 +821,8 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const specBody = initialSpec || `# ${cleanTitle}\n\n## Outcome\n\n${cleanOutcome}\n\n## User-visible behavior\n\n## Constraints and compatibility\n\n## Acceptance criteria\n\n## Out of scope\n\n## Open decisions\n`;
       await atomicWrite(root, contained(root, '.theater', 'features', slug, 'spec.md'), `${specBody.trim()}\n`);
       await writeFeatureAgentFile(ctx, row);
-      await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination, baseFeature: baseSlug, baseRevision: base } });
+      const { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } = clone.commitIdentity;
+      await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination, baseFeature: baseSlug, baseRevision: base, commitIdentity: { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
       await writeJson(root, contained(root, 'theater.json'), ctx.config);
@@ -822,9 +831,10 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
         baseFeature: baseSlug,
         repositoryProfile: profile,
         canonicalSource: { status: canonicalSource, defaultRevision: refreshed.defaultRevision, defaultBranch: refreshed.defaultBranch },
+        commitIdentity: clone.commitIdentity,
         contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
         specPath: contained(root, '.theater', 'features', slug, 'spec.md'),
-        next: initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call theater_spec_update.',
+        next: `${initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call theater_spec_update.'}${clone.commitIdentity.automation ? ' Disclose that this lane commits as the OVERDRIVE automation identity and show the optional lane-local override from commitIdentity.override; work and commits need not wait for an answer.' : clone.commitIdentity.overridden ? ' Disclose that inherited Git identity overrides decide this lane\'s author and committer (see commitIdentity).' : ''}`,
       };
     } finally { ctx.db.close(); }
   });
@@ -893,6 +903,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       verification: verificationStatus(ctx, row, projection.snapshot.head),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
+      commitIdentity: projection.commitIdentity,
       checkoutCaveat: projection.checkoutCaveat,
       timeline,
       contextPath: contained(ctx.root, '.theater', 'features', row.slug, 'context.md'),

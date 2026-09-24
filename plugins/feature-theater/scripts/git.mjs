@@ -138,6 +138,117 @@ export async function profileRepository(root, revision, gitDir = mirrorPath(root
   return profile;
 }
 
+export const AUTOMATION_IDENTITY = Object.freeze({ name: 'OVERDRIVE', email: 'overdrive@local.invalid' });
+// Command-line and environment scopes belong to one process, so only file-backed config can supply
+// an identity a later worker commit will also see.
+const DURABLE_SCOPES = new Set(['system', 'global', 'local', 'worktree']);
+
+// Variables that take precedence over Git config for a commit made in this process's environment,
+// which lane workers inherit.
+const IDENTITY_ENVIRONMENT = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT'];
+const PROVENANCE_MARKERS = { 'overdrive.identity': 'identity', 'overdrive.identityorigin': 'origin', 'overdrive.identitysource': 'source' };
+
+// Reads user.name/user.email from durable Git config (last value wins, as for a commit) plus the
+// clone-local OVERDRIVE provenance markers. -C keeps a missing repository a Git failure, not a launch
+// failure; `readable` is false when Git could not read the repository at all.
+async function configuredIdentity(repository, scope = null) {
+  const result = await run(['git', '-C', repository, 'config', ...(scope ? [`--${scope}`] : []), '--show-scope', '--get-regexp', '^(user\\.(name|email)|overdrive\\.identity(origin|source)?)$'], { allowFailure: true });
+  const identity = { readable: result.exitCode === 0 || result.exitCode === 1, marker: {} };
+  if (result.exitCode !== 0) return identity;
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const match = line.match(/^([a-z]+)\t(user\.name|user\.email|overdrive\.identity(?:origin|source)?)(?: (.*))?$/);
+    if (!match || !DURABLE_SCOPES.has(match[1])) continue;
+    const value = (match[3] ?? '').trim();
+    if (match[2].startsWith('overdrive.')) {
+      if (match[1] === 'local') identity.marker[PROVENANCE_MARKERS[match[2]]] = value;
+      continue;
+    }
+    const key = match[2].slice('user.'.length);
+    if (value) identity[key] = { value, scope: match[1] };
+    else delete identity[key];
+  }
+  return identity;
+}
+
+const identityComplete = identity => Boolean(identity.name && identity.email);
+const formatIdent = ident => ident ? `${ident.name} <${ident.email}>` : null;
+
+// Git's own resolution for a commit here: environment, command-line config, then config files.
+async function effectiveIdent(repository, variable) {
+  const result = await run(['git', '-C', repository, 'var', variable], { allowFailure: true });
+  const match = result.exitCode === 0 ? result.stdout.match(/^(.*) <([^<>]*)> \d+ [+-]\d{4}$/) : null;
+  return match ? { name: match[1], email: match[2] } : null;
+}
+
+async function recordProvenance(destination, name, email, origin, source = null) {
+  await git(destination, 'config', '--local', 'user.name', name);
+  await git(destination, 'config', '--local', 'user.email', email);
+  await git(destination, 'config', '--local', 'overdrive.identityOrigin', origin);
+  await git(destination, 'config', '--local', 'overdrive.identity', `${name} <${email}>`);
+  if (source) await git(destination, 'config', '--local', 'overdrive.identitySource', source);
+}
+
+// Describes the author and committer a commit in this checkout would actually get, and where the
+// configured identity came from. Provenance recorded by OVERDRIVE applies only while the clone-local
+// identity still matches it.
+export async function readCommitIdentity(repository, note = null) {
+  const [configured, author, committer] = await Promise.all([
+    configuredIdentity(repository), effectiveIdent(repository, 'GIT_AUTHOR_IDENT'), effectiveIdent(repository, 'GIT_COMMITTER_IDENT'),
+  ]);
+  const complete = identityComplete(configured);
+  const pair = complete ? `${configured.name.value} <${configured.email.value}>` : null;
+  const scope = complete ? (configured.name.scope === configured.email.scope ? configured.name.scope : `${configured.name.scope}+${configured.email.scope}`) : null;
+  const recorded = scope === 'local' && configured.marker.identity === pair ? configured.marker.origin : null;
+  const origin = !complete ? 'missing'
+    : recorded === 'source' || recorded === 'automation' ? recorded
+      : scope === 'local' && pair === formatIdent(AUTOMATION_IDENTITY) ? 'automation' : 'configured';
+  const label = origin === 'automation' ? 'OVERDRIVE automation fallback in clone-local config; no human identity was configured'
+    : origin === 'source' ? `copied into clone-local config from the adopted local source${configured.marker.source ? ` ${configured.marker.source}` : ''}`
+      : origin === 'configured' ? `${scope === 'local' ? 'clone-local' : scope} Git config` : 'no complete user.name and user.email in Git config';
+  const environment = IDENTITY_ENVIRONMENT.filter(key => process.env[key]);
+  const overridden = Boolean(author && committer) && (formatIdent(author) !== pair || formatIdent(committer) !== pair);
+  const automation = formatIdent(author) === formatIdent(AUTOMATION_IDENTITY) && formatIdent(committer) === formatIdent(AUTOMATION_IDENTITY);
+  let summary;
+  if (!author || !committer) summary = `No usable commit identity (${label}); commits in this clone will fail until a lane-local user.name and user.email are set.`;
+  else if (overridden) summary = `Author ${formatIdent(author)}, committer ${formatIdent(committer)} · this environment's ${environment.length ? environment.join(', ') : 'Git overrides'} take precedence over ${pair ?? 'Git config'} (${label})`;
+  else summary = `${pair} · ${label}`;
+  return {
+    author: formatIdent(author),
+    committer: formatIdent(committer),
+    name: complete ? configured.name.value : null,
+    email: complete ? configured.email.value : null,
+    scope,
+    origin,
+    source: origin === 'source' ? configured.marker.source ?? null : null,
+    automation,
+    overridden,
+    environment,
+    override: [`git -C "${repository}" config user.name "Your Name"`, `git -C "${repository}" config user.email "you@example.com"`],
+    summary: note ? `${summary}. ${note}` : summary,
+  };
+}
+
+// Keeps an explicit clone identity, carries an adopted local source's repository-local pair (which
+// outranks global config in that source too), keeps any other complete configured identity, and
+// otherwise attributes commits in this clone only to OVERDRIVE automation. Global and system config
+// are never written, and no human author is invented. Environment overrides are reported, not changed.
+async function configureCommitIdentity(destination, config) {
+  const current = await configuredIdentity(destination);
+  const explicit = [current.name?.scope, current.email?.scope].every(scope => scope === 'local' || scope === 'worktree');
+  if (identityComplete(current) && explicit) return readCommitIdentity(destination);
+  let note = null;
+  if (config.repositoryKind === 'local') {
+    const source = await configuredIdentity(config.repository, 'local');
+    if (identityComplete(source)) {
+      await recordProvenance(destination, source.name.value, source.email.value, 'source', config.repository);
+      return readCommitIdentity(destination);
+    }
+    if (!source.readable) note = `The adopted local source ${config.repository} could not be read, so its repository-local identity was not considered`;
+  }
+  if (!identityComplete(current)) await recordProvenance(destination, AUTOMATION_IDENTITY.name, AUTOMATION_IDENTITY.email, 'automation');
+  return readCommitIdentity(destination, note);
+}
+
 export async function createFeatureCheckout(root, config, slug, baseRevision, baseRepository = mirrorPath(root)) {
   const destinationRoot = await ensureManagedPath(root, featureRoot(root, slug));
   const destination = await ensureManagedPath(root, checkoutPath(root, slug));
@@ -154,7 +265,8 @@ export async function createFeatureCheckout(root, config, slug, baseRevision, ba
     await git(destination, 'remote', 'set-url', 'origin', config.repository);
     await git(destination, 'config', 'fetch.prune', 'true');
     await fs.appendFile(path.join(destination, '.git', 'info', 'exclude'), '\n/.theater/\n', 'utf8');
-    return { destination, branch };
+    const commitIdentity = await configureCommitIdentity(destination, config);
+    return { destination, branch, commitIdentity };
   } catch (error) {
     throw new TheaterError(error.message, error.code || 'CHECKOUT_FAILED', {
       checkoutPath: destination, featurePath: destinationRoot, baseRevision,
