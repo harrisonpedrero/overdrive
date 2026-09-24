@@ -77,17 +77,17 @@ export function assertAgentIdle(feature) {
 }
 
 // A Claude worker process can outlive its completed turn and still change the checkout, so an idle
-// lane is verified only once its clean exit or a coordinator attestation has cleared every guard.
+// lane is verified or completed only once its clean exit or a coordinator attestation has cleared every guard.
 // Tools launched by a worker stopped without its process tree can likewise outlive it, so an
 // unconfirmed-descendants marker blocks verification until an attestation clears it.
 export function assertWorkersStopped(db, feature) {
   const guards = parseJson(meta(db, workersKey(feature.id)), []);
   if (guards.length) {
-    throw new TheaterError('A worker process from this lane has not confirmed its exit. Wait for it to stop, or stop the lane with an attestation, before verifying or recording a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
+    throw new TheaterError('A worker process from this lane has not confirmed its exit. Wait for it to stop, or stop the lane with an attestation, before verifying, recording or accepting a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
   }
   const marker = unconfirmedDescendants(db, feature.id);
   if (marker) {
-    throw new TheaterError(`Tools launched by a stopped worker of this lane may still be running, so checks and candidate recording must wait. Confirm no process is running in its checkout, then pause the lane with theater_feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
+    throw new TheaterError(`Tools launched by a stopped worker of this lane may still be running, so checks, candidate recording and completion must wait. Confirm no process is running in its checkout, then pause the lane with theater_feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
   }
 }
 

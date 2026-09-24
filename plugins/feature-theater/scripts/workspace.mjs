@@ -1259,6 +1259,7 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
     let completionCandidate = null;
     if (status === 'done') {
       assertAgentIdle(row);
+      assertWorkersStopped(ctx.db, row);
       const progress = progressFor(ctx.db, row.id);
       if (progress.open > 0) throw new TheaterError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
       completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY rowid DESC LIMIT 1").get(row.id);
@@ -1281,8 +1282,17 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       const projected = featureBySlug(ctx.db, slug).next_action;
       const terminal = projected === ARCHIVED_ACTION || (projected === PAUSED_ACTION && status !== 'paused');
       const resumed = ctx.db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(row.id) ? CANDIDATE_REVIEW_ACTION : workGraphAction(workItems(ctx.db, row.id));
-      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : ''}`)
+      // Completion is refused on the same stopped-state condition, re-read in the write itself, so a
+      // turn, worker guard or descendant marker recorded while the checkout was read cannot slip through.
+      // Like assertAgentIdle, it also refuses a running status saved without a turn ID.
+      const stopped = ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}`;
+      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? stopped : completionCandidate ? `${stopped} AND agent_status IS NOT 'running'` : ''}`)
         .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, terminal ? 1 : 0, resumed, stamp, row.id);
+      if (!changed.changes && completionCandidate) {
+        const current = featureBySlug(ctx.db, slug);
+        assertAgentIdle(current);
+        assertWorkersStopped(ctx.db, current);
+      }
       if (!changed.changes) throw new TheaterError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
       if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
       const saved = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);

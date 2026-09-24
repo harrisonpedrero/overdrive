@@ -551,6 +551,101 @@ test('an unconfirmed-descendants marker blocks checks and candidates until an at
   assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => candidate.status), ['ready']);
 });
 
+test('a worker guard or unconfirmed-descendants marker blocks completion until it clears', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-completion-worker-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'finishing' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Finishing', description: 'Completion waits for stopped workers.' });
+  await createFeature({ ...args, title: 'Finishing', outcome: 'Accepted only after its worker exits.', spec: '# Finishing\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(args)).verification.ready, true);
+  const { candidateId } = await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
+  // The turn completed and the lane reads idle, but its worker process has not exited yet.
+  await bindAgentSession({ ...args, thread_id: 'claude-thread', harness: 'claude' });
+  await registerWorkerGuard({ ...args, thread_id: 'claude-thread', guard_id: 'live-process' });
+  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
+  const unchanged = async (before, refusal) => {
+    await assert.rejects(setFeatureStatus({ ...args, status: 'done' }), refusal);
+    const after = await getFeatureContext(args);
+    assert.equal(after.feature.status, 'review');
+    assert.deepEqual(after.candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'ready']]);
+    assert.deepEqual(after.candidates, before.candidates);
+    assert.deepEqual(after.timeline, before.timeline);
+  };
+  const guarded = await getFeatureContext(args);
+  assert.equal(guarded.feature.agent.status, 'idle');
+  assert.equal(guarded.verification.ready, true);
+  await unchanged(guarded, error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /worker process/.test(error.message));
+
+  // The worker exits, but a stop without its process tree leaves its tools unconfirmed.
+  await clearWorkerGuards({ ...args, guard_id: 'live-process' });
+  const marker = await markDescendantsUnconfirmed({ ...args, thread_id: 'claude-thread', turn_id: 'turn-1', summary: 'The worker was stopped without its process tree.' });
+  await unchanged(await getFeatureContext(args), error => error.code === 'AGENT_BUSY' && error.details?.unconfirmedDescendants === true && error.details?.turnId === 'turn-1'
+    && /may still be running/.test(error.message) && /prior_turn_attestation/.test(error.message));
+
+  assert.equal((await attestDescendantsStopped({ ...args, evidence: 'No process runs in the checkout.', generation: marker.generation })).cleared, true);
+  const done = await setFeatureStatus({ ...args, status: 'done' });
+  assert.equal(done.feature.status, 'done');
+  assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'accepted']]);
+});
+
+test('a worker guard or running status saved while completion reads the checkout still refuses it', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-completion-race-'));
+  const started = path.join(workspace, 'snapshot-started');
+  const release = path.join(workspace, 'snapshot-release');
+  t.after(async () => {
+    await fs.writeFile(release, '');
+    await fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const args = { workspace_path: workspace, feature: 'racing' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Racing', description: 'Completion rechecks workers as it writes.' });
+  const lane = await createFeature({ ...args, title: 'Racing', outcome: 'Never accepted beside a live worker.', spec: '# Racing\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  assert.equal((await runChecks(args)).verification.ready, true);
+  const { candidateId } = await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
+  await bindAgentSession({ ...args, thread_id: 'claude-thread', harness: 'claude' });
+  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
+  // An fsmonitor hook holds the first git status of each round, the completion's, until the late
+  // state below is saved; later calls pass. Its failure exit makes git scan the clean checkout normally.
+  const hook = path.join(workspace, 'hold-status.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs';
+let first = false;
+try { fs.writeFileSync(${JSON.stringify(started)}, '', { flag: 'wx' }); first = true; } catch {}
+if (first) {
+  for (let waited = 0; !fs.existsSync(${JSON.stringify(release)}) && waited < 20000; waited += 20) await new Promise(resolve => setTimeout(resolve, 20));
+}
+process.exit(1);
+`);
+  const slash = value => value.replaceAll('\\', '/');
+  await git(lane.feature.checkoutPath, 'config', 'core.fsmonitor', `"${slash(process.execPath)}" "${slash(hook)}"`);
+  const raced = async (interject, refusal) => {
+    await fs.rm(started, { force: true });
+    await fs.rm(release, { force: true });
+    const completing = setFeatureStatus({ ...args, status: 'done' });
+    completing.catch(() => {});
+    for (let attempt = 0; !(await fs.stat(started).catch(() => null)); attempt++) {
+      assert.ok(attempt < 500, 'completion never reached its checkout snapshot');
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await interject();
+    await fs.writeFile(release, '');
+    await assert.rejects(completing, refusal);
+    const refused = await getFeatureContext(args);
+    assert.equal(refused.feature.status, 'review');
+    assert.deepEqual(refused.candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'ready']]);
+    assert.equal(refused.timeline.some(event => event.kind === 'feature.done'), false);
+  };
+  await raced(() => registerWorkerGuard({ ...args, thread_id: 'claude-thread', guard_id: 'late-process' }),
+    error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /worker process/.test(error.message));
+  await clearWorkerGuards({ ...args, guard_id: 'late-process' });
+  // A running status saved without a turn ID is busy to assertAgentIdle, so the write refuses it too.
+  await raced(() => saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'running' }),
+    error => error.code === 'AGENT_BUSY' && /Wait for the feature agent to stop/.test(error.message));
+  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
+  assert.equal((await setFeatureStatus({ ...args, status: 'done' })).feature.status, 'done');
+  assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'accepted']]);
+});
+
 test('a queued check waits for a direct run in its clone and is judged once that run settles', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-direct-overlap-'));
   const release = path.join(workspace, 'release');
