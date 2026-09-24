@@ -11,7 +11,14 @@ export const CHECK_QUEUE_META = 'checks:queue';
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
 
+// A direct check whose command was not confirmed stopped first records this marker in the lane's
+// database, so the clone stays reserved even if its interrupted queue job cannot be written.
+// Resolving that job with execution_stopped clears it.
+export const uncertainCheckKey = featureId => `checks-uncertain:${featureId}`;
+
 export function assertCheckReservation(db, featureId, receiptId = null) {
+  const marker = parseJson(meta(db, uncertainCheckKey(featureId)), null);
+  if (marker) throw new TheaterError(`Verification job ${marker.jobKey} reserves this clone because its check command may still be running. Confirm it and its children stopped, then resolve the job with execution_stopped.`, 'CHECK_EXECUTION_RESERVED');
   const raw = meta(db, CHECK_QUEUE_META);
   if (!raw) return;
   const queue = JSON.parse(raw);
@@ -19,6 +26,17 @@ export function assertCheckReservation(db, featureId, receiptId = null) {
   const reserved = queue.jobs.find(job => job.featureId === featureId && ['running', 'interrupted'].includes(job.status)
     && !(job.status === 'running' && receiptId && job.attempts.at(-1)?.receiptId === receiptId));
   if (reserved) throw new TheaterError(`Verification job ${reserved.key} reserves this clone. Inspect the queue and resolve uncertain execution before reusing it.`, 'CHECK_EXECUTION_RESERVED');
+}
+
+// Records a directly run check whose command may still be running as an interrupted queue job, so
+// the clone stays reserved exactly as for an interrupted queued check until the coordinator confirms
+// execution stopped. The caller holds the verification-queue lock.
+export function reserveInterruptedCheck(db, job) {
+  const raw = meta(db, CHECK_QUEUE_META);
+  const queue = raw ? JSON.parse(raw) : { version: 1, runner: null, jobs: [] };
+  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new TheaterError('Unsupported verification queue state.', 'INVALID_STATE');
+  queue.jobs.push(job);
+  meta(db, CHECK_QUEUE_META, JSON.stringify(queue));
 }
 
 function schema(db) {

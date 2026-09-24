@@ -87,7 +87,7 @@ export const TOOLS = [
     max_checks: integer('Maximum admissions in this call; defaults to 10.', 1, 50),
     admission_seconds: integer('Stop admitting new jobs after this many seconds, default 60. Already admitted checks finish under their configured deadlines; this is not a call timeout.', 1, 300),
   }, ['workspace_path']), { destructiveHint: false, openWorldHint: true }),
-  tool('theater_checks_resolve', 'Resolve stopped verification', 'After inspecting a failure or interrupted command, explicitly retry its unchanged binding or cancel it. Changed commits/contracts require new jobs. Interrupted execution retains resources until command termination is established.', object({
+  tool('theater_checks_resolve', 'Resolve stopped verification', 'After inspecting a failure or interrupted command, explicitly retry its unchanged binding or cancel it. Changed commits/contracts require new jobs. Interrupted execution, including a direct theater_checks_run job whose command was not confirmed stopped, retains resources until command termination is established.', object({
     ...workspace, job_key: string('Queue job key.'), action: string('Resolution.', { enum: ['retry', 'cancel'] }),
     reason: string('Observed cause and resolution; for interruption, include how command and child-process termination was established.'),
     execution_stopped: boolean('Required true for interrupted jobs, only after verifying the old command and children stopped.'),
@@ -113,7 +113,7 @@ export const TOOLS = [
     }, ['key', 'purpose', 'argv']) },
   }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),
 
-  tool('theater_checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature, stopping at the first failure for inspection. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract.', object({
+  tool('theater_checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature, stopping at the first failure for inspection. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract. A timed-out command whose process tree cannot be confirmed stopped fails with COMMAND_TERMINATION_UNCERTAIN and no receipt; its interrupted job then reserves the clone until theater_checks_resolve.', object({
     ...workspace, ...feature,
     check_keys: { type: 'array', minItems: 1, maxItems: 50, uniqueItems: true, items: string('Exact configured check key.'), description: 'Optional nonempty selection of known checks, executed in saved order. Omit to run all. Does not edit the contract or create receipts for omitted checks.' },
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),

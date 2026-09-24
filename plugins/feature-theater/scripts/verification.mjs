@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { checkOutcome } from './check-outcome.mjs';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, transaction, workGraphAction, workItems } from './state.mjs';
+import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { unconfirmedDescendants, workersKey } from './ownership.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
@@ -263,6 +263,36 @@ export async function updateChecks(args) {
   });
 }
 
+// The queue marks its own job interrupted when runChecks throws without a receipt; a direct run
+// records an equivalent interrupted job, which blocks further checks, candidates, completion and
+// dispatch in this clone until theater_checks_resolve confirms execution_stopped. The lane marker
+// is written first, under the control lock already held, so a queue that cannot be written still
+// leaves the clone reserved.
+async function reserveUncertainExecution(ctx, feature, check, { revision, contract, startedAt, queued }, error) {
+  const reason = redactString(error.message);
+  const job = queued ? null : {
+    key: `direct-${randomUUID()}`, feature: feature.slug, featureId: feature.id, checkKey: check.key, revision, contractHash: contract,
+    dependsOn: [], resources: [], status: 'interrupted', queuedAt: startedAt, eligibleAt: startedAt, direct: true,
+    reason: `Direct check run without a confirmed stop: ${reason} Establish command termination before releasing its clone.`,
+    attempts: [{ receiptId: newId('evidence'), status: 'interrupted', startedAt, queueWaitMs: 0, eligibleWaitMs: 0, finishedAt: null, executionMs: null }],
+  };
+  let reservationError = null;
+  if (job) {
+    meta(ctx.db, uncertainCheckKey(feature.id), JSON.stringify({ jobKey: job.key, checkKey: check.key, revision, at: now() }));
+    try { await withWorkspaceLock(ctx.root, 'verification-queue', () => reserveInterruptedCheck(ctx.db, job)); }
+    catch (caught) { reservationError = redactString(caught.message); }
+  }
+  const reservedBy = job?.key ?? null;
+  recordEvent(ctx.db, {
+    featureId: feature.id, kind: 'checks.execution_uncertain',
+    summary: `${check.purpose}: no receipt recorded because its command may still be running${reservedBy ? `; queue job ${reservedBy} reserves this clone` : ''}.`,
+    details: { checkKey: check.key, revision, pid: error.details?.pid ?? null, commandExited: error.details?.commandExited ?? null, reservedBy, reservationError },
+  });
+  const guidance = queued ? 'Its queue job stays interrupted' : `Job ${reservedBy} reserves this clone${reservationError ? ` (recorded on the lane only; the queue could not be updated: ${reservationError})` : ''}`;
+  return new TheaterError(`${reason} No receipt was recorded. ${guidance} until theater_checks_resolve confirms execution_stopped after you verify the command and its children stopped.`, error.code,
+    { ...error.details, output: redactString(error.details?.output ?? ''), checkKey: check.key, reservedBy, reservationError });
+}
+
 export async function runChecks(args, execution = {}) {
   return withFeature(args, async (ctx, feature) => {
     assertCheckReservation(ctx.db, feature.id, execution.receiptId);
@@ -304,8 +334,13 @@ export async function runChecks(args, execution = {}) {
       let existing = null;
       try { existing = await artifactFiles(feature.checkout_path, artifactPaths(check.artifact_paths)); } catch { existing = null; }
       let result;
-      try { result = await run(check.argv, { cwd: feature.checkout_path, timeoutMs: check.timeout_seconds * 1000, maxOutput: 500_000, allowFailure: true }); }
-      catch (error) { result = { exitCode: null, stderr: error.message, stdout: '', durationMs: 0 }; }
+      const startedAt = now();
+      try { result = await run(check.argv, { cwd: feature.checkout_path, timeoutMs: check.timeout_seconds * 1000, maxOutput: 500_000, allowFailure: true, confirmTermination: true }); }
+      catch (error) {
+        // A command that may still be running has not completed: it gets no receipt and keeps its clone reserved.
+        if (error?.code === 'COMMAND_TERMINATION_UNCERTAIN') throw await reserveUncertainExecution(ctx, feature, check, { revision: before.head, contract, startedAt, queued: Boolean(execution.receiptId) }, error);
+        result = { exitCode: null, stderr: error.message, stdout: '', durationMs: 0 };
+      }
       const id = execution.receiptId ?? newId('evidence');
       try { archived = await archiveCheckArtifacts(ctx, feature, check, id, before.head, existing); artifact = archived?.manifest ?? null; }
       catch (error) { artifactError = redactString(error.message); }

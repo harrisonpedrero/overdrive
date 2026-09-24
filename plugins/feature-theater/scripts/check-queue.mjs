@@ -193,7 +193,8 @@ export async function drainCheckQueue(args) {
         const current = queue.jobs.find(item => item.key === job.key);
         const evidence = receipt(ctx, current);
         if (evidence) finish(current, evidence);
-        else if (['AGENT_BUSY', 'WORKSPACE_BUSY'].includes(error?.code)) {
+        // A lane reservation outside the queue (a direct run's marker) refuses the job before its command starts.
+        else if (['AGENT_BUSY', 'WORKSPACE_BUSY', 'CHECK_EXECUTION_RESERVED'].includes(error?.code)) {
           current.status = 'queued'; current.reason = error.message; deferred.add(job.key);
           Object.assign(current.attempts.at(-1), { status: 'deferred', finishedAt: now(), executionMs: 0 });
         } else {
@@ -272,16 +273,25 @@ export async function resolveCheckJob(args) {
   if (!['retry', 'cancel'].includes(args.action)) throw new TheaterError('Action must be retry or cancel.', 'INVALID_INPUT');
   return access(await resolveWorkspace(args.workspace_path), async (ctx, queue) => {
     const job = queue.jobs.find(item => item.key === key);
-    if (!job) throw new TheaterError('Queue job not found.', 'INVALID_INPUT');
-    if (job.status === 'running' || job.status === 'passed') throw new TheaterError('Running or passing jobs cannot be resolved or rerun.', 'INVALID_INPUT');
-    if (job.status === 'interrupted' && args.execution_stopped !== true) throw new TheaterError('First establish that the previous command and its children stopped, then confirm execution_stopped.', 'EXECUTION_UNCERTAIN');
-    if (args.action === 'retry') {
+    // A direct run's lane marker names its job, and may be all that was recorded if the queue could not be written.
+    const marker = ctx.db.prepare("SELECT key FROM meta WHERE key LIKE 'checks-uncertain:%' AND json_extract(value, '$.jobKey') = ?").get(key);
+    if (!job && !marker) throw new TheaterError('Queue job not found.', 'INVALID_INPUT');
+    if (job?.status === 'running' || job?.status === 'passed') throw new TheaterError('Running or passing jobs cannot be resolved or rerun.', 'INVALID_INPUT');
+    if ((marker || job.status === 'interrupted') && args.execution_stopped !== true) throw new TheaterError('First establish that the previous command and its children stopped, then confirm execution_stopped.', 'EXECUTION_UNCERTAIN');
+    if (!job && args.action === 'retry') throw new TheaterError('This reservation has no queue job to retry; cancel it, then run or queue the check again.', 'INVALID_INPUT');
+    if (job && args.action === 'retry') {
       assertAgentIdle(await binding(ctx, job));
       job.queuedAt = now(); job.eligibleAt = null;
     }
+    const resolution = { action: args.action, reason, at: now(), executionStopped: args.execution_stopped === true };
+    if (marker) {
+      ctx.db.prepare('DELETE FROM meta WHERE key = ?').run(marker.key);
+      recordEvent(ctx.db, { featureId: marker.key.slice('checks-uncertain:'.length), kind: 'checks.execution_resolved', summary: `Released the clone reserved by check job ${key}: ${reason}`, details: { jobKey: key, resolution } });
+    }
+    if (!job) return { job: { key, status: 'cancelled', resolution } };
     job.status = args.action === 'retry' ? 'queued' : 'cancelled';
     job.reason = reason;
-    job.resolution = { action: args.action, reason, at: now(), executionStopped: args.execution_stopped === true };
+    job.resolution = resolution;
     return { job };
   });
 }

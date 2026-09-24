@@ -142,7 +142,14 @@ function commandDescription(argv) {
 
 // binary returns stdout as a byte-exact Buffer capped at maxOutput bytes, for output such as raw
 // Git paths that must never pass through per-chunk text decoding.
-export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, binary = false } = {}) {
+// On Windows a timed-out command's process tree is ended with taskkill /T; when taskkill cannot
+// run, fails or stalls, the command itself is terminated directly, which cannot reach processes it
+// started. The result waits for taskkill's outcome, and settles within two grace periods of the
+// deadline even if a surviving process keeps the output open. A tree not confirmed stopped is
+// named as terminationUncertain in a timed-out result or in the COMMAND_FAILED message; with
+// confirmTermination it rejects with COMMAND_TERMINATION_UNCERTAIN instead. Only this child's PID
+// is ever targeted, and never after it has exited.
+export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, binary = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new TheaterError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
@@ -194,27 +201,66 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
     child.stdout.on('data', chunk => { if (binary) collectBytes(chunk); else stdout = collect(stdout, chunk); });
     child.stderr.on('data', chunk => { stderr = collect(stderr, chunk); });
     let timedOut = false;
+    let unconfirmed = null;
+    let killing = false;
+    let closed = null;
+    let settled = false;
+    let closeDeadline = null;
+    const exited = () => child.exitCode !== null || child.signalCode !== null;
+    const uncertain = reason => new TheaterError(`${commandDescription(argv)} passed its deadline and ${reason}; processes it started may still be running.`, 'COMMAND_TERMINATION_UNCERTAIN',
+      { pid: child.pid, commandExited: exited(), output: `${binary ? '' : stdout}\n${stderr}`.trim().slice(-4_000) });
+    const stopDirectly = reason => {
+      unconfirmed ??= reason;
+      if (!exited()) { try { child.kill(); } catch { /* reported by the close deadline */ } }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      if (process.platform === 'win32') {
-        const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', shell: false });
-        killer.once('error', () => child.kill());
-      } else {
+      if (process.platform !== 'win32') {
         try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill(); }
+        return;
       }
+      closeDeadline = setTimeout(() => settle(`did not close within ${Math.ceil(2 * terminationGraceMs / 1000)}s of it (${unconfirmed ?? 'taskkill did not stop it'})`), 2 * terminationGraceMs);
+      // Output still open after the command exited means a descendant holds it, and that tree can no
+      // longer be targeted safely through a PID that may have been reused.
+      if (exited()) { unconfirmed ??= 'had already exited while its output stayed open, so its process tree could not be targeted'; return; }
+      killing = true;
+      const killed = reason => { clearTimeout(stalled); killing = false; if (reason) stopDirectly(reason); settle(); };
+      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', shell: false });
+      const stalled = setTimeout(() => { killer.kill(); killed('taskkill did not finish'); }, terminationGraceMs);
+      killer.once('error', error => killed(`taskkill could not run (${error.message})`));
+      killer.once('exit', code => killed(code === 0 ? null : `taskkill exited ${code ?? 'without a code'}`));
     }, timeoutMs);
-    child.once('error', error => {
+    child.on('error', error => {
+      // A failed direct termination emits here too; the close deadline reports that command.
+      if (process.platform === 'win32' && timedOut && child.pid !== undefined) { unconfirmed ??= `stopping it failed (${error.message})`; return; }
+      settled = true;
       clearTimeout(timer);
+      clearTimeout(closeDeadline);
       reject(new TheaterError(`Unable to launch ${argv[0]}: ${error.message}`, 'COMMAND_LAUNCH_FAILED'));
     });
     child.once('close', code => {
       clearTimeout(timer);
+      closed = { code, durationMs: Date.now() - started };
+      settle();
+    });
+    // The command can close before taskkill reports, so a close also waits for its outcome. The close
+    // deadline settles regardless and releases the output pipes a surviving process may still hold.
+    function settle(deadline = null) {
+      if (settled || (!deadline && (!closed || killing))) return;
+      settled = true;
+      clearTimeout(closeDeadline);
+      if (deadline) { child.stdout.destroy(); child.stderr.destroy(); }
+      const code = closed ? closed.code : child.exitCode;
+      const durationMs = closed ? closed.durationMs : Date.now() - started;
+      const uncertainty = deadline ?? (unconfirmed && `${unconfirmed}, so its process tree was not confirmed stopped`);
+      if (uncertainty && confirmTermination) return reject(uncertain(uncertainty));
+      const terminationUncertain = uncertainty ? `Passed its deadline and ${uncertainty}; processes it started may still be running.` : null;
       if (binary) stdout = Buffer.concat(bytes);
-      if (allowFailure) return resolve({ stdout: binary ? stdout : stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs: Date.now() - started, argv });
+      if (allowFailure) return resolve({ stdout: binary ? stdout : stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs, argv, ...(terminationUncertain ? { terminationUncertain } : {}) });
       if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput || binary ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
       const detail = stderr.trim().slice(-4_000) || (binary ? '' : stdout.trim().slice(-4_000)) || 'No output';
-      reject(new TheaterError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}: ${detail}`, 'COMMAND_FAILED'));
-    });
+      reject(new TheaterError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}${terminationUncertain ? ` (${terminationUncertain})` : ''}: ${detail}`, 'COMMAND_FAILED'));
+    }
   });
 }
 
