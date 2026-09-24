@@ -123,8 +123,11 @@ export function verificationStatus(ctx, feature, revision) {
       if (!savedBindings.has(row.contract_hash)) savedBindings.set(row.contract_hash, parseJson(meta(ctx.db, bindingKey(feature.id, row.contract_hash)), null));
       const saved = savedBindings.get(row.contract_hash);
       const known = saved?.version === 1 && /^[a-f0-9]{64}$/.test(saved.checks?.[check.key] ?? '');
+      // A same-binding failure still outranks any older receipt. A same-binding pass this check may not
+      // reuse proves nothing here, so the scan continues to an older receipt for this exact contract.
       if (known && saved.checks[check.key] === bindings[check.key]) {
-        if (check.reuse_same_revision || !row.passed) receipt = row;
+        if (!check.reuse_same_revision && row.passed) continue;
+        receipt = row;
         break;
       }
       if (!known && !row.passed && check.reuse_same_revision) { reuseBlockedBy = row.id; break; }

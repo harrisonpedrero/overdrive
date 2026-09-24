@@ -441,6 +441,57 @@ test('marker receipts must be eligible under the candidate contract; stale same-
   assert.deepEqual(await view(reusedCandidate.candidateId), { row: [reusedChecks, 'executed-receipts'], event: [reusedChecks, 'executed-receipts'] });
 });
 
+test('restoring an exact contract recognizes its receipt past newer passes from other contracts, but not past a newer failure', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-restore-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'restore' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Restore', description: 'Return to an earlier check contract.' });
+  const lane = await createFeature({ ...args, title: 'Restore', outcome: 'Exact receipts survive a contract round trip.', spec: '# Restore\n\nThe README exists.' });
+  await fs.appendFile(path.join(lane.feature.checkoutPath, '.git', 'info', 'exclude'), '\n.check-fails\n');
+  const readme = { key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] };
+  const optional = (purpose = 'Lint nothing') => ({ key: 'lint', purpose, required: false, argv: [process.execPath, '-e', ''] });
+  const status = async () => (await getFeatureContext(args)).verification;
+  const readmeStatus = async () => (await status()).checks.find(check => check.key === 'readme');
+
+  // A runs readme; A+optional adds an optional check without changing readme's binding and runs both at the same HEAD.
+  await updateChecks({ ...args, checks: [readme] });
+  const exact = (await runChecks(args)).receipts[0];
+  const contractA = (await status()).contractHash;
+  await updateChecks({ ...args, checks: [readme, optional()] });
+  const [newer] = (await runChecks(args)).receipts;
+  assert.notEqual(newer.id, exact.id);
+
+  // Returning to A finds A's own exact receipt behind the newer passing A+optional receipt.
+  await updateChecks({ ...args, checks: [readme] });
+  const restored = await status();
+  assert.equal(restored.contractHash, contractA);
+  assert.equal(restored.ready, true);
+  assert.deepEqual([restored.checks[0].status, restored.checks[0].receipt.id, restored.checks[0].reused], ['passed', exact.id, false]);
+  assert.deepEqual((await recordCandidate({ ...args, summary: 'Restored contract.' })).checks, [`readme: passed · receipt ${exact.id}`]);
+
+  // A contract with no exact receipt at this HEAD and no reuse policy stays missing despite equal-binding passes.
+  await updateChecks({ ...args, checks: [readme, optional('Lint something else')] });
+  const unproven = await status();
+  assert.equal(unproven.ready, false);
+  assert.deepEqual([unproven.checks[0].status, unproven.checks[0].receipt, unproven.checks[0].reuseBlockedBy], ['missing', null, undefined]);
+
+  // A newer same-binding failure under A+optional is not hidden by A's older exact success.
+  await updateChecks({ ...args, checks: [readme, optional()] });
+  await fs.writeFile(path.join(lane.feature.checkoutPath, '.check-fails'), 'fail');
+  const [failed] = (await runChecks({ ...args, check_keys: ['readme'] })).receipts;
+  assert.equal(failed.passed, false);
+  await updateChecks({ ...args, checks: [readme] });
+  const blocked = await readmeStatus();
+  assert.deepEqual([blocked.status, blocked.receipt.id, blocked.reused], ['failed', failed.id, true]);
+  assert.equal((await status()).ready, false);
+  await assert.rejects(recordCandidate({ ...args, summary: 'Hidden failure.' }), error => error.code === 'COMPLETION_NOT_PROVEN');
+
+  // A fresh exact run under A supersedes the failure.
+  await fs.rm(path.join(lane.feature.checkoutPath, '.check-fails'));
+  const [rerun] = (await runChecks(args)).receipts;
+  assert.deepEqual([(await readmeStatus()).receipt.id, (await status()).ready], [rerun.id, true]);
+});
+
 test('a Claude worker guard that outlives its completed turn blocks checks and candidates until it clears', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-live-worker-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
