@@ -1019,11 +1019,14 @@ export async function planWork({ workspace_path, feature, items }) {
         const saved = ctx.db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(row.id);
         archived = saved.status === 'archived';
         paused = saved.status === 'paused';
-        // An unchanged plan keeps an explicit checkpoint direction; otherwise the current candidate
-        // or work graph supplies guidance after any contract change has superseded its candidate.
+        // An unchanged plan keeps explicit checkpoint direction for a current candidate. Without
+        // candidate guidance, planning restores the work graph direction as before.
         if (!archived) {
-          const checkpointed = !changed && !contractChanged && ctx.db.prepare(`SELECT ${DIRECTION_CHECKPOINTED_SQL} AS saved FROM features WHERE id = ?`).get(row.id).saved;
-          nextAction = checkpointed ? saved.next_action : candidateAction(ctx.db, row.id);
+          const derivedAction = candidateAction(ctx.db, row.id);
+          const candidateGuidance = derivedAction === CANDIDATE_REVIEW_ACTION || derivedAction === COMPLETED_ACTION;
+          const checkpointed = !changed && !contractChanged && candidateGuidance
+            && ctx.db.prepare(`SELECT ${DIRECTION_CHECKPOINTED_SQL} AS saved FROM features WHERE id = ?`).get(row.id).saved;
+          nextAction = checkpointed ? saved.next_action : derivedAction;
           if (saved.next_action !== nextAction) changed = true;
         }
         ctx.db.prepare('UPDATE features SET next_action = COALESCE(?, next_action), updated_at = ? WHERE id = ?').run(nextAction ?? null, stamp, row.id);
