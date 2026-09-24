@@ -44,6 +44,8 @@ import {
   READY_WORK_ACTION,
   assertBoundCheckout,
   bumpSemanticGeneration,
+  candidateChecksKey,
+  candidateReceiptBacked,
   featureBySlug,
   initializeDatabase,
   listFeatureRows,
@@ -53,6 +55,7 @@ import {
   normalizeFeature,
   openDatabase,
   parseJson,
+  projectCandidateEvent,
   recordEvent,
   transaction,
   unwrapPausedAction,
@@ -241,9 +244,27 @@ function pendingRows(db, featureId) {
     .map(({ payload_json: _payload, ...row }) => row);
 }
 
+// A candidate's checks are the executed receipts behind its exact revision and current contract,
+// one string per receipt; checks never run are absent and optional failures stay labelled.
+function receiptChecks(verification) {
+  return verification.checks.filter(check => check.receipt).map(check => ({
+    text: `${check.key}${check.required ? '' : ' (optional)'}: ${check.status} · receipt ${check.receipt.id}${check.reused ? ' · reused' : ''}`,
+    receipt: { key: check.key, receiptId: check.receipt.id, status: check.status, required: check.required, reused: check.reused },
+  }));
+}
+
+// An unmarked row predates receipt provenance, so its strings are historical caller claims, shown
+// apart as unverified even when they name a real receipt.
+function candidateChecks(db, row) {
+  const stored = parseJson(row.checks_json, []);
+  const entries = (Array.isArray(stored) ? stored : []).map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry));
+  if (candidateReceiptBacked(db, row.id)) return { checks: entries, unverifiedChecks: [], checkProvenance: 'executed-receipts' };
+  return { checks: [], unverifiedChecks: entries, checkProvenance: 'legacy-caller-reported' };
+}
+
 function candidateRows(db, featureId) {
   return db.prepare('SELECT * FROM candidates WHERE feature_id = ? ORDER BY created_at DESC LIMIT 20').all(featureId)
-    .map(row => ({ ...row, checks: parseJson(row.checks_json, []) }))
+    .map(row => ({ ...row, ...candidateChecks(db, row) }))
     .map(({ checks_json: _checks, ...row }) => row);
 }
 
@@ -1314,8 +1335,8 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  const cleanChecks = cleanStringArray(checks, 'checks');
-  if (!cleanChecks.length) throw new TheaterError('A candidate requires at least one executed check.', 'COMPLETION_NOT_PROVEN');
+  // Caller-described checks are prose, not proof; they are kept apart as unverified notes.
+  const notes = cleanStringArray(checks, 'checks');
   return await withCheckoutLock(root, slug, async () => {
     const ctx = await loadWorkspace(root);
     try {
@@ -1331,23 +1352,30 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
       if (snapshot.head !== resolved) throw new TheaterError(`Candidate ${resolved.slice(0, 12)} is not the checkout HEAD ${snapshot.head.slice(0, 12)}.`, 'STALE_CANDIDATE');
       if (allow_dirty || !snapshot.clean) throw new TheaterError('Candidates require a clean committed checkout.', 'DIRTY_CANDIDATE');
       const verification = assertVerified(ctx, row, resolved);
+      const derived = receiptChecks(verification);
+      const executed = derived.map(check => check.text);
       const changes = await diffSummary(row.checkout_path, row.base_revision, resolved);
       const id = newId('candidate');
       const stamp = now();
       transaction(ctx.db, () => {
         ctx.db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status = 'ready'").run(row.id);
         ctx.db.prepare('INSERT INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, \'ready\', ?)')
-          .run(id, row.id, resolved, row.base_revision, cleanSummary, JSON.stringify(cleanChecks), stamp);
+          .run(id, row.id, resolved, row.base_revision, cleanSummary, JSON.stringify(executed), stamp);
         ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
+        meta(ctx.db, candidateChecksKey(id), JSON.stringify({ version: 1, source: 'executed-receipts', receipts: derived.map(check => check.receipt) }));
         ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, next_action = ?, updated_at = ? WHERE id = ?")
           .run(cleanSummary, CANDIDATE_REVIEW_ACTION, stamp, row.id);
         bumpSemanticGeneration(ctx.db, row.id);
       });
-      await addEvent(ctx, { featureId: row.id, kind: 'candidate.recorded', summary: `Recorded candidate ${resolved.slice(0, 12)} with ${cleanChecks.length} check(s).`, details: { candidateId: id, checks: cleanChecks, clean: snapshot.clean } });
+      await addEvent(ctx, {
+        featureId: row.id, kind: 'candidate.recorded',
+        summary: `Recorded candidate ${resolved.slice(0, 12)} with ${executed.length} executed check receipt(s)${notes.length ? `; ${notes.length} unverified caller note(s)` : ''}.`,
+        details: { candidateId: id, checks: executed, unverifiedNotes: notes, clean: snapshot.clean },
+      });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
-      return { candidateId: id, revision: resolved, baseRevision: row.base_revision, checks: cleanChecks, changes, feature: summarizeFeature(ctx, current) };
+      return { candidateId: id, revision: resolved, baseRevision: row.base_revision, checks: executed, unverifiedNotes: notes, checkProvenance: 'executed-receipts', changes, feature: summarizeFeature(ctx, current) };
     } finally { ctx.db.close(); }
   });
 }
@@ -1453,7 +1481,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
 function timelineRows(db, featureId, limit = 30) {
   const bounded = Math.max(1, Math.min(Number(limit) || 30, 200));
   return db.prepare('SELECT id, kind, summary, details_json, created_at FROM events WHERE feature_id = ? ORDER BY id DESC LIMIT ?').all(featureId, bounded)
-    .map(row => ({ id: Number(row.id), kind: row.kind, summary: row.summary, details: parseJson(row.details_json, {}), createdAt: row.created_at }));
+    .map(row => projectCandidateEvent(db, { id: Number(row.id), kind: row.kind, summary: row.summary, details: parseJson(row.details_json, {}), createdAt: row.created_at }));
 }
 
 export async function readTimeline({ workspace_path, feature, limit = 30 }) {

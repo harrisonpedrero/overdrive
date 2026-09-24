@@ -141,6 +141,129 @@ test('a paused lane refuses candidates until it is explicitly resumed', async t 
   assert.equal(reviewed.candidates.find(candidate => candidate.status === 'ready').summary, 'Ready after resuming.');
 });
 
+test('candidate checks come only from executed receipts; caller check strings stay unverified notes', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-candidate-provenance-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'proven' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Provenance', description: 'Candidate checks are receipts.' });
+  await createFeature({ ...args, title: 'Proven', outcome: 'Only executed checks count.', spec: '# Proven\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [
+    { key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] },
+    { key: 'browser', purpose: 'Optional browser pass', required: false, argv: [process.execPath, '-e', 'process.exit(3)'] },
+    { key: 'lint', purpose: 'Optional lint never reached', required: false, argv: [process.execPath, '-e', 'process.exit(0)'] },
+  ] });
+  // The optional failure stops the run, so lint never executes and must not appear as performed.
+  const run = await runChecks(args);
+  assert.equal(run.verification.ready, true);
+  assert.deepEqual(run.receipts.map(receipt => [receipt.key, receipt.passed]), [['readme', true], ['browser', false]]);
+  const [readme, browser] = run.receipts;
+  const invented = ['security audit: passed', 'browser e2e: passed'];
+  const recorded = await callTool('theater_candidate_record', { ...args, summary: 'Ready.', checks: invented });
+
+  const expected = [`readme: passed · receipt ${readme.id}`, `browser (optional): failed · receipt ${browser.id}`];
+  assert.deepEqual(recorded.checks, expected);
+  assert.deepEqual(recorded.unverifiedNotes, invented);
+  assert.equal(recorded.checkProvenance, 'executed-receipts');
+
+  const context = await getFeatureContext(args);
+  const [candidate] = context.candidates;
+  assert.equal(candidate.id, recorded.candidateId);
+  assert.deepEqual(candidate.checks, expected);
+  assert.deepEqual(candidate.unverifiedChecks, []);
+  assert.equal(candidate.checkProvenance, 'executed-receipts');
+  assert.equal('checks_json' in candidate, false);
+  const event = context.timeline.find(entry => entry.kind === 'candidate.recorded');
+  assert.match(event.summary, /with 2 executed check receipt\(s\); 2 unverified caller note\(s\)\.$/);
+  assert.deepEqual(event.details.checks, expected);
+  assert.deepEqual(event.details.unverifiedNotes, invented);
+  for (const shown of [recorded.checks, candidate.checks, event.details.checks]) {
+    assert.ok(shown.every(entry => typeof entry === 'string'));
+    assert.equal(shown.some(entry => /security|e2e|lint/.test(entry)), false);
+  }
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  try {
+    assert.deepEqual(JSON.parse(db.prepare('SELECT checks_json FROM candidates WHERE id = ?').get(recorded.candidateId).checks_json), expected);
+    // The runtime's provenance marker is what makes these strings executed checks.
+    assert.deepEqual(JSON.parse(db.prepare('SELECT value FROM meta WHERE key = ?').get(`candidate-checks:${recorded.candidateId}`).value), { version: 1, source: 'executed-receipts', receipts: [
+      { key: 'readme', receiptId: readme.id, status: 'passed', required: true, reused: false },
+      { key: 'browser', receiptId: browser.id, status: 'failed', required: false, reused: false },
+    ] });
+  } finally { db.close(); }
+
+  // Notes are optional; the receipt gate alone admits a candidate, and still refuses without it.
+  const bare = await recordCandidate({ ...args, summary: 'Ready without notes.' });
+  assert.deepEqual(bare.checks, expected);
+  assert.deepEqual(bare.unverifiedNotes, []);
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the README again', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  await assert.rejects(recordCandidate({ ...args, summary: 'Notes are not receipts.', checks: ['readme: passed'] }), error => error.code === 'COMPLETION_NOT_PROVEN');
+
+  // Rows written before receipt provenance stay readable, but carry no runtime marker: their strings are
+  // historical caller claims, never shown as run, even when they exactly match a real receipt's text.
+  const statePath = path.join(workspace, '.theater', 'state.sqlite3');
+  const legacyClaims = ['npm test: passed', ...expected, `browser: passed · receipt ${browser.id} · reused`];
+  const forgeLegacy = claims => {
+    const raw = new DatabaseSync(statePath);
+    try {
+      raw.prepare("INSERT OR REPLACE INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) SELECT 'candidate-legacy', feature_id, revision, base_revision, 'Legacy.', ?, 'superseded', '2000-01-01T00:00:00.000Z' FROM candidates WHERE id = ?")
+        .run(JSON.stringify(claims), recorded.candidateId);
+    } finally { raw.close(); }
+  };
+  const legacyRow = async () => (await getFeatureContext(args)).candidates.find(entry => entry.id === 'candidate-legacy');
+  forgeLegacy(legacyClaims);
+  const forged = await legacyRow();
+  assert.deepEqual([forged.checks, forged.unverifiedChecks, forged.checkProvenance], [[], legacyClaims, 'legacy-caller-reported']);
+
+  // A receipt executed after the legacy row cannot promote a claim that happens to name it.
+  const later = await runChecks(args);
+  assert.equal(later.verification.ready, true);
+  const laterClaim = `readme: passed · receipt ${later.receipts[0].id}`;
+  forgeLegacy([...legacyClaims, laterClaim]);
+  const legacy = await legacyRow();
+  assert.deepEqual(legacy.checks, []);
+  assert.deepEqual(legacy.unverifiedChecks, [...legacyClaims, laterClaim]);
+  assert.equal(legacy.checkProvenance, 'legacy-caller-reported');
+
+  // A fresh runtime-recorded candidate for that later receipt is still shown as executed.
+  const fresh = await recordCandidate({ ...args, summary: 'Ready on the later receipt.' });
+  assert.deepEqual(fresh.checks, [laterClaim]);
+  const listed = (await getFeatureContext(args)).candidates.find(entry => entry.id === fresh.candidateId);
+  assert.deepEqual([listed.checks, listed.unverifiedChecks, listed.checkProvenance], [[laterClaim], [], 'executed-receipts']);
+
+  // Pre-provenance candidate.recorded events stay immutable but are read as caller claims; marked events are unchanged.
+  const legacySummary = 'Recorded candidate 91a0e4c0ab4b with 2 check(s).';
+  const legacyDetails = { candidateId: 'candidate-legacy', checks: ['security audit: passed', expected[0]], clean: true };
+  const events = new DatabaseSync(statePath);
+  let legacyEventId;
+  try {
+    const { feature_id: featureId } = events.prepare('SELECT feature_id FROM candidates WHERE id = ?').get(fresh.candidateId);
+    legacyEventId = Number(events.prepare("INSERT INTO events(feature_id, kind, summary, details_json, created_at) VALUES (?, 'candidate.recorded', ?, ?, '2000-01-01T00:00:00.000Z')")
+      .run(featureId, legacySummary, JSON.stringify(legacyDetails)).lastInsertRowid);
+  } finally { events.close(); }
+  const projectedSummary = 'Recorded candidate 91a0e4c0ab4b with 2 caller-reported check claim(s), not verified as executed.';
+  const projectedDetails = { candidateId: 'candidate-legacy', clean: true, checks: [], unverifiedChecks: legacyDetails.checks, checkProvenance: 'legacy-caller-reported' };
+  const views = [
+    (await getFeatureContext({ ...args, timeline_limit: 200 })).timeline,
+    (await callTool('theater_timeline', { ...args, limit: 200 })).events,
+  ];
+  for (const timeline of views) {
+    const legacyEvent = timeline.find(entry => entry.id === legacyEventId);
+    assert.equal(legacyEvent.summary, projectedSummary);
+    assert.deepEqual(legacyEvent.details, projectedDetails);
+    for (const [candidateId, checks] of [[recorded.candidateId, expected], [fresh.candidateId, [laterClaim]]]) {
+      const marked = timeline.find(entry => entry.kind === 'candidate.recorded' && entry.details.candidateId === candidateId);
+      assert.match(marked.summary, /executed check receipt\(s\)/);
+      assert.deepEqual(marked.details.checks, checks);
+      assert.equal('unverifiedChecks' in marked.details, false);
+    }
+  }
+  const activity = (await callTool('theater_state', { ...args, components: ['activity'] })).selected.activity;
+  assert.equal(activity.find(entry => entry.id === legacyEventId).summary, projectedSummary);
+  assert.match(activity.find(entry => entry.kind === 'candidate.recorded' && entry.id !== legacyEventId).summary, /with 1 executed check receipt\(s\)\.$/);
+  const stored = new DatabaseSync(statePath);
+  try { assert.deepEqual({ ...stored.prepare('SELECT summary, details_json FROM events WHERE id = ?').get(legacyEventId) }, { summary: legacySummary, details_json: JSON.stringify(legacyDetails) }); }
+  finally { stored.close(); }
+});
+
 test('a Claude worker guard that outlives its completed turn blocks checks and candidates until it clears', async t => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-live-worker-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));

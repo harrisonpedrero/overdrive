@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, workItems } from './state.mjs';
+import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, projectCandidateEvent, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { verificationStatus } from './verification.mjs';
 import { recoverAgentState } from './ownership.mjs';
@@ -119,8 +119,8 @@ export async function snapshotState({ workspace_path, feature, components, inclu
           if (selected.candidate) selected.candidate.summary = clip(selected.candidate.summary);
         }
         if (chosen.includes('activity')) {
-          selected.activity = ctx.db.prepare('SELECT id, kind, summary, created_at FROM events WHERE feature_id = ? ORDER BY id DESC LIMIT 15').all(row.id)
-            .map(item => ({ ...item, summary: clip(item.summary, 1200) }));
+          selected.activity = ctx.db.prepare('SELECT id, kind, summary, details_json, created_at FROM events WHERE feature_id = ? ORDER BY id DESC LIMIT 15').all(row.id)
+            .map(({ details_json: details, ...item }) => ({ ...item, summary: clip(projectCandidateEvent(ctx.db, { ...item, details: parseJson(details, {}) }).summary, 1200) }));
         }
         if (chosen.includes('handoff')) {
           const checkpoint = ctx.db.prepare('SELECT summary, next_action, unresolved_json, head_revision, created_at FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id);

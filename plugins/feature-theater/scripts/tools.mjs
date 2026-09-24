@@ -232,14 +232,14 @@ export const TOOLS = [
     passed: boolean('Whether this is passing or failing evidence; omit for a neutral note.'),
   }, ['workspace_path', 'feature', 'kind', 'summary']), { destructiveHint: false }),
 
-  tool('theater_candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate with executed checks. A paused or archived lane is refused until it is made active again. Does not push, open a PR, or merge.', object({
+  tool('theater_candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate. Its checks are derived only from the executed receipts for that revision and current contract, one "key: outcome · receipt id" string each; caller text is never counted or shown as an executed check. A paused or archived lane is refused until it is made active again. Does not push, open a PR, or merge.', object({
     ...workspace,
     ...feature,
     revision: string('Candidate commit; defaults to HEAD.'),
     summary: string('What the candidate changes and why it is ready.'),
-    checks: { type: 'array', minItems: 1, maxItems: 100, items: string('Executed check and outcome.') },
+    checks: { type: 'array', maxItems: 100, items: string('Optional reviewer note.'), description: 'Optional caller notes, echoed only as unverifiedNotes in the response and timeline event. They are never stored, counted or shown as the candidate\'s executed checks; those come only from runtime receipts.' },
     allow_dirty: boolean('Deprecated: true is refused because evidence must describe a clean commit.'),
-  }, ['workspace_path', 'feature', 'summary', 'checks']), { destructiveHint: false }),
+  }, ['workspace_path', 'feature', 'summary']), { destructiveHint: false }),
 
   tool('theater_candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
     ...workspace,

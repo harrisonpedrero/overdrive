@@ -469,6 +469,29 @@ export function recordEvent(db, { featureId = null, workItemId = null, kind, sum
   return { id: Number(result.lastInsertRowid), created_at: stamp };
 }
 
+// The runtime marks each candidate whose checks it derived from executed receipts, in the
+// candidate's own transaction. Authorship is never inferred from check text.
+export const candidateChecksKey = candidateId => `candidate-checks:${candidateId}`;
+export function candidateReceiptBacked(db, candidateId) {
+  const marker = typeof candidateId === 'string' ? parseJson(meta(db, candidateChecksKey(candidateId)), null) : null;
+  return marker?.version === 1 && marker.source === 'executed-receipts';
+}
+
+// Events are immutable history. A candidate.recorded event whose candidate lacks the marker predates
+// receipt provenance, so on read its caller check strings are shown only as unverified claims.
+const LEGACY_CANDIDATE_SUMMARY = / with (\d+) check\(s\)\.$/;
+export function projectCandidateEvent(db, event) {
+  if (event.kind !== 'candidate.recorded' || candidateReceiptBacked(db, event.details?.candidateId)) return event;
+  const { checks = [], ...details } = event.details ?? {};
+  return {
+    ...event,
+    summary: LEGACY_CANDIDATE_SUMMARY.test(event.summary)
+      ? event.summary.replace(LEGACY_CANDIDATE_SUMMARY, ' with $1 caller-reported check claim(s), not verified as executed.')
+      : `${event.summary} (caller-reported checks, not verified as executed)`,
+    details: { ...details, checks: [], unverifiedChecks: Array.isArray(checks) ? checks : [checks], checkProvenance: 'legacy-caller-reported' },
+  };
+}
+
 // Counts semantic lane changes (spec, work graph, lifecycle, verification definition, candidates).
 // Call it inside the transaction that makes the change, so a checkpoint that recorded the previous
 // generation is provably stale even when timestamps tie or the controller dies before logging.
