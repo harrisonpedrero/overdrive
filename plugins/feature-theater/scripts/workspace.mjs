@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { assertAgentIdle, assertVerified, assertWorkersStopped, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
+import { assertAgentIdle, assertVerified, assertWorkersStopped, captureFeatureContract, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
 import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, agentBusy, agentOwner, descendantsKey, ownerAlive, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -44,8 +44,9 @@ import {
   READY_WORK_ACTION,
   assertBoundCheckout,
   bumpSemanticGeneration,
+  bindCandidateChecks,
   candidateChecksKey,
-  candidateReceiptBacked,
+  candidateRecordedSummary,
   featureBySlug,
   initializeDatabase,
   listFeatureRows,
@@ -56,6 +57,7 @@ import {
   openDatabase,
   parseJson,
   projectCandidateEvent,
+  receiptCheckText,
   recordEvent,
   transaction,
   unwrapPausedAction,
@@ -244,27 +246,19 @@ function pendingRows(db, featureId) {
     .map(({ payload_json: _payload, ...row }) => row);
 }
 
-// A candidate's checks are the executed receipts behind its exact revision and current contract,
-// one string per receipt; checks never run are absent and optional failures stay labelled.
+// A candidate's checks are the executed receipts behind its exact revision and current contract.
 function receiptChecks(verification) {
-  return verification.checks.filter(check => check.receipt).map(check => ({
-    text: `${check.key}${check.required ? '' : ' (optional)'}: ${check.status} · receipt ${check.receipt.id}${check.reused ? ' · reused' : ''}`,
-    receipt: { key: check.key, receiptId: check.receipt.id, status: check.status, required: check.required, reused: check.reused },
-  }));
+  return verification.checks.filter(check => check.receipt).map(check => {
+    const receipt = { key: check.key, receiptId: check.receipt.id, status: check.status, required: check.required, reused: check.reused };
+    return { text: receiptCheckText(receipt), receipt };
+  });
 }
 
-// An unmarked row predates receipt provenance, so its strings are historical caller claims, shown
-// apart as unverified even when they name a real receipt.
-function candidateChecks(db, row) {
-  const stored = parseJson(row.checks_json, []);
-  const entries = (Array.isArray(stored) ? stored : []).map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry));
-  if (candidateReceiptBacked(db, row.id)) return { checks: entries, unverifiedChecks: [], checkProvenance: 'executed-receipts' };
-  return { checks: [], unverifiedChecks: entries, checkProvenance: 'legacy-caller-reported' };
-}
-
+// Displayed checks are rebuilt from the candidate's marker; an unmarked row predates receipt provenance,
+// and saved strings that differ from the marker are shown apart as unverified, even when they name a receipt.
 function candidateRows(db, featureId) {
   return db.prepare('SELECT * FROM candidates WHERE feature_id = ? ORDER BY created_at DESC LIMIT 20').all(featureId)
-    .map(row => ({ ...row, ...candidateChecks(db, row) }))
+    .map(row => ({ ...row, ...bindCandidateChecks(db, row.id, parseJson(row.checks_json, [])) }))
     .map(({ checks_json: _checks, ...row }) => row);
 }
 
@@ -1362,6 +1356,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
         ctx.db.prepare('INSERT INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, \'ready\', ?)')
           .run(id, row.id, resolved, row.base_revision, cleanSummary, JSON.stringify(executed), stamp);
         ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
+        captureFeatureContract(ctx.db, row);
         meta(ctx.db, candidateChecksKey(id), JSON.stringify({ version: 1, source: 'executed-receipts', receipts: derived.map(check => check.receipt) }));
         ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, next_action = ?, updated_at = ? WHERE id = ?")
           .run(cleanSummary, CANDIDATE_REVIEW_ACTION, stamp, row.id);
@@ -1369,7 +1364,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
       });
       await addEvent(ctx, {
         featureId: row.id, kind: 'candidate.recorded',
-        summary: `Recorded candidate ${resolved.slice(0, 12)} with ${executed.length} executed check receipt(s)${notes.length ? `; ${notes.length} unverified caller note(s)` : ''}.`,
+        summary: candidateRecordedSummary(resolved, executed.length, notes.length),
         details: { candidateId: id, checks: executed, unverifiedNotes: notes, clean: snapshot.clean },
       });
       const current = featureBySlug(ctx.db, slug);

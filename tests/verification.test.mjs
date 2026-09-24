@@ -178,7 +178,8 @@ test('candidate checks come only from executed receipts; caller check strings st
   assert.deepEqual(event.details.unverifiedNotes, invented);
   for (const shown of [recorded.checks, candidate.checks, event.details.checks]) {
     assert.ok(shown.every(entry => typeof entry === 'string'));
-    assert.equal(shown.some(entry => /security|e2e|lint/.test(entry)), false);
+    // Only the label is inspected: hex receipt ids can contain any of these letters.
+    assert.equal(shown.some(entry => /security|e2e|lint/.test(entry.split(' · receipt ')[0])), false);
   }
   const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
   try {
@@ -262,6 +263,182 @@ test('candidate checks come only from executed receipts; caller check strings st
   const stored = new DatabaseSync(statePath);
   try { assert.deepEqual({ ...stored.prepare('SELECT summary, details_json FROM events WHERE id = ?').get(legacyEventId) }, { summary: legacySummary, details_json: JSON.stringify(legacyDetails) }); }
   finally { stored.close(); }
+});
+
+test('marked candidate rows and events display only checks bound to the marker receipts', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-candidate-tamper-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'bound' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Bound', description: 'Marked checks bind to receipts.' });
+  await createFeature({ ...args, title: 'Bound', outcome: 'Tampered claims stay unverified.', spec: '# Bound\n\nThe README exists.' });
+  await updateChecks({ ...args, checks: [
+    { key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] },
+    { key: 'browser', purpose: 'Optional browser pass', required: false, argv: [process.execPath, '-e', 'process.exit(3)'] },
+  ] });
+  const [readme, browser] = (await runChecks(args)).receipts;
+  const recorded = await callTool('theater_candidate_record', { ...args, summary: 'Ready.' });
+  const expected = [`readme: passed · receipt ${readme.id}`, `browser (optional): failed · receipt ${browser.id}`];
+  assert.deepEqual(recorded.checks, expected);
+
+  const statePath = path.join(workspace, '.theater', 'state.sqlite3');
+  const sql = (query, ...values) => {
+    const db = new DatabaseSync(statePath);
+    try { return db.prepare(query).run(...values); } finally { db.close(); }
+  };
+  const markerKey = `candidate-checks:${recorded.candidateId}`;
+  const original = (() => {
+    const db = new DatabaseSync(statePath);
+    try {
+      return {
+        marker: db.prepare('SELECT value FROM meta WHERE key = ?').get(markerKey).value,
+        event: { ...db.prepare("SELECT id, summary, details_json FROM events WHERE kind = 'candidate.recorded' AND json_extract(details_json, '$.candidateId') = ?").get(recorded.candidateId) },
+      };
+    } finally { db.close(); }
+  })();
+  const candidate = async () => (await getFeatureContext(args)).candidates.find(entry => entry.id === recorded.candidateId);
+  const eventViews = async () => {
+    const find = timeline => timeline.find(entry => entry.id === Number(original.event.id));
+    return [find((await getFeatureContext({ ...args, timeline_limit: 200 })).timeline), find((await callTool('theater_timeline', { ...args, limit: 200 })).events)];
+  };
+  const activitySummary = async () => (await callTool('theater_state', { ...args, components: ['activity'] })).selected.activity.find(entry => entry.id === Number(original.event.id)).summary;
+  const bound = value => [value.checks, value.unverifiedChecks ?? [], value.checkProvenance ?? 'executed-receipts'];
+
+  // Altered saved row strings are never promoted; verified checks still come from the marker's receipts.
+  const invented = `security audit: passed · receipt ${readme.id}`;
+  for (const saved of [[expected[0], invented, expected[1]], [expected[0], `browser (optional): passed · receipt ${browser.id}`]]) {
+    sql('UPDATE candidates SET checks_json = ? WHERE id = ?', JSON.stringify(saved), recorded.candidateId);
+    assert.deepEqual(bound(await candidate()), [expected, saved.filter(entry => !expected.includes(entry)), 'marker-mismatch']);
+  }
+  sql('UPDATE candidates SET checks_json = ? WHERE id = ?', JSON.stringify(expected), recorded.candidateId);
+  assert.deepEqual(bound(await candidate()), [expected, [], 'executed-receipts']);
+
+  // A marked event with altered checks, or any summary claim (count, candidate hash, note count) that differs
+  // from the one rebuilt from the candidate record, is projected as unverified with a rebuilt summary.
+  const originalDetails = JSON.parse(original.event.details_json);
+  const rebuilt = `Candidate ${recorded.revision.slice(0, 12)} event does not match its receipt record; 2 executed check receipt(s) verified.`;
+  assert.equal(original.event.summary, `Recorded candidate ${recorded.revision.slice(0, 12)} with 2 executed check receipt(s).`);
+  sql('UPDATE events SET details_json = ? WHERE id = ?', JSON.stringify({ ...originalDetails, checks: [...expected, invented] }), original.event.id);
+  for (const event of await eventViews()) {
+    assert.deepEqual(bound(event.details), [expected, [invented], 'marker-mismatch']);
+    assert.equal(event.summary, rebuilt);
+  }
+  for (const [summary, details] of [
+    [original.event.summary.replace('with 2 executed', 'with 5 executed'), originalDetails],
+    [original.event.summary.replace(recorded.revision.slice(0, 12), 'deadbeefcafe'), originalDetails],
+    [original.event.summary.replace(/\.$/, '; 3 unverified caller note(s).'), originalDetails],
+    [original.event.summary, { ...originalDetails, unverifiedNotes: ['security audit: passed'] }],
+  ]) {
+    sql('UPDATE events SET summary = ?, details_json = ? WHERE id = ?', summary, JSON.stringify(details), original.event.id);
+    for (const event of await eventViews()) {
+      assert.deepEqual(bound(event.details), [expected, [], 'marker-mismatch'], summary);
+      assert.equal(event.summary, rebuilt, summary);
+    }
+    assert.equal(await activitySummary(), rebuilt, summary);
+  }
+  sql('UPDATE events SET summary = ?, details_json = ? WHERE id = ?', original.event.summary, original.event.details_json, original.event.id);
+
+  // A marker naming a receipt that does not exist, or with an altered outcome, verifies nothing.
+  const marker = JSON.parse(original.marker);
+  for (const receipts of [
+    [...marker.receipts, { key: 'security', receiptId: 'evidence_forged', status: 'passed', required: false, reused: false }],
+    marker.receipts.map(entry => entry.key === 'browser' ? { ...entry, status: 'passed' } : entry),
+  ]) {
+    sql('UPDATE meta SET value = ? WHERE key = ?', JSON.stringify({ ...marker, receipts }), markerKey);
+    assert.deepEqual(bound(await candidate()), [[], expected, 'marker-mismatch']);
+    for (const event of await eventViews()) assert.deepEqual(bound(event.details), [[], expected, 'marker-mismatch']);
+  }
+
+  // Restored to the runtime's record, the candidate and its event read exactly as recorded.
+  sql('UPDATE meta SET value = ? WHERE key = ?', original.marker, markerKey);
+  assert.deepEqual(bound(await candidate()), [expected, [], 'executed-receipts']);
+  for (const event of await eventViews()) assert.deepEqual([event.summary, event.details], [original.event.summary, originalDetails]);
+  assert.equal(await activitySummary(), original.event.summary);
+});
+
+test('marker receipts must be eligible under the candidate contract; stale same-revision receipts verify nothing', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-candidate-contract-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'contracted' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Contracted', description: 'Marker receipts bind to the candidate contract.' });
+  await createFeature({ ...args, title: 'Contracted', outcome: 'Only eligible receipts verify.', spec: '# Contracted\n\nThe README exists.' });
+  const readmeCheck = (extra = {}) => ({ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"], ...extra });
+  const lintCheck = extra => ({ key: 'lint', purpose: 'Lint the README', argv: [process.execPath, '-e', 'process.exit(0)'], ...extra });
+  const statePath = path.join(workspace, '.theater', 'state.sqlite3');
+  const sql = (query, ...values) => {
+    const db = new DatabaseSync(statePath);
+    try { return db.prepare(query).get(...values); } finally { db.close(); }
+  };
+  const view = async candidateId => {
+    const context = await getFeatureContext({ ...args, timeline_limit: 200 });
+    const row = context.candidates.find(entry => entry.id === candidateId);
+    const event = context.timeline.find(entry => entry.kind === 'candidate.recorded' && entry.details.candidateId === candidateId);
+    return { row: [row.checks, row.checkProvenance], event: [event.details.checks, event.details.checkProvenance ?? 'executed-receipts'] };
+  };
+  const withMarker = async (candidateId, receipts, assertion) => {
+    const key = `candidate-checks:${candidateId}`;
+    const original = sql('SELECT value FROM meta WHERE key = ?', key).value;
+    sql('UPDATE meta SET value = ? WHERE key = ?', JSON.stringify({ ...JSON.parse(original), receipts }), key);
+    try { await assertion(); } finally { sql('UPDATE meta SET value = ? WHERE key = ?', original, key); }
+  };
+  const mismatch = { row: [[], 'marker-mismatch'], event: [[], 'marker-mismatch'] };
+
+  // Contract C1 runs readme (receipt A); C2 adds lint without changing readme's binding and runs both.
+  await updateChecks({ ...args, checks: [readmeCheck()] });
+  const [stale] = (await runChecks(args)).receipts;
+  await updateChecks({ ...args, checks: [readmeCheck(), lintCheck()] });
+  const [direct, lint] = (await runChecks(args)).receipts;
+  const first = await recordCandidate({ ...args, summary: 'Direct receipts.' });
+  const firstChecks = [`readme: passed · receipt ${direct.id}`, `lint: passed · receipt ${lint.id}`];
+  assert.deepEqual((await view(first.candidateId)), { row: [firstChecks, 'executed-receipts'], event: [firstChecks, 'executed-receipts'] });
+  const lintEntry = { key: 'lint', receiptId: lint.id, status: 'passed', required: true, reused: false };
+  // A same-revision receipt from the older contract is not direct proof, and C2 has no reuse policy for a passing reuse.
+  for (const reused of [false, true]) {
+    await withMarker(first.candidateId, [{ key: 'readme', receiptId: stale.id, status: 'passed', required: true, reused }, lintEntry], async () => {
+      assert.deepEqual(await view(first.candidateId), mismatch);
+    });
+  }
+  // Real receipt ids still verify nothing when the entries disagree with the candidate contract's checks:
+  // a relabelled required flag, a key outside the contract, a missing required check or a duplicate.
+  const readmeEntry = { key: 'readme', receiptId: direct.id, status: 'passed', required: true, reused: false };
+  for (const receipts of [
+    [readmeEntry, { ...lintEntry, required: false }],
+    [readmeEntry, lintEntry, { ...lintEntry, key: 'security', required: false }],
+    [readmeEntry],
+    [readmeEntry, lintEntry, readmeEntry],
+  ]) {
+    await withMarker(first.candidateId, receipts, async () => assert.deepEqual(await view(first.candidateId), mismatch));
+  }
+
+  // C3 opts readme into same-revision reuse (its binding is unchanged) and makes lint optional: readme reuses its C2 receipt.
+  await updateChecks({ ...args, checks: [readmeCheck({ reuse_same_revision: true }), lintCheck({ required: false })] });
+  const reusedCandidate = await recordCandidate({ ...args, summary: 'Reused receipt.' });
+  const reusedChecks = [`readme: passed · receipt ${direct.id} · reused`];
+  assert.deepEqual(reusedCandidate.checks, reusedChecks);
+  assert.deepEqual(await view(reusedCandidate.candidateId), { row: [reusedChecks, 'executed-receipts'], event: [reusedChecks, 'executed-receipts'] });
+
+  // C4 changes readme's definition and runs it (receipt E). The C3 candidate still validates against its own
+  // contract, but a marker pointing at E, directly or as a reuse with a different binding, verifies nothing.
+  await updateChecks({ ...args, checks: [readmeCheck({ purpose: 'Read the README again', reuse_same_revision: true }), lintCheck({ required: false })] });
+  const [changed] = (await runChecks({ ...args, check_keys: ['readme'] })).receipts;
+  assert.deepEqual(await view(reusedCandidate.candidateId), { row: [reusedChecks, 'executed-receipts'], event: [reusedChecks, 'executed-receipts'] });
+  for (const reused of [false, true]) {
+    await withMarker(reusedCandidate.candidateId, [{ key: 'readme', receiptId: changed.id, status: 'passed', required: true, reused }], async () => {
+      assert.deepEqual(await view(reusedCandidate.candidateId), mismatch);
+    });
+  }
+
+  // A candidate contract snapshot saved before its required/reuse policies were recorded fails closed.
+  const { contract_hash: contract, feature_id: featureId } = sql('SELECT contract_hash, feature_id FROM candidates WHERE id = ?', reusedCandidate.candidateId);
+  const snapshotKey = `verification-contract:${featureId}:${contract}`;
+  const snapshot = sql('SELECT value FROM meta WHERE key = ?', snapshotKey).value;
+  assert.deepEqual([JSON.parse(snapshot).required, JSON.parse(snapshot).reuse], [['readme'], ['readme']]);
+  for (const policy of ['reuse', 'required']) {
+    const { [policy]: _policy, ...withoutPolicy } = JSON.parse(snapshot);
+    sql('UPDATE meta SET value = ? WHERE key = ?', JSON.stringify(withoutPolicy), snapshotKey);
+    assert.deepEqual(await view(reusedCandidate.candidateId), mismatch, policy);
+  }
+  sql('UPDATE meta SET value = ? WHERE key = ?', snapshot, snapshotKey);
+  assert.deepEqual(await view(reusedCandidate.candidateId), { row: [reusedChecks, 'executed-receipts'], event: [reusedChecks, 'executed-receipts'] });
 });
 
 test('a Claude worker guard that outlives its completed turn blocks checks and candidates until it clears', async t => {

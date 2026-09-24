@@ -3,7 +3,7 @@ import { checkOutcome } from './check-outcome.mjs';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
+import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, contractSnapshotKey, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { unconfirmedDescendants, workersKey } from './ownership.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
@@ -22,7 +22,7 @@ function contractDefinition(db, feature) {
 }
 
 const fingerprint = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const bindingKey = (featureId, contract) => `verification-contract:${featureId}:${contract}`;
+const bindingKey = contractSnapshotKey;
 
 export function featureContract(db, feature) {
   return fingerprint(contractDefinition(db, feature));
@@ -52,9 +52,22 @@ function scopedWork(work, scope) {
 function captureContract(db, feature, definition) {
   const contract = fingerprint(definition);
   const key = bindingKey(feature.id, contract);
-  // The exact full hash binds legacy receipts to this snapshot without rewriting their evidence.
-  if (!meta(db, key)) meta(db, key, JSON.stringify({ version: 1, checks: checkBindings(definition) }));
+  // The exact full hash binds legacy receipts to this snapshot without rewriting their evidence. Its
+  // required and reuse policies let a recorded candidate's checks be revalidated against this contract
+  // later; a snapshot saved before they existed gains them when this exact definition is captured again.
+  const policy = {
+    required: definition.checks.filter(check => check.required).map(check => check.key),
+    reuse: definition.checks.filter(check => check.reuse_same_revision).map(check => check.key),
+  };
+  const saved = parseJson(meta(db, key), null);
+  if (!saved) meta(db, key, JSON.stringify({ version: 1, checks: checkBindings(definition), ...policy }));
+  else if (saved.version === 1 && !(Array.isArray(saved.required) && Array.isArray(saved.reuse))) meta(db, key, JSON.stringify({ ...saved, ...policy }));
   return contract;
+}
+
+// Recording a candidate snapshots its exact contract, even when every receipt it relies on was reused.
+export function captureFeatureContract(db, feature) {
+  return captureContract(db, feature, contractDefinition(db, feature));
 }
 
 export function assertAgentIdle(feature) {
