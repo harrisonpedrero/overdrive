@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
@@ -291,6 +292,31 @@ export async function normalizeRepositorySource(value) {
   return { source: real, kind: 'local' };
 }
 
+function lockOwnerAlive(record) {
+  if (!Number.isInteger(record.pid) || record.pid <= 0) return true;
+  try { process.kill(record.pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; }
+  return true;
+}
+
+// Serialize stale-lock removal with a persistent SQLite write lock that survives pathname replacement
+// and releases when its holder dies. Re-read under the guard so an old observation cannot remove a new live lock.
+async function reclaimDeadLock(root, lockFile, observed) {
+  const guard = new DatabaseSync(await ensureManagedPath(root, `${lockFile}.reclaim`));
+  try {
+    try { guard.exec('BEGIN IMMEDIATE'); } catch (error) { if ((error?.errcode & 0xff) === 5) return false; throw error; }
+    let current;
+    try { current = await fs.readFile(lockFile, 'utf8'); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    if (current !== observed) return false;
+    const stale = `${lockFile}.stale-${randomUUID()}`;
+    await fs.rename(lockFile, stale);
+    await fs.rm(stale, { force: true });
+    return true;
+  } finally {
+    // Closing ends the empty transaction, so the guard file is never written.
+    guard.close();
+  }
+}
+
 // A lock name is an operation name, or a lane control lock: `control-` followed by a whole feature
 // slug. The prefix sits outside the 63-character body so every accepted slug keeps a distinct lock.
 export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_000 } = {}) {
@@ -311,17 +337,8 @@ export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_0
       if (error?.code !== 'EEXIST') throw error;
       try {
         const stat = await fs.stat(lockFile);
-        const record = JSON.parse(await fs.readFile(lockFile, 'utf8'));
-        let alive = true;
-        if (Number.isInteger(record.pid) && record.pid > 0) {
-          try { process.kill(record.pid, 0); } catch (error) { if (error.code === 'ESRCH') alive = false; }
-        }
-        if (!alive && Date.now() - stat.mtimeMs > 500) {
-          const stale = `${lockFile}.stale-${randomUUID()}`;
-          await fs.rename(lockFile, stale);
-          await fs.rm(stale, { force: true });
-          continue;
-        }
+        const observed = await fs.readFile(lockFile, 'utf8');
+        if (!lockOwnerAlive(JSON.parse(observed)) && Date.now() - stat.mtimeMs > 500 && await reclaimDeadLock(root, lockFile, observed)) continue;
       } catch (statError) {
         if (!(statError instanceof SyntaxError) && !['ENOENT', 'EACCES'].includes(statError?.code)) throw statError;
       }
