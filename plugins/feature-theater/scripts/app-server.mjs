@@ -57,17 +57,20 @@ function disabledMcpOverrides(executable) {
   return isolatedMcpConfigArgs(servers);
 }
 
-function launchSpec(override = undefined) {
-  if (override) return override;
+// The Codex executable a worker launch would use: CODEX_CLI_PATH, then codex.exe on the Windows
+// PATH, otherwise the bare command name for the platform's own PATH lookup.
+export function codexExecutable() {
   let direct = process.env.CODEX_CLI_PATH;
   if ((!direct || !fsSync.existsSync(direct)) && process.platform === 'win32') {
     const found = spawnSync('where.exe', ['codex.exe'], { encoding: 'utf8', windowsHide: true });
     direct = found.status === 0 ? found.stdout.split(/\r?\n/).find(candidate => candidate && fsSync.existsSync(candidate)) : undefined;
   }
-  if (direct && fsSync.existsSync(direct)) {
-    return { command: direct, args: [...configArgs(WORKER_CONFIG_OVERRIDES), 'app-server', '--stdio'] };
-  }
-  return { command: 'codex', args: [...configArgs(WORKER_CONFIG_OVERRIDES), 'app-server', '--stdio'] };
+  return direct && fsSync.existsSync(direct) ? direct : 'codex';
+}
+
+function launchSpec(override = undefined) {
+  if (override) return override;
+  return { command: codexExecutable(), args: [...configArgs(WORKER_CONFIG_OVERRIDES), 'app-server', '--stdio'] };
 }
 
 export class CodexAppServer extends EventEmitter {

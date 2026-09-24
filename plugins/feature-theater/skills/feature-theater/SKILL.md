@@ -15,7 +15,7 @@ Use the current control-workspace absolute path for every tool call. If `theater
 
 If the user wants a new project rather than an existing repository, infer a concise project name and product brief from their request and call `theater_project_create`. It creates `project/` as the managed canonical Git repository with a minimal initial commit, then initializes the same lane workflow. Ask only for the missing product outcome when the request does not establish one; do not force the user to invent a repository first. If neither an existing source nor scratch-project intent is clear, ask whether to use a repository URL/path or start from a brief.
 
-Run `theater_doctor` after initialization or when Git, Codex, state, or the repository cache appears unhealthy. Do not work around a partial `.theater` directory by deleting it; inspect and preserve recoverable state.
+Run `theater_doctor` after initialization or when Git, the configured worker CLI, state, or the repository cache appears unhealthy. Do not work around a partial `.theater` directory by deleting it; inspect and preserve recoverable state.
 
 ## Coordinate the deliverable
 

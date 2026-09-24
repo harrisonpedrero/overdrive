@@ -3,6 +3,8 @@ import { assertAgentIdle, assertVerified, assertWorkersStopped, captureFeatureCo
 import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, agentBusy, agentOwner, descendantsKey, ownerAlive, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { codexExecutable } from './app-server.mjs';
+import { claudeExecutable, normalizeWorkerOptions } from './claude-worker.mjs';
 import {
   TheaterError,
   atomicWrite,
@@ -59,6 +61,7 @@ import {
   normalizeFeature,
   openDatabase,
   parseJson,
+  readWorkspaceConfig,
   projectCandidateEvent,
   receiptCheckText,
   recordEvent,
@@ -661,20 +664,62 @@ export function overview(ctx) {
   };
 }
 
+const HARNESS_CLIS = {
+  codex: { name: 'Codex', executable: codexExecutable, override: 'CODEX_CLI_PATH' },
+  claude: { name: 'Claude Code', executable: claudeExecutable, override: 'CLAUDE_CLI_PATH' },
+};
+
 export async function doctorWorkspace({ workspace_path }) {
   const root = await resolveWorkspace(workspace_path);
   const checks = [];
-  for (const [name, argv] of [['Git', ['git', '--version']], ['Node', ['node', '--version']], ['Codex', ['codex', '--version']]]) {
-    try { checks.push({ name, ok: true, detail: (await run(argv, { cwd: root, timeoutMs: 15_000 })).stdout.split(/\r?\n/)[0] }); }
+  const version = async command => (await run([command, '--version'], { cwd: root, timeoutMs: 15_000 })).stdout.split(/\r?\n/)[0];
+  for (const [name, command] of [['Git', 'git'], ['Node', 'node']]) {
+    try { checks.push({ name, ok: true, detail: await version(command) }); }
     catch (error) { checks.push({ name, ok: false, detail: error.message }); }
   }
+  // Only the configured worker harness is probed, through the executable a lane launch would use.
+  let config = null;
+  let cli = null;
   try {
-    const ctx = await loadWorkspace(root);
+    config = await readWorkspaceConfig(root);
+    const { harness, harnessOptions } = workerHarness(config, '');
+    if (harness === 'claude') normalizeWorkerOptions(harnessOptions);
+    cli = HARNESS_CLIS[harness];
+    checks.push({ name: 'Configuration', ok: true, detail: `${harness} worker harness` });
+  } catch (error) {
+    checks.push({ name: 'Configuration', ok: false, detail: error.message });
+  }
+  if (cli) {
     try {
+      const command = cli.executable();
+      if (!command) throw new TheaterError(`${cli.name} CLI not found.`, 'CLI_NOT_FOUND');
+      checks.push({ name: cli.name, ok: true, detail: `${await version(command)} (${command})` });
+    } catch (error) {
+      checks.push({ name: cli.name, ok: false, detail: `${error.message.replace(/\.?$/, '.')} Install it or set ${cli.override}.` });
+    }
+  }
+  // An unreadable theater.json was already reported; the database and cache are still inspected
+  // independently so one damaged part does not hide the health of the others.
+  let ctx = null;
+  if (config) {
+    try {
+      ctx = await loadWorkspace(root);
       const integrity = ctx.db.prepare('PRAGMA integrity_check').get().integrity_check;
       checks.push({ name: 'State database', ok: integrity === 'ok', detail: integrity });
+    } catch (error) {
+      ctx?.db.close();
+      ctx = null;
+      checks.push({ name: 'Workspace', ok: false, detail: error.message });
+    }
+  }
+  try {
+    try {
       const mirror = await inspectMirror(root);
       checks.push({ name: 'Repository cache', ok: Boolean(mirror.defaultRevision), detail: `${mirror.defaultBranch || 'detached'} @ ${mirror.defaultRevision.slice(0, 12)}` });
+    } catch (error) {
+      checks.push({ name: 'Repository cache', ok: false, detail: error.message });
+    }
+    if (ctx) {
       if (ctx.config.managedProject) {
         const project = await ensureManagedPath(root, contained(root, 'project'));
         const snapshot = await repositorySnapshot(project);
@@ -694,10 +739,10 @@ export async function doctorWorkspace({ workspace_path }) {
           ? `${unbound.length} of ${lanes.length} lane(s) not bound to this workspace: ${unbound.map(lane => `${lane.slug} (${lane.checkout_location.reason === 'linked_path' ? `linked via ${lane.checkout_location.link}` : `recorded at ${lane.checkout_location.recorded}`})`).join('; ')}`
           : `${lanes.length} registered lane(s)`,
       });
-    } finally { ctx.db.close(); }
+    }
   } catch (error) {
     checks.push({ name: 'Workspace', ok: false, detail: error.message });
-  }
+  } finally { ctx?.db.close(); }
   return { root, ok: checks.every(check => check.ok), checks };
 }
 

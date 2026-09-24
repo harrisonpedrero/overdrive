@@ -136,7 +136,7 @@ export const TOOLS = [
     harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'project_name', 'description']), { destructiveHint: false, idempotentHint: true }),
 
-  tool('theater_doctor', 'Check OVERDRIVE', 'Check the local Git, Node, Codex, state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('theater_doctor', 'Check OVERDRIVE', 'Check the local Git, Node, configured worker harness CLI (Codex or Claude Code), state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
   tool('theater_feature_create', 'Create feature lane', 'Create an independent full repository clone at an exact commit and initialize its isolated spec/context packet.', object({
     ...workspace,

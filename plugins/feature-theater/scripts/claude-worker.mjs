@@ -68,17 +68,23 @@ export function workerEnvironment(env = process.env) {
   return { ...Object.fromEntries(inherited), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
 }
 
-function launchSpec(override) {
-  if (override) return override;
+// The Claude Code executable a worker launch would use: CLAUDE_CLI_PATH, then the PATH, then the
+// native installer's ~/.local/bin location; null when none exists.
+export function claudeExecutable() {
   const direct = process.env.CLAUDE_CLI_PATH;
-  if (direct && fsSync.existsSync(direct)) return { command: direct, args: [] };
+  if (direct && fsSync.existsSync(direct)) return direct;
   const locator = process.platform === 'win32' ? ['where.exe', ['claude.exe', 'claude']] : ['which', ['claude']];
   const found = spawnSync(locator[0], locator[1], { encoding: 'utf8', windowsHide: true });
   const located = found.status === 0 ? found.stdout.split(/\r?\n/).map(line => line.trim()).find(candidate => candidate && fsSync.existsSync(candidate)) : undefined;
-  if (located) return { command: located, args: [] };
+  if (located) return located;
   const local = path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'claude.exe' : 'claude');
-  if (fsSync.existsSync(local)) return { command: local, args: [] };
-  return null;
+  return fsSync.existsSync(local) ? local : null;
+}
+
+function launchSpec(override) {
+  if (override) return override;
+  const command = claudeExecutable();
+  return command ? { command, args: [] } : null;
 }
 
 function textOf(input) {

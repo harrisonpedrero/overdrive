@@ -248,14 +248,19 @@ export function openDatabase(root) {
   const file = contained(root, '.theater', 'state.sqlite3');
   const db = new DatabaseSync(file);
   databaseRoots.set(db, path.resolve(root));
-  schema(db);
-  const current = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
-  if (current && Number(current.value) > SCHEMA_VERSION) {
+  // A damaged or foreign file fails here; the handle is released so the file can be repaired.
+  try {
+    schema(db);
+    const current = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
+    if (current && Number(current.value) > SCHEMA_VERSION) {
+      throw new TheaterError('This workspace was created by a newer OVERDRIVE version.', 'NEWER_SCHEMA');
+    }
+    migrate(db, current ? Number(current.value) : 2);
+    db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
+  } catch (error) {
     db.close();
-    throw new TheaterError('This workspace was created by a newer OVERDRIVE version.', 'NEWER_SCHEMA');
+    throw error;
   }
-  migrate(db, current ? Number(current.value) : 2);
-  db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
   return db;
 }
 
@@ -285,7 +290,7 @@ export function initializeDatabase(root, config) {
   return db;
 }
 
-export async function loadWorkspace(root) {
+export async function readWorkspaceConfig(root) {
   const configFile = await ensureManagedPath(root, contained(root, 'theater.json'));
   let config;
   try { config = await readJson(configFile); } catch (error) {
@@ -295,6 +300,11 @@ export async function loadWorkspace(root) {
   if (config?.formatVersion !== 1 || typeof config.workspaceId !== 'string' || typeof config.repository !== 'string') {
     throw new TheaterError('theater.json is invalid.', 'INVALID_STATE');
   }
+  return config;
+}
+
+export async function loadWorkspace(root) {
+  const config = await readWorkspaceConfig(root);
   const databaseFile = await ensureManagedPath(root, contained(root, '.theater', 'state.sqlite3'));
   try { await fs.access(databaseFile); } catch {
     throw new TheaterError('OVERDRIVE state database is missing.', 'INVALID_STATE');
