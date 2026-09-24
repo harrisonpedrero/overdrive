@@ -42,7 +42,7 @@ function handle({ id, method, params = {} }) {
     const text = (params.input ?? []).map(part => part.text).join('\n');
     if (/FAKE_REFUSE/.test(text)) return send({ id, error: { code: -32000, message: 'turn refused by fake backend' } });
     const turnId = `turn-${randomUUID()}`;
-    thread.turns.push({ id: turnId, status: 'inProgress', items: [] });
+    thread.turns.push({ id: turnId, status: 'inProgress', items: [], completeOnResume: /FAKE_COMPLETE_ON_RESUME/.test(text), completeAfterResume: /FAKE_COMPLETE_AFTER_RESUME/.test(text), completeOnSecondRead: /FAKE_COMPLETE_ON_SECOND_READ/.test(text) });
     save(store);
     const lost = /FAKE_LOSE_RESPONSE/.test(text);
     // FAKE_LOSE_RESPONSE_DONE: the turn finishes at once, but neither its response nor any
@@ -56,14 +56,29 @@ function handle({ id, method, params = {} }) {
     const startedThenLost = /FAKE_STARTED_THEN_LOSE/.test(text);
     if (!lost && !startedThenLost) send({ id, result: { turn: { id: turnId } } });
     if (!lost) send({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress' } } });
-    running.set(threadId, { turnId, timer: /hang/.test(text) || startedThenLost ? null : setTimeout(() => complete(threadId, turnId, 'completed'), lost ? 4_000 : 150) });
+    running.set(threadId, { turnId, timer: /hang|FAKE_COMPLETE_(?:ON|AFTER)_RESUME|FAKE_COMPLETE_ON_SECOND_READ/.test(text) || startedThenLost ? null : setTimeout(() => complete(threadId, turnId, 'completed'), lost ? 4_000 : 150) });
     return;
+  }
+  if (method === 'thread/resume') {
+    const active = thread.turns.findLast(candidate => candidate.status === 'inProgress');
+    if (active?.completeOnResume) complete(threadId, active.id, 'completed');
+    if (active?.completeAfterResume) setTimeout(() => complete(threadId, active.id, 'completed'), 1_500);
+    return send({ id, result: { thread: { id: threadId } } });
   }
   if (method === 'turn/interrupt') {
     send({ id, result: {} });
     return complete(threadId, params.turnId, 'interrupted');
   }
-  if (method === 'thread/read') return send({ id, result: { thread: { id: threadId, turns: thread.turns } } });
+  if (method === 'thread/read') {
+    const active = thread.turns.findLast(candidate => candidate.status === 'inProgress');
+    if (active?.completeOnSecondRead) {
+      active.reads = (active.reads ?? 0) + 1;
+      save(store);
+    }
+    send({ id, result: { thread: { id: threadId, turns: thread.turns } } });
+    if (active?.completeOnSecondRead && active.reads === 2) complete(threadId, active.id, 'completed');
+    return;
+  }
   if (method === 'thread/compact/start') {
     send({ id, result: {} });
     const turnId = `compact-${randomUUID()}`;

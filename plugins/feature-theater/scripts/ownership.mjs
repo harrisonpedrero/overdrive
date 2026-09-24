@@ -83,6 +83,23 @@ export async function withAgentControl(args, token, fn) {
   });
 }
 
+// An observer may take over a dead controller's session, but must leave a live owner's
+// notifications and state writes with that controller.
+export async function adoptAgentObservation(args, token) {
+  const root = await resolveWorkspace(args.workspace_path);
+  const slug = safeSlug(args.feature);
+  return withWorkspaceLock(root, `control-${slug}`, async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      const owner = agentOwner(ctx.db, row.id);
+      if (owner?.token !== token && ownerAlive(owner)) return false;
+      claimAgentControl(ctx, row, token);
+      return true;
+    } finally { ctx.db.close(); }
+  });
+}
+
 // Holds the lane's control lock for a whole lifecycle stop, so no turn can be dispatched between
 // stopping the worker and recording the new status. The lane is claimed only when a worker may be
 // live and must be stopped here; an idle lane keeps its owner. fn receives the lane row, whether

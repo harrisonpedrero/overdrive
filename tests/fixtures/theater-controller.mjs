@@ -30,6 +30,7 @@ const operations = {
   start: runtime.startFeatureAgent,
   steer: runtime.steerFeatureAgent,
   inspect: runtime.inspectFeatureAgent,
+  wait: runtime.waitFeatureAgent,
   interrupt: runtime.interruptFeatureAgent,
   compact: runtime.compactFeatureAgent,
 };

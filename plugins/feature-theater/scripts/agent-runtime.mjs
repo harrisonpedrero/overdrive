@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
 import { summarizePatch, TheaterError, parseJsonObject, requiredText, redactString } from './util.mjs';
-import { withAgentControl, withLaneStop } from './ownership.mjs';
+import { adoptAgentObservation, withAgentControl, withLaneStop } from './ownership.mjs';
 import {
   attestDescendantsStopped,
   bindAgentSession,
@@ -32,6 +32,7 @@ const registrations = new Map();
 const turnMessages = new Map();
 const turnDiffs = new Map();
 const turnPlans = new Map();
+const completedTurns = new Set();
 const compactionWaiters = new Map();
 const compactionTurns = new Set();
 const recordedCompactions = new Set();
@@ -186,6 +187,8 @@ async function onNotification({ method, params }) {
   if (method === 'turn/completed') {
     const turn = params.turn || {};
     const turnId = turn.id;
+    const completionKey = `${params.threadId}:${turnId}`;
+    if (turnId && completedTurns.has(completionKey)) return;
     // Recorded before the turn's end, so no reader sees the lane stopped without the marker.
     if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, thread_id: params.threadId, turn_id: turnId ?? null, summary: descendantsSummary(turnId) });
     if (compactionTurns.has(turnId) && compactionWaiters.has(params.threadId)) {
@@ -219,6 +222,10 @@ async function onNotification({ method, params }) {
     turnPlans.delete(turnId);
     compactionTurns.delete(turnId);
     if (saved.ignored) return;
+    if (turnId) {
+      completedTurns.add(completionKey);
+      if (completedTurns.size > 256) completedTurns.delete(completedTurns.values().next().value);
+    }
     const runtime = await featureRuntime({ ...base, allow_inactive: true });
     if (!shuttingDown && runtime.feature.compaction_pending && status === 'idle') {
       setTimeout(() => { if (!shuttingDown) void compactFeatureAgent(base).catch(error => process.stderr.write(`[overdrive] deferred compaction: ${redactString(error.message)}\n`)); }, 0);
@@ -322,6 +329,27 @@ async function resume(runtime) {
   const response = await bridge.resumeThread(params);
   register(runtime.feature.thread_id, runtime.root, runtime.feature.slug);
   return response;
+}
+
+async function prepareCodexObservation(runtime) {
+  if (runtime.harness !== 'codex' || !runtime.feature.thread_id ||
+      (!runtime.feature.active_turn_id && runtime.feature.agent_status !== 'uncertain')) return false;
+  if (!(await adoptAgentObservation({ workspace_path: runtime.root, feature: runtime.feature.slug }, ownerToken))) return false;
+  await resume(runtime);
+  return true;
+}
+
+async function reconcileCompletedNativeTurn(runtime, thread) {
+  const turn = thread.turns?.find(candidate => candidate.id === runtime.feature.active_turn_id);
+  if (!turn || !['completed', 'interrupted', 'failed'].includes(turn.status) ||
+      !registrations.has(runtime.feature.thread_id)) return;
+  await enqueueStateWork(async () => {
+    const current = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1 });
+    if (current.feature.agent.threadId !== thread.id || current.feature.agent.activeTurnId !== turn.id) return;
+    await onNotification({ method: 'turn/completed', params: { threadId: thread.id, turn } });
+  });
+  const current = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1 });
+  Object.assign(runtime.feature, { agent_status: current.feature.agent.status, active_turn_id: current.feature.agent.activeTurnId });
 }
 
 // Settles an 'uncertain' lane from its owning native session: a turn still in progress becomes
@@ -514,19 +542,19 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   } else if (include_thread && runtime.feature.thread_id) {
     try {
       await bridge.ensureStarted();
-      // A fresh controller loads the session's metadata (no turn, no model call) so it can be read.
-      if (!registrations.has(runtime.feature.thread_id)) await bridge.attachThread?.(sessionParams(runtime));
+      // A live Codex turn needs a registered listener. Completed turns are also read back to
+      // cover a completion delivered before resume registered the session.
+      const observing = await prepareCodexObservation(runtime);
+      if (!observing && !registrations.has(runtime.feature.thread_id)) await bridge.attachThread?.(sessionParams(runtime));
       const response = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
       thread = safeThreadView(response.thread);
-      const active = response.thread.turns?.find(turn => turn.id === runtime.feature.active_turn_id);
+      if (observing || registrations.has(runtime.feature.thread_id)) await reconcileCompletedNativeTurn(runtime, response.thread);
       if (runtime.feature.agent_status === 'uncertain') {
         await settleUncertain(runtime, response.thread);
         if (runtime.feature.active_turn_id && !registrations.has(runtime.feature.thread_id)) await resume(runtime);
         if (runtime.feature.agent_status === 'uncertain') warning = response.thread.history === 'unavailable'
           ? `The last turn request has no confirmed outcome and this session's history is not available here. ${UNCERTAIN_NEXT}`
           : 'The last turn request has no confirmed outcome; the next agent command reconciles it from the native session before doing anything else.';
-      } else if (active && ['completed', 'interrupted', 'failed'].includes(active.status)) {
-        await enqueueStateWork(() => saveAgentSession({ workspace_path, feature, thread_id: runtime.feature.thread_id, owner_token: ownerToken, status: active.status === 'completed' ? 'idle' : active.status }));
       }
     } catch (error) {
       warning = `Native task could not be refreshed: ${error.message}`;
@@ -562,6 +590,12 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
   bridge.on('serverRequest', request);
   timer = setTimeout(() => finish(false), timeout_seconds * 1000);
   try {
+    for (const runtime of runtimes) {
+      if (await prepareCodexObservation(runtime)) {
+        const response = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
+        await reconcileCompletedNativeTurn(runtime, response.thread);
+      }
+    }
     await notificationQueue;
     const initial = await Promise.all(runtimes.map(runtime => getFeatureContext({ workspace_path, feature: runtime.feature.slug, timeline_limit: 1 })));
     for (const state of initial) {

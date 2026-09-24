@@ -56,6 +56,69 @@ async function lines(file) {
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
 }
 
+test('a restarted controller waits for saved Codex turns and preserves inspect-before-wait completion', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-restart-wait-'));
+  const env = { FAKE_CODEX_STORE: path.join(root, 'codex-store.json'), FAKE_CODEX_LOG: path.join(root, 'codex.log') };
+  const controllers = [];
+  t.after(async () => {
+    for (const running of controllers) await running.kill().catch(() => {});
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const launch = async () => {
+    const running = controller(env);
+    controllers.push(running);
+    await running.started;
+    return running;
+  };
+  await initializeManagedProject({ workspace_path: root, project_name: 'Wait fixture', description: 'Wait through a controller restart.' });
+  for (const feature of ['normal', 'after', 'during', 'inspected']) {
+    await createFeature({ workspace_path: root, feature, title: feature, outcome: 'Finish a saved turn.', spec: '# Saved turn' });
+  }
+  const args = feature => ({ workspace_path: root, feature });
+  let current = await launch();
+  await current.call('start', args('normal'));
+  const normal = await current.call('wait', { ...args('normal'), timeout_seconds: 2 });
+  assert.equal(normal.timedOut, false);
+  assert.equal(normal.feature.agent.status, 'idle');
+  assert.match(normal.feature.summary, /^Codex handoff for turn-/);
+
+  const after = await current.call('start', { ...args('after'), instruction: 'FAKE_COMPLETE_AFTER_RESUME' });
+  const during = await current.call('start', { ...args('during'), instruction: 'FAKE_COMPLETE_ON_RESUME' });
+  const inspectedTurn = await current.call('start', { ...args('inspected'), instruction: 'FAKE_COMPLETE_ON_SECOND_READ' });
+  const observer = await launch();
+  assert.equal((await observer.call('inspect', args('after'))).feature.agent.status, 'running');
+  assert.ok(!(await lines(env.FAKE_CODEX_LOG)).some(entry => entry.method === 'thread/resume' && entry.threadId === after.threadId), 'inspection does not claim a live controller\'s turn');
+  await observer.stop();
+  await current.kill();
+  current = await launch();
+
+  const waited = await current.call('wait', { ...args('after'), timeout_seconds: 3 });
+  assert.equal(waited.timedOut, false);
+  assert.deepEqual({ status: waited.feature.agent.status, turnId: waited.feature.agent.activeTurnId }, { status: 'idle', turnId: null });
+  assert.equal(waited.feature.summary, `Codex handoff for ${after.turnId}.`);
+
+  const inspected = await current.call('inspect', args('during'));
+  assert.equal(inspected.warning, null);
+  assert.equal(inspected.feature.agent.status, 'idle');
+  assert.equal(inspected.feature.summary, `Codex handoff for ${during.turnId}.`);
+  const afterInspect = await current.call('wait', { ...args('during'), timeout_seconds: 2 });
+  assert.equal(afterInspect.timedOut, false);
+  assert.equal(afterInspect.feature.summary, `Codex handoff for ${during.turnId}.`);
+  assert.equal(afterInspect.feature.agent.status, 'idle');
+  const completions = (await getFeatureContext({ ...args('during'), timeline_limit: 50 })).timeline.filter(event => event.kind === 'agent.idle' && event.summary === `Codex handoff for ${during.turnId}.`);
+  assert.equal(completions.length, 1);
+  const runningInspect = await current.call('inspect', args('inspected'));
+  assert.equal(runningInspect.warning, null);
+  assert.equal(runningInspect.feature.agent.status, 'running');
+  const afterRunningInspect = await current.call('wait', { ...args('inspected'), timeout_seconds: 3 });
+  assert.equal(afterRunningInspect.timedOut, false);
+  assert.equal(afterRunningInspect.feature.agent.status, 'idle');
+  assert.equal(afterRunningInspect.feature.summary, `Codex handoff for ${inspectedTurn.turnId}.`);
+  const resumed = (await lines(env.FAKE_CODEX_LOG)).filter(entry => entry.method === 'thread/resume').map(entry => entry.threadId);
+  assert.ok([after.threadId, during.threadId, inspectedTurn.threadId].every(threadId => resumed.includes(threadId)));
+  await current.stop();
+});
+
 test('saved sessions keep their owning backend across harness changes and real controller restarts', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-restart-'));
   const controllers = [];
@@ -257,8 +320,10 @@ test('an unconfirmed turn request survives a controller crash and is reconciled 
   await current.kill();
   current = await launch();
   assert.deepEqual(await agent(codexLane), { status: 'uncertain', activeTurnId: null }, 'crash recovery keeps the unconfirmed state');
-  assert.match((await current.call('inspect', codexLane)).warning, /no confirmed outcome/);
   const lostTurn = (await codexTurns(codexSession.threadId)).at(-1);
+  const recoveredInspect = await current.call('inspect', codexLane);
+  assert.equal(recoveredInspect.warning, null);
+  assert.deepEqual({ status: recoveredInspect.feature.agent.status, activeTurnId: recoveredInspect.feature.agent.activeTurnId }, { status: 'running', activeTurnId: lostTurn.id });
   await assert.rejects(current.call('start', { ...codexLane, instruction: 'Retry.' }), error => error.code === 'TURN_ACTIVE');
   assert.deepEqual(await agent(codexLane), { status: 'running', activeTurnId: lostTurn.id });
   assert.equal((await codexTurns(codexSession.threadId)).length, 2, 'the retry did not dispatch a duplicate turn');
