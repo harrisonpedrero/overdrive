@@ -6,7 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { createFeature, getFeatureContext, initializeManagedProject } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
+import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, readWorkerGuards } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +119,42 @@ test('a restarted controller waits for saved Codex turns and preserves inspect-b
   const resumed = (await lines(env.FAKE_CODEX_LOG)).filter(entry => entry.method === 'thread/resume').map(entry => entry.threadId);
   assert.ok([after.threadId, during.threadId, inspectedTurn.threadId].every(threadId => resumed.includes(threadId)));
   await current.stop();
+});
+
+test('a controller killed alone takes its Claude worker trees with it, and a later inspection proves it', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-crash-'));
+  const pidFile = path.join(root, 'tool.pid');
+  const release = path.join(root, 'release');
+  const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
+  let toolPid = 0;
+  t.after(async () => {
+    await fs.writeFile(release, '').catch(() => {});
+    if (toolPid && alive(toolPid)) process.kill(toolPid);
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 5 });
+  });
+  await initializeManagedProject({ workspace_path: root, project_name: 'Crash fixture', description: 'Kill a controller alone.', harness: 'claude' });
+  const args = { workspace_path: root, feature: 'alpha' };
+  await createFeature({ ...args, title: 'Alpha', outcome: 'Outlive nothing.', spec: '# Alpha\n\nStart a tool.' });
+  // The worker leaves a detached tool running after its turn.
+  const running = controller({ FAKE_CLAUDE_LAUNCH: JSON.stringify([path.join(here, 'fixtures', 'lingering-tool.mjs'), 'cli', 'detached', pidFile, release]) });
+  t.after(() => running.kill().catch(() => {}));
+  await running.started;
+  await running.call('start', args);
+  await eventually(async () => (await getFeatureContext(args)).feature.agent.status === 'idle' && Number(await fs.readFile(pidFile, 'utf8').catch(() => '0')) > 0, 'tool running');
+  toolPid = Number(await fs.readFile(pidFile, 'utf8'));
+  await eventually(async () => Boolean((await readWorkerGuards(args))[0]?.job), 'job recorded');
+  assert.ok(alive(toolPid));
+
+  // Only the controller's own process is terminated, not its tree.
+  await running.kill();
+  await eventually(() => !alive(toolPid), 'tool ended with its controller');
+  // Nothing recorded that, so the guard stays until a later controller proves it from the job.
+  assert.equal((await readWorkerGuards(args)).length, 1);
+  const observer = createAgentRuntime(new WorkerBridge());
+  t.after(() => observer.shutdownAgentRuntime());
+  await observer.inspectFeatureAgent({ ...args, include_thread: false });
+  assert.deepEqual(await readWorkerGuards(args), []);
+  assert.equal((await getFeatureContext(args)).feature.status, 'active');
 });
 
 test('saved sessions keep their owning backend across harness changes and real controller restarts', async t => {

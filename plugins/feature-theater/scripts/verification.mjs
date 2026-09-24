@@ -83,7 +83,7 @@ export function assertAgentIdle(feature) {
 export function assertWorkersStopped(db, feature) {
   const guards = parseJson(meta(db, workersKey(feature.id)), []);
   if (guards.length) {
-    throw new TheaterError('A worker process from this lane has not confirmed its exit. Wait for it to stop, or stop the lane with an attestation, before verifying, recording or accepting a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
+    throw new TheaterError('A worker process from this lane, or a tool it launched, has not confirmed its exit. Wait for it to stop, then inspect the lane with theater_agent_inspect, which clears a guard whose process tree is proven ended; or stop the lane, with an attestation if its exit cannot be proven, before verifying, recording or accepting a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
   }
   const marker = unconfirmedDescendants(db, feature.id);
   if (marker) {

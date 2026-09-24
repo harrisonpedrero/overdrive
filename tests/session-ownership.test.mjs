@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
 import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
 import { TheaterError, refusedRequest } from '../plugins/feature-theater/scripts/util.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, recordAgentEvent, saveAgentSession, savePendingAgentRequest, setFeatureStatus } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, setFeatureStatus } from '../plugins/feature-theater/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +41,7 @@ class NativeBackend extends EventEmitter {
       const timeout = new TheaterError(`${this.harness} request timed out: turn/start`, 'CODEX_TIMEOUT');
       if (fault === 'lost-unstarted') throw timeout;
       const turn = { id: `${thread.id}-turn-${thread.turns.length + 1}`, status: 'inProgress', items: [] };
+      Object.defineProperty(turn, 'guardId', { value: params.guardId ?? null });
       thread.turns.push(turn);
       if (fault === 'lost-after-started') this.emit('notification', { method: 'turn/started', params: { threadId: thread.id, turn } });
       if (fault?.startsWith('lost')) throw timeout;
@@ -63,10 +64,12 @@ class NativeBackend extends EventEmitter {
     }
     return { thread };
   }
+  // Like the Claude bridge, a finished worker whose whole process tree ended reports that exit.
   finish(threadId, text = 'Visible handoff.') {
     const turn = this.store.get(threadId).turns.at(-1);
     Object.assign(turn, { status: 'completed', items: [{ type: 'agentMessage', text }] });
     this.emit('notification', { method: 'turn/completed', params: { threadId, turn } });
+    if (turn.guardId) this.emit('notification', { method: 'worker/exited', params: { threadId, guardId: turn.guardId } });
   }
   raise(id, method, params) {
     (this.live ??= new Set()).add(String(id));
@@ -179,6 +182,8 @@ test('a replacement that cannot be created or started keeps the previous binding
 
   f.faults.claude = 'turn/start';
   await assert.rejects(f.runtime.startFeatureAgent({ ...f.args, force_new_session: true }), /could not start a turn/);
+  // The refused request launched no worker, so it leaves no guard behind.
+  assert.deepEqual(await readWorkerGuards(f.args), []);
   const failed = await getFeatureContext(f.args);
   assert.deepEqual({ threadId: failed.feature.agent.threadId, harness: failed.feature.agent.harness, status: failed.feature.agent.status }, { threadId: original.threadId, harness: 'codex', status: 'failed' });
   assert.match(failed.feature.summary, new RegExp(`Kept native session ${original.threadId}`));
@@ -330,7 +335,11 @@ test('a turn request without a confirmed outcome keeps its binding and blocks du
   const inspected = await f.runtime.inspectFeatureAgent(f.args);
   assert.deepEqual({ status: inspected.feature.agent.status, turnId: inspected.feature.agent.activeTurnId }, { status: 'idle', turnId: null });
   assert.ok(inspected.timeline.some(entry => entry.kind === 'agent.dispatch_reconciled'));
-  const next = await f.runtime.startFeatureAgent(f.args);
+  // History shows no turn, but a Claude request that was not refused may still have launched a
+  // worker process, so its guard holds until the coordinator verifies none is running.
+  await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'WORKERS_UNCONFIRMED' && error.details?.workerGuards === 1);
+  assert.equal(turns().length, 3);
+  const next = await f.runtime.startFeatureAgent({ ...f.args, prior_turn_attestation: { evidence: 'Verified no Claude worker process runs in the fixture checkout.' } });
   assert.equal(next.turnId, 'claude-1-turn-4');
   assert.equal(turns().length, 4);
 });

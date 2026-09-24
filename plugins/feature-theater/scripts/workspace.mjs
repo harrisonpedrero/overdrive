@@ -1728,8 +1728,9 @@ export async function readUnconfirmedDescendants({ workspace_path, feature }) {
 }
 
 // Registered before a Claude turn request can reach its worker. A controller restart loses the
-// process handle, so this record remains until its owning bridge observes a clean completed
-// turn and child exit, confirms tree termination, or the coordinator attests it has stopped.
+// process handle, so this record remains until its owning bridge confirms the worker's whole
+// process tree ended or was stopped, a later controller finds its recorded containment job gone,
+// or the coordinator attests it has stopped.
 export async function registerWorkerGuard({ workspace_path, feature, thread_id, guard_id, owner_token }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
@@ -1746,11 +1747,33 @@ export async function registerWorkerGuard({ workspace_path, feature, thread_id, 
   });
 }
 
+// Records the containment job a Claude worker's process tree runs in, once the tree is inside it,
+// so a later controller can prove from the job's absence that every process in it has ended.
+export async function recordWorkerGuardJob({ workspace_path, feature, thread_id, guard_id, job, owner_token }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token) || row.thread_id !== thread_id) return { ignored: true };
+      const guards = parseJson(meta(ctx.db, workersKey(row.id)), []);
+      const guard = guards.find(entry => entry.id === guard_id);
+      if (!guard) return { recorded: false };
+      guard.job = requiredText(job, 'job', { max: 200 });
+      meta(ctx.db, workersKey(row.id), JSON.stringify(guards));
+      return { recorded: true };
+    } finally { ctx.db.close(); }
+  });
+}
+
 export async function readWorkerGuards({ workspace_path, feature }) {
   return await withContext(workspace_path, async ctx => parseJson(meta(ctx.db, workersKey(featureBySlug(ctx.db, safeSlug(feature)).id)), []));
 }
 
-export async function clearWorkerGuards({ workspace_path, feature, guard_id = null, evidence = null }) {
+// job_gone: the caller verified the guard's containment job no longer exists or holds no process.
+// unused: the turn request the guard was registered for was refused before any worker started.
+export async function clearWorkerGuards({ workspace_path, feature, guard_id = null, evidence = null, job_gone = false, unused = false }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
@@ -1764,7 +1787,12 @@ export async function clearWorkerGuards({ workspace_path, feature, guard_id = nu
         if (remaining.length) meta(ctx.db, workersKey(row.id), JSON.stringify(remaining));
         else ctx.db.prepare('DELETE FROM meta WHERE key = ?').run(workersKey(row.id));
       });
-      await addEvent(ctx, { featureId: row.id, kind: evidence ? 'agent.workers_attested' : 'agent.worker_stopped', summary: evidence ? `The coordinator attested that no worker or tool process for this lane is running: ${evidence}` : 'The owning bridge confirmed the worker stopped.', details: { guardId: guard_id, cleared: guards.length - remaining.length } });
+      const summary = evidence ? `The coordinator attested that no worker or tool process for this lane is running: ${evidence}`
+        : job_gone ? 'The worker\'s process-tree job no longer exists or holds no process, so every process launched under it has ended.'
+          : unused ? 'The turn request was refused before any worker process started.'
+            : 'The owning bridge confirmed the worker and every process it launched stopped.';
+      const basis = job_gone ? 'job_gone' : unused ? 'refused_request' : null;
+      await addEvent(ctx, { featureId: row.id, kind: evidence ? 'agent.workers_attested' : 'agent.worker_stopped', summary, details: { guardId: guard_id, cleared: guards.length - remaining.length, ...(basis ? { basis } : {}) } });
       return { cleared: true };
     } finally { ctx.db.close(); }
   });

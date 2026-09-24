@@ -10,7 +10,9 @@ import { TheaterError } from '../../plugins/feature-theater/scripts/util.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const node = script => ({ launch: { command: process.execPath, args: [path.join(here, script)] } });
 const codex = { ...node('fake-codex-store.mjs'), requestTimeoutMs: Number(process.env.FAKE_CODEX_TIMEOUT_MS) || undefined };
-const bridge = new WorkerBridge({ codex, claude: node('fake-claude-cli.mjs') });
+// FAKE_CLAUDE_LAUNCH: a JSON argument list for Node that replaces the fake Claude CLI.
+const claude = process.env.FAKE_CLAUDE_LAUNCH ? { launch: { command: process.execPath, args: JSON.parse(process.env.FAKE_CLAUDE_LAUNCH) } } : node('fake-claude-cli.mjs');
+const bridge = new WorkerBridge({ codex, claude });
 // FAKE_LOST_AFTER_SEND: the turn request really reaches the backend and the turn runs, but the
 // response and its turn/started notification are lost, as with a transport timeout.
 const request = bridge.request.bind(bridge);

@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { TREE_MARK, defaultContainment } from './process-tree.mjs';
 import { TheaterError, now, redactString, refusedRequest, run } from './util.mjs';
 
 // Workers get no MCP servers, hooks, skills, plugins or browser integration; the Theater
@@ -26,6 +27,8 @@ const EXIT_DRAIN_MS = 1_000;
 const STDERR_TAIL_CHARS = 8_000;
 const DIAGNOSTIC_CHARS = 1_200;
 const DIAGNOSTIC_STDERR_LINES = 12;
+const CONTAINMENT_START_MS = 30_000;
+const uncontainedNote = reason => `This worker ran without process-tree containment (${reason}), so tools it launched cannot be confirmed stopped. Checks, candidate recording, completion and the next turn wait until the coordinator verifies no process for this lane is running and records that with prior_turn_attestation.`;
 
 function toolList(value, name) {
   if (value === undefined) return undefined;
@@ -140,28 +143,44 @@ function waitForExit(child, timeoutMs) {
   });
 }
 
-function runKiller({ command, args }, timeoutMs) {
+// Resolves once the stream has closed, or after timeoutMs.
+function streamClosed(stream, timeoutMs) {
+  if (!stream || stream.closed || stream.destroyed) return Promise.resolve();
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); stream.off('close', done); resolve(); };
+    const timer = setTimeout(done, timeoutMs);
+    stream.once('close', done);
+  });
+}
+
+function runKiller({ command, args, env }, timeoutMs) {
   return new Promise(resolve => {
     let killer;
-    try { killer = spawn(command, args, { windowsHide: true, stdio: 'ignore', shell: false }); } catch { resolve(false); return; }
+    try { killer = spawn(command, args, { windowsHide: true, stdio: 'ignore', shell: false, ...(env ? { env: { ...process.env, ...env } } : {}) }); } catch { resolve(false); return; }
     const timer = setTimeout(() => { killer.kill(); resolve(false); }, timeoutMs);
     killer.once('error', () => { clearTimeout(timer); resolve(false); });
     killer.once('exit', code => { clearTimeout(timer); resolve(code === 0); });
   });
 }
 
+function settledWithin(turn, timeoutMs) {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, timeoutMs, false);
+    void turn.settled.then(() => { clearTimeout(timer); resolve(true); });
+  });
+}
+
 const defaultTreeKill = pid => (process.platform === 'win32' ? { command: 'taskkill.exe', args: ['/PID', String(pid), '/T', '/F'] } : null);
 
-// Resolves true only once the worker process has actually exited. taskkill /T also stops the
-// tools Claude launched; when it cannot run, fails or stalls, the direct child is terminated
-// instead and onDirectKill records that its descendants were not confirmed stopped. Only this
-// child's PID is ever targeted, and never after it has exited.
-async function terminateTree(child, treeKill, timeoutMs, onDirectKill = () => {}, onTreeKill = () => {}) {
+// Stops an uncontained worker and resolves true only once it has actually exited. taskkill /T
+// is tried first so the tools Claude launched are stopped where it can reach them, but it walks
+// parent PIDs and misses a tool whose parent already exited, so no uncontained stop confirms them.
+// Only this child's PID is ever targeted, and never after it has exited.
+async function terminateProcess(child, treeKill, timeoutMs) {
   if (!child || exited(child)) return true;
   const tree = treeKill(child.pid);
-  if (tree && await runKiller(tree, timeoutMs) && await waitForExit(child, timeoutMs)) { onTreeKill(); return true; }
+  if (tree && await runKiller(tree, timeoutMs) && await waitForExit(child, timeoutMs)) return true;
   if (exited(child)) return true;
-  onDirectKill();
   try { child.kill(); } catch { /* reported through the exit wait below */ }
   if (await waitForExit(child, timeoutMs)) return true;
   if (process.platform === 'win32') return false;
@@ -170,10 +189,15 @@ async function terminateTree(child, treeKill, timeoutMs, onDirectKill = () => {}
 }
 
 export class ClaudeWorkerBridge extends EventEmitter {
-  constructor({ launch, treeKill = defaultTreeKill, terminationTimeoutMs = TERMINATION_TIMEOUT_MS } = {}) {
+  // containment is the process-tree boundary (see process-tree.mjs); null runs every worker
+  // uncontained, so no worker exit or stop can confirm the tools it launched.
+  constructor({ launch, treeKill = defaultTreeKill, containment = defaultContainment(), terminationTimeoutMs = TERMINATION_TIMEOUT_MS, containmentStartMs = CONTAINMENT_START_MS } = {}) {
     super();
     this.launchOverride = launch;
     this.treeKill = treeKill;
+    this.containment = containment;
+    this.containmentUnavailable = null;
+    this.containmentStartMs = containmentStartMs;
     this.terminationTimeoutMs = terminationTimeoutMs;
     this.launch = null;
     this.threads = new Map();
@@ -266,12 +290,12 @@ export class ClaudeWorkerBridge extends EventEmitter {
     const stop = (child, termination) => stopping.push(termination.then(stopped => (stopped ? null : child.pid)));
     for (const meta of this.threads.values()) {
       const previous = meta.lingering;
-      if (previous && !exited(previous)) stop(previous, terminateTree(previous, this.treeKill, this.terminationTimeoutMs));
+      if (previous) stop(previous, this.#terminate(previous, meta.lingeringTurn).then(result => result.stopped));
       if (!meta.active) continue;
       affected.push(meta.id);
       const turn = meta.active;
       try { turn.child?.stdin?.end(); } catch { /* process already gone */ }
-      stop(turn.child, this.#stop(turn));
+      stop(turn.process, this.#stop(turn));
     }
     this.threads.clear();
     if (affected.length) this.emit('exit', new TheaterError('Claude worker bridge closed.', 'CLAUDE_CLOSED'), affected);
@@ -287,25 +311,45 @@ export class ClaudeWorkerBridge extends EventEmitter {
   #stop(turn) {
     turn.interrupted = true;
     clearTimeout(turn.graceTimer);
-    turn.termination ??= terminateTree(turn.child, this.treeKill, this.terminationTimeoutMs, () => { turn.descendantsUnconfirmed = true; }, () => { turn.treeStoppedGuardId = turn.guardId; });
+    turn.termination ??= this.#terminate(turn.process, turn).then(({ stopped, confirmed }) => {
+      if (stopped && confirmed) turn.treeStoppedGuardId = turn.guardId;
+      else if (stopped) turn.descendantsUnconfirmed = true;
+      return stopped;
+    });
     return turn.termination;
   }
 
-  // A finished turn's process normally exits once its stdin closes. If one is still running
-  // when the next turn starts it is given that chance, then stopped; two processes never share
-  // a session. This guard is in memory only and does not survive a bridge restart. Resolves with
-  // the process and turn IDs when only that process, not its tree, could be terminated, so tools it launched
-  // may still be running; otherwise null.
+  // Resolves { stopped, confirmed }. A contained worker is stopped by terminating its job, which
+  // also ends the warden; if that fails the warden itself is killed, and since it holds the job's
+  // only handle the kernel then ends every process in the job. Only the job can confirm the tree:
+  // the stop is confirmed once, after the warden exited, the job no longer exists or holds no process.
+  async #terminate(child, turn) {
+    if (!turn?.tree) return { stopped: await terminateProcess(child, this.treeKill, this.terminationTimeoutMs), confirmed: false };
+    if (!exited(child)) {
+      await runKiller(this.containment.stop(turn.tree.job), this.terminationTimeoutMs);
+      if (!(await waitForExit(child, this.terminationTimeoutMs))) {
+        try { child.kill(); } catch { /* reported through the exit wait below */ }
+        if (!(await waitForExit(child, this.terminationTimeoutMs))) return { stopped: false, confirmed: false };
+      }
+    }
+    return { stopped: true, confirmed: (await turn.settled) === 'confirmed' };
+  }
+
+  // A finished turn's process tree normally ends once the CLI's stdin closes. If it is still
+  // running when the next turn starts it is given that chance, then stopped; two processes never
+  // share a session. This guard is in memory only and does not survive a bridge restart. Resolves
+  // with the process and turn IDs when the tree could not be confirmed stopped, so tools it
+  // launched may still be running; otherwise null or the guard its confirmed stop cleared.
   async #settlePrevious(threadId) {
     const meta = this.#thread(threadId);
     if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     const previous = meta.lingering;
-    const previousTurnId = meta.lingeringTurnId;
-    const previousGuardId = meta.lingeringGuardId;
-    if (!previous || exited(previous)) return null;
-    if (await waitForExit(previous, this.terminationTimeoutMs)) return null;
-    let directOnly = false;
-    if (await terminateTree(previous, this.treeKill, this.terminationTimeoutMs, () => { directOnly = true; })) return directOnly ? { orphaned: { pid: previous.pid, turnId: previousTurnId } } : { treeStoppedGuardId: previousGuardId };
+    const turn = meta.lingeringTurn;
+    if (!previous) return null;
+    // A tree that ends by itself is reported through its own settlement.
+    if (await settledWithin(turn, this.terminationTimeoutMs)) return null;
+    const { stopped, confirmed } = await this.#terminate(previous, turn);
+    if (stopped) return confirmed ? { treeStoppedGuardId: turn.guardId } : { orphaned: { pid: previous.pid, turnId: turn.id } };
     throw refusedRequest(new TheaterError(`Claude worker process ${previous.pid} from an earlier turn is still running in ${meta.cwd} and could not be stopped; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING'));
   }
 
@@ -326,11 +370,10 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (meta?.unconfirmedDescendants?.turnId === turnId) meta.unconfirmedDescendants = null;
   }
 
-  #track(meta, child, turnId, guardId) {
+  #track(meta, child, turn) {
     meta.lingering = child;
-    meta.lingeringTurnId = turnId;
-    meta.lingeringGuardId = guardId;
-    child.once('exit', () => { if (meta.lingering === child) { meta.lingering = null; meta.lingeringTurnId = null; meta.lingeringGuardId = null; } });
+    meta.lingeringTurn = turn;
+    void turn.settled.then(() => { if (meta.lingering === child) { meta.lingering = null; meta.lingeringTurn = null; } });
   }
 
   async #startTurn({ threadId, input, effort, guardId = null }) {
@@ -340,10 +383,62 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
     if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     meta.lingering = null;
-    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, interrupted: false, child: null, termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
-    const args = [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)];
-    const child = spawn(this.launch.command, args, { cwd: meta.cwd, env: workerEnvironment(), windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
+    turn.settled = new Promise(resolve => { turn.resolveSettled = resolve; });
+    await this.#launch(meta, turn, { command: this.launch.command, args: [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)] });
+    meta.active = turn;
+    meta.turns = [...meta.turns, turn].slice(-RETAINED_TURNS);
+    meta.updatedAt = now();
+    // The new turn now carries this uncertainty into its completion record.
+    meta.unconfirmedDescendants = null;
+    // Recorded with the durable guard, so a later controller can prove the tree ended.
+    if (turn.tree && guardId) this.emit('notification', { method: 'worker/contained', params: { threadId, guardId, job: turn.tree.job } });
+    this.emit('notification', { method: 'turn/started', params: { threadId, turn: { id: turn.id, status: 'inProgress' } } });
+    this.#send(turn, textOf(input));
+    return { turn: { id: turn.id }, treeStoppedGuardId: settled?.treeStoppedGuardId ?? null };
+  }
+
+  // Starts the CLI under the containment warden, which reports on stderr once the job holds it.
+  // If the warden cannot establish containment, the CLI never started under it and this bridge
+  // falls back, for this and later turns, to uncontained workers that never confirm a tree.
+  async #launch(meta, turn, cli) {
+    const contained = this.containment && !this.containmentUnavailable ? this.containment.launch(cli, this.containment.jobName(turn.guardId ?? turn.id)) : null;
+    if (contained) {
+      const { job } = contained;
+      const warden = this.#spawn(meta, turn, contained, contained.token);
+      const started = await new Promise(resolve => {
+        const finish = result => { if (!warden.startup) return; warden.startup = null; clearTimeout(timer); resolve(result); };
+        const timer = setTimeout(() => { try { warden.kill(); } catch { /* reported below */ } finish({ unavailable: `the warden did not start the worker within ${Math.round(this.containmentStartMs / 1000)}s` }); }, this.containmentStartMs);
+        warden.startup = finish;
+      });
+      if (started === 'started') {
+        turn.tree = { job };
+        return;
+      }
+      // Not a refusal: a warden still running may yet start the CLI, so its guard must stay.
+      if (!(await waitForExit(warden, this.terminationTimeoutMs))) throw new TheaterError(`The Claude worker warden ${warden.pid} did not exit after failing to start; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING');
+      if (started.launchFailed) throw refusedRequest(new TheaterError(`Unable to launch the Claude worker: ${boundedHead(started.launchFailed)}`, 'CLAUDE_LAUNCH_FAILED'));
+      this.containmentUnavailable = boundedHead(started.unavailable);
+      process.stderr.write(`[feature-theater] Claude worker process-tree containment is unavailable: ${this.containmentUnavailable}\n`);
+    }
+    turn.uncontained = this.containmentUnavailable
+      ?? (this.containment ? `${path.basename(cli.command)} is not a native executable` : 'no process-tree containment is available on this platform');
+    const child = this.#spawn(meta, turn, cli, null);
+    turn.process = child;
     turn.child = child;
+    await new Promise((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', error => reject(refusedRequest(error)));
+    });
+  }
+
+  // token: the containment warden's report token, or null for an uncontained CLI.
+  #spawn(meta, turn, { command, args, env = {} }, token) {
+    const contained = token !== null;
+    const reportMark = `${TREE_MARK}${token} `;
+    const child = spawn(command, args, { cwd: meta.cwd, env: { ...workerEnvironment(), ...env }, windowsHide: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    // Output belongs to the turn once this is its process; a warden that failed to start the CLI has none.
+    const current = () => turn.process === child || (!turn.process && !contained);
     let buffer = '';
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -353,47 +448,104 @@ export class ClaudeWorkerBridge extends EventEmitter {
       while ((newline = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, newline).trim();
         buffer = buffer.slice(newline + 1);
-        if (!line) continue;
+        if (!line || !current()) continue;
         let message;
         try { message = JSON.parse(line); } catch { continue; }
         this.#event(meta, turn, message);
       }
     });
-    child.stderr.on('data', chunk => { turn.stderrTail = (turn.stderrTail + chunk).slice(-STDERR_TAIL_CHARS); });
+    let wardenText = '';
+    const stderrText = text => {
+      if (current()) turn.stderrTail = (turn.stderrTail + text).slice(-STDERR_TAIL_CHARS);
+      else wardenText = (wardenText + text).slice(-STDERR_TAIL_CHARS);
+    };
+    if (!contained) child.stderr.on('data', stderrText);
+    else {
+      // The warden's reports are whole lines, carrying its token, on the stderr it shares with the
+      // CLI and its tools; anything else there is their output.
+      let partial = '';
+      child.stderr.on('data', chunk => {
+        const lines = (partial + chunk).split('\n');
+        partial = lines.pop();
+        for (const line of lines) {
+          const at = line.indexOf(reportMark);
+          if (at < 0) { stderrText(`${line}\n`); continue; }
+          if (at > 0) stderrText(`${line.slice(0, at)}\n`);
+          this.#marker(meta, turn, child, line.slice(at + reportMark.length).trim());
+        }
+      });
+      child.stderr.once('end', () => { if (partial) stderrText(partial); });
+    }
     // A dead worker surfaces through its exit; a write to its closed stdin must not crash the host.
     child.stdin.on('error', () => {});
     child.on('error', error => {
+      if (child.startup) return child.startup({ unavailable: error.message });
       // Before spawn this is a launch failure; afterwards it is a failed kill, which termination reports.
-      if (child.pid === undefined) void this.#finish(meta, turn, 'failed', `Unable to launch the Claude worker: ${boundedHead(error.message)}`);
+      if (child.pid === undefined && current()) {
+        turn.resolveSettled('unconfirmed');
+        void this.#finish(meta, turn, 'failed', `Unable to launch the Claude worker: ${boundedHead(error.message)}`);
+      }
     });
     child.once('exit', code => {
-      this.#reportCleanExit(meta, turn);
-      // stdout can still hold the final result when the process exits; let it drain briefly.
       const settle = () => {
-        if (turn.status !== 'inProgress') return;
-        // An interrupted turn is decided by its termination, even while a failed result waits for
-        // stderr; that result's redacted diagnostic is kept. Otherwise the failed result's own
-        // finish waits for stderr.
-        if (turn.interrupted) return this.#finishInterrupted(meta, turn);
-        if (turn.failedResult) return;
-        void this.#finish(meta, turn, 'failed', `Claude worker exited (${code}) before completing the turn. ${stderrExcerpt(turn.stderrTail)}`.trim());
+        child.startup?.({ unavailable: `the warden exited (${code}) before starting the worker${wardenText.trim() ? `: ${stderrExcerpt(wardenText)}` : ''}` });
+        if (turn.process !== child) return;
+        if (!contained) this.#cliExited(meta, turn, child, code);
+        void this.#settleTree(meta, turn, child, code);
       };
-      if (child.stdout.readableEnded) return settle();
-      const timer = setTimeout(settle, EXIT_DRAIN_MS);
-      child.stdout.once('end', () => { clearTimeout(timer); settle(); });
+      // A warden's reports, read from stderr, can arrive after its exit.
+      if (contained) void streamClosed(child.stderr, EXIT_DRAIN_MS).then(settle);
+      else settle();
     });
-    await new Promise((resolve, reject) => {
-      child.once('spawn', resolve);
-      child.once('error', error => reject(refusedRequest(error)));
-    });
-    meta.active = turn;
-    meta.turns = [...meta.turns, turn].slice(-RETAINED_TURNS);
-    meta.updatedAt = now();
-    // The new turn now carries this uncertainty into its completion record.
-    meta.unconfirmedDescendants = null;
-    this.emit('notification', { method: 'turn/started', params: { threadId, turn: { id: turn.id, status: 'inProgress' } } });
-    this.#send(turn, textOf(input));
-    return { turn: { id: turn.id }, treeStoppedGuardId: settled?.treeStoppedGuardId ?? null };
+    return child;
+  }
+
+  #marker(meta, turn, child, report) {
+    const [kind, ...rest] = report.split(' ');
+    const detail = rest.join(' ');
+    if (kind === 'started' && child.startup) {
+      turn.process = child;
+      turn.child = child;
+      child.startup('started');
+    } else if (kind === 'launch-failed' || kind === 'unavailable') {
+      child.startup?.(kind === 'launch-failed' ? { launchFailed: detail } : { unavailable: detail });
+    } else if (kind === 'exit' && turn.process === child) {
+      this.#cliExited(meta, turn, child, Number(detail));
+    }
+  }
+
+  // The CLI itself has exited; the tools it launched may still be running.
+  #cliExited(meta, turn, child, code) {
+    if (turn.cliExited) return;
+    turn.cliExited = true;
+    // stdout can still hold the final result when the process exits; let it drain briefly.
+    const settle = () => {
+      if (turn.status !== 'inProgress') return;
+      // An interrupted turn is decided by its termination, even while a failed result waits for
+      // stderr; that result's redacted diagnostic is kept. Otherwise the failed result's own
+      // finish waits for stderr.
+      if (turn.interrupted) return this.#finishInterrupted(meta, turn);
+      if (turn.failedResult) return;
+      void this.#finish(meta, turn, 'failed', `Claude worker exited (${code}) before completing the turn. ${stderrExcerpt(turn.stderrTail)}`.trim());
+    };
+    if (child.stdout.readableEnded) return settle();
+    const timer = setTimeout(settle, EXIT_DRAIN_MS);
+    child.stdout.once('end', () => { clearTimeout(timer); settle(); });
+  }
+
+  // Runs once the turn's process has exited: the warden, which normally outlives every process in
+  // its job, or an uncontained CLI, whose tools can never be confirmed stopped. The warden's own
+  // reports do not decide this: the tree has ended only if its job is gone or holds no process.
+  async #settleTree(meta, turn, child, code) {
+    let state = 'unconfirmed';
+    if (turn.tree) {
+      // A warden that reported no CLI exit was itself ended, and the job with it.
+      this.#cliExited(meta, turn, child, code);
+      if (['absent', 'empty'].includes(await this.containment.query(turn.tree.job))) state = 'confirmed';
+    }
+    turn.treeState = state;
+    turn.resolveSettled(state);
+    this.#reportCleanExit(meta, turn);
   }
 
   #send(turn, text) {
@@ -417,7 +569,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     const meta = this.#thread(threadId);
     const turn = meta.active;
     if (!turn || turn.id !== turnId) return { interrupted: false };
-    const pid = turn.child.pid;
+    const pid = turn.process.pid;
     if (await this.#stop(turn)) return { interrupted: true, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}), ...(turn.treeStoppedGuardId ? { treeStoppedGuardId: turn.treeStoppedGuardId } : {}) };
     const message = `Interrupt could not stop Claude worker process ${pid}; it may still be running in ${meta.cwd}. The next turn start retries stopping it.`;
     await this.#finish(meta, turn, 'failed', message);
@@ -515,7 +667,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
       stderr?.off('close', done);
       if (!turn.interrupted) return failWith();
       // If the worker exited first, its exit handler has already passed this turn by.
-      if (child && exited(child)) this.#finishInterrupted(meta, turn);
+      if (turn.cliExited) this.#finishInterrupted(meta, turn);
     };
     if (!stderr || stderr.readableEnded || stderr.destroyed) return done();
     timer = setTimeout(done, EXIT_DRAIN_MS);
@@ -524,8 +676,9 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   // An interrupted turn keeps the redacted diagnostic of a failed result it was still waiting on.
+  // It ends once termination has decided whether its tools are confirmed stopped.
   #finishInterrupted(meta, turn) {
-    void this.#finish(meta, turn, 'interrupted', turn.failedResult ? redactString([failedResultDiagnostic(turn.failedResult, turn.stderrTail), ...turn.text].join('\n')) : undefined);
+    void Promise.resolve(turn.termination).then(() => this.#finish(meta, turn, 'interrupted', turn.failedResult ? redactString([failedResultDiagnostic(turn.failedResult, turn.stderrTail), ...turn.text].join('\n')) : undefined));
   }
 
   #scheduleDiff(meta, turn) {
@@ -537,8 +690,10 @@ export class ClaudeWorkerBridge extends EventEmitter {
     }, DIFF_DEBOUNCE_MS);
   }
 
+  // Clears the durable guard only once the turn has ended and its whole process tree is confirmed
+  // stopped; the CLI's own exit proves nothing about the tools it launched.
   #reportCleanExit(meta, turn) {
-    if (turn.status !== 'completed' || turn.descendantsUnconfirmed || !turn.guardId || turn.cleanExitReported) return;
+    if (turn.status === 'inProgress' || turn.treeState !== 'confirmed' || turn.descendantsUnconfirmed || !turn.guardId || turn.cleanExitReported) return;
     turn.cleanExitReported = true;
     this.emit('notification', { method: 'worker/exited', params: { threadId: meta.id, guardId: turn.guardId } });
   }
@@ -566,7 +721,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (meta.active === turn) meta.active = null;
     meta.updatedAt = now();
     const child = turn.child;
-    if (child && child.pid !== undefined && !exited(child)) this.#track(meta, child, turn.id, turn.guardId);
+    if (turn.process?.pid !== undefined && turn.treeState === 'running') this.#track(meta, turn.process, turn);
     try { child?.stdin?.end(); } catch { /* process already gone */ }
     const patch = await this.#workingPatch(meta).catch(() => null);
     if (patch) this.emit('notification', { method: 'turn/diff/updated', params: { threadId: meta.id, turnId: turn.id, diff: patch } });
@@ -576,10 +731,11 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (text) items.push({ type: 'agentMessage', text: status === 'failed' ? redactString(text) : text });
     if (turn.descendantsUnconfirmed && status === 'interrupted') items.push({ type: 'agentMessage', text: 'The worker process tree could not be ended as a whole, so only the worker process itself was terminated; tools it launched may still be running.' });
     if (turn.denials.length) items.push({ type: 'agentMessage', text: `Worker permission policy denied ${turn.denials.length} tool call(s): ${[...new Set(turn.denials)].join(', ')}. Route those needs through the coordinator.` });
+    if (turn.uncontained && status === 'completed') items.push({ type: 'agentMessage', text: uncontainedNote(turn.uncontained) });
     turn.items = items;
     turn.text = [];
     turn.child = null;
     this.emit('notification', { method: 'turn/completed', params: { threadId: meta.id, turn: { id: turn.id, status, items, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) } } });
-    if (exited(child)) this.#reportCleanExit(meta, turn);
+    this.#reportCleanExit(meta, turn);
   }
 }

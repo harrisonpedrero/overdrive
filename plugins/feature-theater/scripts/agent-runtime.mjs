@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
 import { summarizePatch, TheaterError, parseJsonObject, requiredText, redactString } from './util.mjs';
 import { adoptAgentObservation, withAgentControl, withLaneStop } from './ownership.mjs';
+import { workerJobState } from './process-tree.mjs';
 import {
   attestDescendantsStopped,
   bindAgentSession,
@@ -16,6 +17,7 @@ import {
   readUnconfirmedDescendants,
   readWorkerGuards,
   recordAgentEvent,
+  recordWorkerGuardJob,
   registerWorkerGuard,
   releaseAgentSession,
   resolveAgentRequestRecord,
@@ -146,6 +148,10 @@ async function onNotification({ method, params }) {
   const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
   if (method === 'worker/exited') {
     await clearWorkerGuards({ ...base, guard_id: params.guardId });
+    return;
+  }
+  if (method === 'worker/contained') {
+    await recordWorkerGuardJob({ ...base, thread_id: params.threadId, guard_id: params.guardId, job: params.job });
     return;
   }
   if (method === 'serverRequest/resolved') {
@@ -406,6 +412,51 @@ async function reconcileDispatch(runtime, attestation = null) {
   throw new TheaterError(`The last turn request for ${runtime.feature.slug} has no confirmed outcome and ${reason}, so no new turn was started. ${UNCERTAIN_NEXT}`, 'DISPATCH_UNCERTAIN');
 }
 
+// Clears durable worker guards whose containment job no longer exists or holds no process: once
+// its last handle has closed, the kernel has ended every process launched under it. Guards
+// without a job stay.
+async function recoverWorkerGuards(args) {
+  for (const guard of await readWorkerGuards(args)) {
+    if (guard.job && ['absent', 'empty'].includes(await workerJobState(guard.job))) await clearWorkerGuards({ ...args, guard_id: guard.id, job_gone: true });
+  }
+}
+
+const WORKERS_NEXT = 'Wait for them to stop or pause the lane, which stops a process tree this controller holds. If you verify under your existing authority that no process for this lane is running (for example by checking the processes whose working directory is its checkout), retry with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline.';
+
+// Before a new turn, settle trees this bridge holds and clear only guards whose jobs ended.
+// An attestation covers only prior records and never a job that still exists.
+async function assertWorkersSettled(runtime, attestation) {
+  const args = { workspace_path: runtime.root, feature: runtime.feature.slug };
+  const priorGeneration = (await readUnconfirmedDescendants(args))?.generation ?? null;
+  const priorGuards = new Set((await readWorkerGuards(args)).map(guard => guard.id));
+  const threadId = runtime.feature.thread_id;
+  if (threadId) {
+    try {
+      const settled = await bridge.settleThread?.({ threadId });
+      if (settled?.treeStoppedGuardId) await clearWorkerGuards({ ...args, guard_id: settled.treeStoppedGuardId });
+    } catch (error) {
+      if (error.code !== 'CLAUDE_DESCENDANTS_UNCONFIRMED') throw error;
+      const recorded = await enqueueStateWork(() => markDescendantsUnconfirmed({ ...args, owner_token: ownerToken, thread_id: threadId, turn_id: error.details?.turnId ?? null, summary: redactString(error.message) }));
+      if (!recorded.ignored) bridge.acknowledgeDescendants?.({ threadId, turnId: error.details?.turnId });
+    }
+  }
+  // Clean-exit reports the settlement produced are applied first.
+  await notificationQueue;
+  await recoverWorkerGuards(args);
+  let marker = await readUnconfirmedDescendants(args);
+  if (marker && attestation && marker.generation === priorGeneration && (await attestDescendantsStopped({ ...args, evidence: attestation.evidence, generation: marker.generation })).cleared) marker = null;
+  let guards = await readWorkerGuards(args);
+  if (guards.length && attestation) {
+    for (const guard of guards) {
+      if (priorGuards.has(guard.id) && !(guard.job && (await workerJobState(guard.job)) === 'present')) await clearWorkerGuards({ ...args, guard_id: guard.id, evidence: attestation.evidence });
+    }
+    guards = await readWorkerGuards(args);
+  }
+  if (!marker && !guards.length) return;
+  const reason = marker ? marker.summary : `${guards.length} worker process tree(s) from earlier turns of this lane have no confirmed exit, so tools they launched may still be running.`;
+  throw new TheaterError(`No turn was started for ${runtime.feature.slug}: ${reason} ${WORKERS_NEXT}`, 'WORKERS_UNCONFIRMED', { workerGuards: guards.length, descendantsUnconfirmed: Boolean(marker) });
+}
+
 async function dispatchTurn(runtime, threadId, instruction, effort, created = false) {
   const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: threadId, owner_token: ownerToken };
   const guardId = runtime.harness === 'claude' ? randomUUID() : null;
@@ -434,6 +485,8 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
       });
       throw error;
     }
+    // A refused request launched no worker, so its own guard is released; earlier ones stay.
+    if (guardId) await clearWorkerGuards({ ...base, guard_id: guardId, unused: true });
     await enqueueStateWork(async () => {
       // A replacement that never ran a turn is abandoned and the previous binding kept.
       if (created && !(await releaseAgentSession({
@@ -453,6 +506,7 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
   if (!runtime.feature.spec_revision) throw new TheaterError('Save a concrete feature specification before starting its agent.', 'SPEC_REQUIRED');
   await reconcileDispatch(runtime, attestation);
   if (runtime.feature.active_turn_id) throw new TheaterError(`Feature already has active turn ${runtime.feature.active_turn_id}; steer it instead.`, 'TURN_ACTIVE');
+  await assertWorkersSettled(runtime, attestation);
   await bridge.ensureStarted();
   let threadId = runtime.feature.thread_id;
   let created = false;
@@ -505,6 +559,7 @@ async function steerOwned({ workspace_path, feature, effort = 'high' }, directio
     });
     mode = 'mid_turn';
   } else {
+    await assertWorkersSettled(runtime, null);
     if (runtime.feature.compaction_pending) {
       await compactThreadAndWait(runtime);
     }
@@ -559,6 +614,14 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
     } catch (error) {
       warning = `Native task could not be refreshed: ${error.message}`;
     }
+  }
+  // A guard whose recorded job proves its tree ended (for example after the controller holding it
+  // exited before recording the exit) is cleared here, so checks can proceed without a new turn.
+  // Guards whose tree may still run, or that have no job, stay.
+  try {
+    await recoverWorkerGuards({ workspace_path: runtime.root, feature: runtime.feature.slug });
+  } catch (error) {
+    warning ??= `Worker guards could not be re-checked: ${redactString(error.message)}`;
   }
   const context = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 30 });
   const turnId = context.feature.agent.activeTurnId;
@@ -781,6 +844,10 @@ async function stopForStatus({ prior_turn_attestation = undefined, ...args }, ro
       throw await stopUnconfirmed(lane, args.status, `a worker process from an earlier turn ${error.code === 'CLAUDE_DESCENDANTS_UNCONFIRMED' ? 'left tools that may still be running' : 'is still running'} (${redactString(error.message)}).`, { lingeringProcess: true });
     }
   }
+  // Clean-exit reports the settlement produced are applied first; a later controller can still
+  // prove from a missing containment job that a tree it never held has ended.
+  await notificationQueue;
+  await recoverWorkerGuards(args);
   const marker = await readUnconfirmedDescendants(args);
   // A stop that itself left descendants unconfirmed is refused whatever attestation it carries.
   const attestable = attestation && !interruption?.descendantsUnconfirmed && marker?.generation === priorGeneration;
@@ -790,6 +857,8 @@ async function stopForStatus({ prior_turn_attestation = undefined, ...args }, ro
   const guards = await readWorkerGuards(args);
   if (guards.length) {
     if (!attestation || interruption?.descendantsUnconfirmed) throw await stopUnconfirmed(lane, args.status, `a Claude worker process from this lane has no confirmed process-tree exit. ${ATTEST_NEXT}`, { workerGuards: guards.length });
+    const running = (await Promise.all(guards.map(guard => (guard.job ? workerJobState(guard.job) : 'unknown')))).filter(state => state === 'present').length;
+    if (running) throw await stopUnconfirmed(lane, args.status, `${running} worker process tree(s) from this lane still exist, so tools they launched may still be running and an attestation cannot cover them. Stop them from the controller holding them, or wait for them to end.`, { workerGuards: guards.length, runningJobs: running });
     await clearWorkerGuards({ ...args, evidence: attestation.evidence });
   }
   const result = await setStoppedFeatureStatus(args);

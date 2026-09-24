@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
 import { ClaudeWorkerBridge, ISOLATION_ARGS, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/feature-theater/scripts/claude-worker.mjs';
 import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, setFeatureStatus, workerHarness } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, recordCandidate, setFeatureStatus, workerHarness } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeCli = path.join(here, 'fixtures', 'fake-claude-cli.mjs');
@@ -218,10 +219,11 @@ test('an interrupt during a failed result stderr wait decides the turn by termin
   };
 
   // A stopped worker: the interrupt succeeds and the turn is interrupted, keeping the diagnostic.
+  // Uncontained, even a successful tree kill cannot confirm the tools it launched.
   for (const [script, exitFirst] of [[stays, false], [exits, true]]) {
     const { bridge, threadId, turnId, child, completed } = await bridgeTurn(t, { input: 'go', treeKill: treeKiller, launchArgs: ['-e', script, '--'] });
     await waiting(bridge, threadId, child, exitFirst);
-    assert.deepEqual(await bridge.request('turn/interrupt', { threadId, turnId }), { interrupted: true });
+    assert.deepEqual(await bridge.request('turn/interrupt', { threadId, turnId }), { interrupted: true, descendantsUnconfirmed: true });
     await settled(bridge, threadId, completed, 'interrupted');
     assert.match(completed[0].items[0].text, diagnostic);
   }
@@ -250,9 +252,11 @@ test('claude harness interrupt ends a hanging turn as interrupted', async t => {
 const failingKiller = () => ({ command: process.execPath, args: ['-e', 'process.exit(1)'] });
 const stalledKiller = () => ({ command: process.execPath, args: ['-e', 'setTimeout(() => {}, 60000)'] });
 
+// Bridge-level turns run uncontained unless a test opts in, so stubbed killers and processes
+// model the worker process itself; containment has its own tests.
 async function bridgeTurn(t, { input = 'hang', launchArgs = [fakeCli], ...options } = {}) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-bridge-'));
-  const bridge = new ClaudeWorkerBridge({ launch: { command: process.execPath, args: launchArgs }, terminationTimeoutMs: 500, ...options });
+  const bridge = new ClaudeWorkerBridge({ launch: { command: process.execPath, args: launchArgs }, terminationTimeoutMs: 500, containment: null, ...options });
   const completed = [];
   bridge.on('notification', message => { if (message.method === 'turn/completed') completed.push(message.params.turn); });
   let child;
@@ -274,7 +278,7 @@ async function bridgeTurn(t, { input = 'hang', launchArgs = [fakeCli], ...option
 }
 
 test('claude interrupt report waits for the worker to exit', async t => {
-  const { args, runtime } = await fixture(t, { treeKill: failingKiller, terminationTimeoutMs: 500 });
+  const { args, runtime } = await fixture(t, { treeKill: failingKiller, terminationTimeoutMs: 500, containment: null });
   await runtime.startFeatureAgent({ ...args, instruction: 'hang' });
   await eventually(async () => (await agentStatus(args)) === 'running');
   const interrupted = await runtime.interruptFeatureAgent(args);
@@ -374,7 +378,7 @@ test('claude interrupt that cannot stop the worker fails visibly and blocks the 
 
 test('pausing a claude lane is refused while its worker process still runs, even after the turn record ends', async t => {
   const stubborn = ['-e', 'process.stdin.resume(); setInterval(() => {}, 1000);', '--'];
-  const { args, bridge, runtime } = await fixture(t, { launch: { command: process.execPath, args: stubborn }, treeKill: failingKiller, terminationTimeoutMs: 500 });
+  const { args, bridge, runtime } = await fixture(t, { launch: { command: process.execPath, args: stubborn }, treeKill: failingKiller, terminationTimeoutMs: 500, containment: null });
   const started = await runtime.startFeatureAgent(args);
   const worker = bridge.backend('claude').threads.get(started.threadId).active.child;
   t.after(async () => {
@@ -418,15 +422,15 @@ const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) 
 
 test('a pause that ends the worker but not the tools it launched is refused until they are verified stopped', async t => {
   const pidFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-tool-')), 'tool.pid');
-  const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', toolLauncher, '--', pidFile] }, treeKill: failingKiller, terminationTimeoutMs: 500 });
+  const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', toolLauncher, '--', pidFile] }, treeKill: failingKiller, terminationTimeoutMs: 500, containment: null });
   const tools = [];
   t.after(async () => {
     for (const pid of tools) if (alive(pid)) process.kill(pid);
     await fs.rm(path.dirname(pidFile), { recursive: true, force: true, maxRetries: 5 });
   });
-  const launch = async instruction => {
+  const launch = async (instruction, extra = {}) => {
     await fs.rm(pidFile, { force: true });
-    await runtime.startFeatureAgent({ ...args, instruction });
+    await runtime.startFeatureAgent({ ...args, instruction, ...extra });
     let pid = 0;
     await eventually(async () => { try { pid = Number(await fs.readFile(pidFile, 'utf8')); return pid > 0; } catch { return false; } });
     tools.push(pid);
@@ -454,16 +458,20 @@ test('a pause that ends the worker but not the tools it launched is refused unti
   assert.ok(alive(first));
   assert.equal((await lane()).status, 'active');
 
-  // A second turn leaves a new unconfirmed tool while the first marker is still recorded. An
-  // attestation sent with the stop that produced it cannot cover it, though it names a real check.
+  // No next turn starts while the first tool is unconfirmed. Once it is verified stopped, a turn
+  // start carrying that attestation clears the marker and runs; the second turn leaves a new
+  // unconfirmed tool, and an attestation sent with the stop that produced it cannot cover it,
+  // though it names a real check.
   await stopTool(first);
-  const second = await launch('second');
+  await assert.rejects(runtime.startFeatureAgent({ ...args, instruction: 'second' }), error => error.code === 'WORKERS_UNCONFIRMED' && error.details?.descendantsUnconfirmed === true);
+  const second = await launch('second', { prior_turn_attestation: { evidence: `Verified process ${first} launched by the worker has exited.` } });
   await assert.rejects(pause({ prior_turn_attestation: { evidence: `Verified process ${first} launched by the worker has exited.` } }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.descendantsUnconfirmed === true);
   assert.ok(alive(second), 'the second tool is still running');
   state = await lane();
   assert.equal(state.status, 'active');
   assert.ok(!state.events.includes('feature.paused'));
-  assert.ok(!state.events.includes('agent.descendants_attested'));
+  // Only the turn start's attestation, for the first tool, was recorded.
+  assert.equal(state.events.filter(kind => kind === 'agent.descendants_attested').length, 1);
 
   // After the tool is really stopped, the coordinator's recorded attestation clears the marker.
   await stopTool(second);
@@ -477,7 +485,7 @@ const lingering = "process.stdin.once('data', () => process.stdout.write(JSON.st
 const treeKiller = pid => ({ command: process.execPath, args: ['-e', `process.kill(${pid})`] });
 
 test('a second controller cannot pause an idle lane whose owner may still hold a worker process', async t => {
-  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, treeKill: treeKiller, terminationTimeoutMs: 500 };
+  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, terminationTimeoutMs: 500 };
   const { args, bridge, runtime: owner } = await fixture(t, claude);
   const started = await owner.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle');
@@ -500,7 +508,7 @@ test('a second controller cannot pause an idle lane whose owner may still hold a
 });
 
 test('after owner loss an idle lingering Claude worker requires durable stop evidence', async t => {
-  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, treeKill: treeKiller, terminationTimeoutMs: 500 };
+  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, terminationTimeoutMs: 500 };
   const { args, bridge, runtime } = await fixture(t, claude);
   const started = await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle');
@@ -510,11 +518,20 @@ test('after owner loss an idle lingering Claude worker requires durable stop evi
   expireControllerOwner(args.workspace_path);
   const restarted = createAgentRuntime(new WorkerBridge({ claude }));
   t.after(() => restarted.shutdownAgentRuntime());
+  // The job still exists, so the later controller cannot treat the tree as ended.
   await assert.rejects(restarted.stopFeatureLane({ ...args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.workerGuards === 1);
+  // Nor can an attestation speak for a tree whose job proves it may still be running.
+  await assert.rejects(restarted.stopFeatureLane({ ...args, status: 'paused', prior_turn_attestation: { evidence: 'Claimed stopped.' } }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.runningJobs === 1);
+  assert.equal(worker.exitCode, null);
   assert.equal((await getFeatureContext(args)).feature.status, 'active');
+  // The first controller ends the tree without recording it, as if it exited while doing so.
+  bridge.removeAllListeners('notification');
   await bridge.settleThread({ threadId: started.threadId });
-  assert.equal((await restarted.stopFeatureLane({ ...args, status: 'paused', prior_turn_attestation: { evidence: `Verified worker ${worker.pid} and its process tree exited.` } })).feature.status, 'paused');
+  assert.ok(worker.exitCode !== null || worker.signalCode !== null);
+  // Once the tree is gone, its missing job proves it without an attestation.
+  assert.equal((await restarted.stopFeatureLane({ ...args, status: 'paused' })).feature.status, 'paused');
   assert.deepEqual(await readWorkerGuards(args), []);
+  assert.ok((await getFeatureContext({ ...args, timeline_limit: 50 })).timeline.some(entry => entry.kind === 'agent.worker_stopped' && entry.details?.basis === 'job_gone'));
   await setFeatureStatus({ ...args, status: 'active' });
   assert.ok((await restarted.startFeatureAgent(args)).turnId);
   await restarted.shutdownAgentRuntime();
@@ -525,24 +542,204 @@ test('a normally completed Claude turn clears its worker guard before an idle pa
   const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', script, '--'] } });
   await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle' && (await readWorkerGuards(args)).length === 0);
+  // The next turn needs no attestation either, and clears in turn.
+  assert.ok((await runtime.startFeatureAgent(args)).turnId);
+  await eventually(async () => (await agentStatus(args)) === 'idle' && (await readWorkerGuards(args)).length === 0);
   assert.equal((await runtime.stopFeatureLane({ ...args, status: 'paused' })).feature.status, 'paused');
 });
 
-test('controller exit before a clean worker-exit notification leaves the durable guard', async t => {
-  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, terminationTimeoutMs: 500 };
-  const { args, bridge, runtime } = await fixture(t, claude);
-  const started = await runtime.startFeatureAgent(args);
+const lingeringTool = path.join(here, 'fixtures', 'lingering-tool.mjs');
+
+test('a tool that outlives its Claude turn keeps checks, candidates, completion and the next turn closed until its tree ends', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
+  // 'tool-tree' is an ordinary shell -> test runner -> test process chain, as npm test run by a
+  // Bash tool call; 'spoof' also writes forged containment reports to the stderr it shares.
+  for (const [mode, ending] of [['detached', 'exits'], ['tool-tree', 'exits'], ['spoof', 'exits'], ['detached', 'pause'], ['tool-tree', 'next-turn']]) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-tool-'));
+    const pidFile = path.join(dir, 'tool.pid');
+    const release = path.join(dir, 'release');
+    const { args, bridge, runtime } = await fixture(t, { launch: { command: process.execPath, args: [lingeringTool, 'cli', mode, pidFile, release] }, terminationTimeoutMs: 500 });
+    let pid = 0;
+    t.after(async () => {
+      await fs.writeFile(release, '').catch(() => {});
+      if (pid && alive(pid)) process.kill(pid);
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5 });
+    });
+    await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+    await runtime.startFeatureAgent(args);
+    await eventually(async () => (await agentStatus(args)) === 'idle' && Number(await fs.readFile(pidFile, 'utf8').catch(() => '0')) > 0);
+    pid = Number(await fs.readFile(pidFile, 'utf8'));
+    // The CLI has reported and exited; only its tool still runs.
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+    assert.ok(alive(pid), `${mode}: the tool is still running`);
+    const [guard, ...others] = await readWorkerGuards(args);
+    assert.equal(others.length, 0);
+    // Containment really ran: the guard names its job and the bridge did not fall back.
+    assert.match(guard?.job ?? '', /^Global\\overdrive-worker-/, `${mode}: the CLI exit did not clear the guard, and it names its job`);
+    assert.equal(bridge.backend('claude').containmentUnavailable, null);
+    const guarded = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1;
+    await assert.rejects(runChecks(args), guarded);
+    await assert.rejects(recordCandidate({ ...args, summary: 'While the tool runs.', checks: ['README receipt'] }), guarded);
+    await assert.rejects(setFeatureStatus({ ...args, status: 'done' }), guarded);
+    assert.equal((await getFeatureContext(args)).feature.status, 'active');
+
+    if (ending === 'exits') {
+      // The tree ends by itself, so the guard clears without any attestation and delivery proceeds.
+      await fs.writeFile(release, '');
+      await eventually(async () => (await readWorkerGuards(args)).length === 0);
+      assert.ok(!alive(pid));
+      assert.ok((await runChecks(args)).verification.ready);
+      assert.equal((await recordCandidate({ ...args, summary: 'After the tool ended.', checks: ['README receipt'] })).feature.status, 'review');
+    } else if (ending === 'pause') {
+      // Pausing stops the tree through its job, which confirms it without an attestation.
+      assert.equal((await runtime.stopFeatureLane({ ...args, status: 'paused' })).feature.status, 'paused');
+      assert.ok(!alive(pid));
+      assert.deepEqual(await readWorkerGuards(args), []);
+    } else {
+      // The next turn stops the earlier tree through its job before it starts.
+      await fs.rm(pidFile);
+      assert.ok((await runtime.startFeatureAgent(args)).turnId);
+      assert.ok(!alive(pid));
+      await eventually(async () => (await agentStatus(args)) === 'idle' && (await fs.readFile(pidFile, 'utf8').catch(() => '')).length > 0);
+      pid = Number(await fs.readFile(pidFile, 'utf8'));
+      assert.equal((await readWorkerGuards(args)).length, 1, 'only the new turn is guarded');
+    }
+  }
+});
+
+test('an uncontained Claude worker leaves every turn unconfirmed until the coordinator attests', async t => {
+  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
+  const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', script, '--'] }, containment: null });
+  await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle');
-  const worker = bridge.backend('claude').threads.get(started.threadId).lingering;
-  bridge.removeAllListeners('notification'); // The controller has exited before recording process exit.
-  worker.kill();
-  await eventually(() => worker.exitCode !== null || worker.signalCode !== null);
+  await new Promise(resolve => setTimeout(resolve, 500));
   assert.equal((await readWorkerGuards(args)).length, 1);
+  assert.match((await getFeatureContext(args)).feature.summary, /without process-tree containment \(no process-tree containment is available on this platform\)/);
+  await assert.rejects(runChecks(args), error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1);
+  await assert.rejects(runtime.startFeatureAgent(args), error => error.code === 'WORKERS_UNCONFIRMED' && error.details?.workerGuards === 1);
+  await assert.rejects(runtime.steerFeatureAgent({ ...args, instruction: 'Continue.' }), error => error.code === 'WORKERS_UNCONFIRMED');
+  // The coordinator's attestation clears only the guard it was given for; the new turn is guarded again.
+  assert.ok((await runtime.startFeatureAgent({ ...args, prior_turn_attestation: { evidence: 'Verified the fixture worker spawned nothing and exited.' } })).turnId);
+  await eventually(async () => (await agentStatus(args)) === 'idle');
+  assert.equal((await readWorkerGuards(args)).length, 1);
+  assert.ok((await getFeatureContext({ ...args, timeline_limit: 50 })).timeline.some(entry => entry.kind === 'agent.workers_attested'));
+});
+
+test('after a controller loses a clean exit, inspection alone clears a guard whose job has ended', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-inspect-'));
+  const pidFile = path.join(dir, 'tool.pid');
+  const release = path.join(dir, 'release');
+  const claude = { launch: { command: process.execPath, args: [lingeringTool, 'cli', 'detached', pidFile, release] }, terminationTimeoutMs: 500 };
+  const { args, bridge, runtime } = await fixture(t, claude);
+  t.after(async () => { await fs.writeFile(release, '').catch(() => {}); await fs.rm(dir, { recursive: true, force: true, maxRetries: 5 }); });
+  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  const started = await runtime.startFeatureAgent(args);
+  await eventually(async () => (await agentStatus(args)) === 'idle' && Number(await fs.readFile(pidFile, 'utf8').catch(() => '0')) > 0);
+  const pid = Number(await fs.readFile(pidFile, 'utf8'));
+  // The first controller stops recording before the tree ends; a second one takes over.
+  bridge.removeAllListeners('notification');
   expireControllerOwner(args.workspace_path);
-  const restarted = createAgentRuntime(new WorkerBridge({ claude }));
-  t.after(() => restarted.shutdownAgentRuntime());
-  await assert.rejects(restarted.stopFeatureLane({ ...args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.workerGuards === 1);
-  assert.equal((await restarted.stopFeatureLane({ ...args, status: 'paused', prior_turn_attestation: { evidence: `Verified worker ${worker.pid} exited after the controller stopped.` } })).feature.status, 'paused');
+  const observer = createAgentRuntime(new WorkerBridge({ claude }));
+  t.after(() => observer.shutdownAgentRuntime());
+  const refused = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /theater_agent_inspect/.test(error.message);
+
+  // While the tool runs, inspection keeps the guard and checks stay refused.
+  await observer.inspectFeatureAgent(args);
+  assert.equal((await readWorkerGuards(args)).length, 1);
+  await assert.rejects(runChecks(args), refused);
+
+  await fs.writeFile(release, '');
+  await eventually(() => !alive(pid));
+  await (bridge.backend('claude').threads.get(started.threadId).turns.at(-1).settled);
+  // The tree has ended but nothing recorded it: direct checks still fail closed.
+  assert.equal((await readWorkerGuards(args)).length, 1);
+  await assert.rejects(runChecks(args), refused);
+  // Inspection proves it from the job alone, without a turn or a lifecycle change.
+  const inspected = await observer.inspectFeatureAgent(args);
+  assert.equal(inspected.warning, null);
+  assert.deepEqual(await readWorkerGuards(args), []);
+  const state = await getFeatureContext({ ...args, timeline_limit: 50 });
+  assert.equal(state.feature.status, 'active');
+  assert.equal(state.feature.agent.status, 'idle');
+  assert.ok(state.timeline.some(entry => entry.kind === 'agent.worker_stopped' && entry.details?.basis === 'job_gone'));
+  assert.ok((await runChecks(args)).verification.ready);
+});
+
+// A stand-in warden that reports with token 'tok', answers as the CLI, then, with its tools
+// forging reports on the stderr they share, reports the CLI's exit and dies abnormally.
+const forgingWarden = [
+  "const mark = text => process.stderr.write('\\n\\u001eoverdrive-tree tok ' + text + '\\n');",
+  "mark('started 1');",
+  "process.stdin.once('data', () => {",
+  "  process.stderr.write('\\n\\u001eoverdrive-tree empty\\n\\u001eoverdrive-tree forged exit 0\\n');",
+  "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n');",
+  '});',
+  "process.stdin.on('end', () => { mark('exit 0'); process.stderr.write('', () => process.exit(1)); });",
+].join('\n');
+
+test('only the job itself, never a warden report, confirms a Claude worker tree ended', async t => {
+  for (const [state, released] of [['present', false], ['unknown', false], ['empty', true], ['absent', true]]) {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-forged-'));
+    const containment = {
+      jobName: id => `Global\\overdrive-worker-${id}`,
+      launch: (_cli, job) => ({ command: process.execPath, args: ['-e', forgingWarden], env: {}, job, token: 'tok' }),
+      stop: () => ({ command: process.execPath, args: ['-e', 'process.exit(1)'] }),
+      query: async () => state,
+    };
+    const bridge = new ClaudeWorkerBridge({ launch: { command: process.execPath, args: [] }, containment, terminationTimeoutMs: 500 });
+    const events = [];
+    bridge.on('notification', message => events.push(message));
+    t.after(async () => { await bridge.shutdown(); await fs.rm(cwd, { recursive: true, force: true, maxRetries: 5 }); });
+    const { thread } = await bridge.startThread({ cwd });
+    await bridge.request('turn/start', { threadId: thread.id, input: 'go', guardId: 'guard-1' });
+    const [turn] = bridge.threads.get(thread.id).turns;
+    assert.equal(await turn.settled, released ? 'confirmed' : 'unconfirmed', state);
+    assert.equal(turn.status, 'completed');
+    assert.equal(events.some(message => message.method === 'worker/contained' && message.params.guardId === 'guard-1'), true);
+    assert.equal(events.some(message => message.method === 'worker/exited'), released, state);
+    // Forged reports were read as the tools' own output.
+    assert.match(turn.stderrTail, /overdrive-tree forged exit 0/);
+  }
+});
+
+test('a warden that cannot establish containment falls back to fail-closed uncontained workers', async t => {
+  const failing = {
+    jobName: id => `Global\\overdrive-worker-${id}`,
+    launch: (_cli, job) => ({ command: process.execPath, args: ['-e', "process.stderr.write('Add-Type is blocked\\n'); process.exit(3)"], env: {}, job, token: 'tok' }),
+    stop: () => ({ command: process.execPath, args: ['-e', 'process.exit(1)'] }),
+    query: async () => 'unknown',
+  };
+  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
+  const { bridge, completed } = await bridgeTurn(t, { input: 'go', containment: failing, launchArgs: ['-e', script, '--'] });
+  await eventually(() => completed.length === 1);
+  assert.equal(completed[0].status, 'completed');
+  assert.match(bridge.containmentUnavailable, /warden exited \(3\) before starting the worker: Add-Type is blocked/);
+  assert.match(completed[0].items.at(-1).text, /without process-tree containment/);
+});
+
+test('controller exit before a clean worker-exit notification leaves the durable guard', async t => {
+  // A contained tree leaves a job a later controller can find gone; an uncontained one leaves nothing.
+  for (const containment of [undefined, null]) {
+    const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, terminationTimeoutMs: 500, containment };
+    const { args, bridge, runtime } = await fixture(t, claude);
+    const started = await runtime.startFeatureAgent(args);
+    await eventually(async () => (await agentStatus(args)) === 'idle');
+    const worker = bridge.backend('claude').threads.get(started.threadId).lingering;
+    bridge.removeAllListeners('notification'); // The controller has exited before recording process exit.
+    worker.kill();
+    await eventually(() => worker.exitCode !== null || worker.signalCode !== null);
+    const guards = await readWorkerGuards(args);
+    assert.equal(guards.length, 1);
+    assert.equal(Boolean(guards[0].job), containment === undefined && process.platform === 'win32');
+    expireControllerOwner(args.workspace_path);
+    const restarted = createAgentRuntime(new WorkerBridge({ claude }));
+    t.after(() => restarted.shutdownAgentRuntime());
+    if (guards[0].job) {
+      assert.equal((await restarted.stopFeatureLane({ ...args, status: 'paused' })).feature.status, 'paused');
+      continue;
+    }
+    await assert.rejects(restarted.stopFeatureLane({ ...args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.workerGuards === 1);
+    assert.equal((await restarted.stopFeatureLane({ ...args, status: 'paused', prior_turn_attestation: { evidence: `Verified worker ${worker.pid} exited after the controller stopped.` } })).feature.status, 'paused');
+  }
 });
 
 test('a stop cannot settle a lingering worker process without its tree, and the next turn carries that', async t => {
@@ -562,12 +759,13 @@ test('a stop cannot settle a lingering worker process without its tree, and the 
 });
 
 test('a failed next worker launch retains the earlier descendant uncertainty for pause', async t => {
-  const { args, bridge, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, treeKill: failingKiller, terminationTimeoutMs: 500 });
+  const { args, bridge, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, treeKill: failingKiller, terminationTimeoutMs: 500, containment: null });
   await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle');
   bridge.backend('claude').launch.command = path.join(args.workspace_path, 'missing-worker.exe');
-  await assert.rejects(runtime.startFeatureAgent(args));
-  await assert.rejects(runtime.stopFeatureLane({ ...args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.lingeringProcess === true);
+  // The next start stops the lingering worker without its tree and records that before refusing.
+  await assert.rejects(runtime.startFeatureAgent(args), error => error.code === 'WORKERS_UNCONFIRMED');
+  await assert.rejects(runtime.stopFeatureLane({ ...args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.descendantsUnconfirmed === true);
   assert.equal((await getFeatureContext(args)).feature.status, 'active');
   assert.ok(await readUnconfirmedDescendants(args));
   const paused = await runtime.stopFeatureLane({ ...args, status: 'paused', prior_turn_attestation: { evidence: 'The earlier fixture worker spawned no tools and has exited.' } });
@@ -575,7 +773,7 @@ test('a failed next worker launch retains the earlier descendant uncertainty for
 });
 
 test('a failed next launch cannot lose prior worker uncertainty across controller restart', async t => {
-  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, treeKill: failingKiller, terminationTimeoutMs: 500 };
+  const claude = { launch: { command: process.execPath, args: ['-e', lingering, '--'] }, treeKill: failingKiller, terminationTimeoutMs: 500, containment: null };
   const { args, bridge, runtime } = await fixture(t, claude);
   await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle');
