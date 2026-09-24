@@ -1042,7 +1042,7 @@ function linkedDetails(packet, key) {
 }
 
 test('a worker given only a claimed key finds its saved details while the packet stays compact', async t => {
-  const { source, workspace } = await fixture(t);
+  const { parent, source, workspace } = await fixture(t);
   await initializeWorkspace({ workspace_path: workspace, repository: source });
   const lane = { workspace_path: workspace, feature: 'compat' };
   await createFeature({ ...lane, title: 'Compat', outcome: 'Callers keep working.', spec: '# Compat\n\nKeep the API.' });
@@ -1075,6 +1075,12 @@ test('a worker given only a claimed key finds its saved details while the packet
   await updateWork({ ...lane, key: 'deliver', status: 'running', owner: 'worker' });
   await featureRuntime(lane);
   assert.equal((await fs.stat(detailsFile)).mtime.getTime(), untouched.getTime());
+  const changed = expected.replace('Preserve API compatibility.', 'Preserve API compatibilitY.');
+  assert.equal(Buffer.byteLength(changed), Buffer.byteLength(expected));
+  assert.equal(changed.split('\n', 1)[0], expected.split('\n', 1)[0]);
+  await fs.writeFile(detailsFile, changed);
+  await featureRuntime(lane);
+  assert.equal(await fs.readFile(detailsFile, 'utf8'), expected);
   await fs.writeFile(detailsFile, expected.slice(0, expected.indexOf('## Acceptance')));
   await featureRuntime(lane);
   assert.equal(await fs.readFile(detailsFile, 'utf8'), expected);
@@ -1111,6 +1117,11 @@ test('a worker given only a claimed key finds its saved details while the packet
   };
   for (const [name, content] of Object.entries(kept)) await fs.writeFile(path.join(workDirectory, name), content);
   await fs.mkdir(path.join(workDirectory, generatedName('folder')));
+  const outsideDirectory = path.join(parent, 'linked-notes');
+  await fs.mkdir(outsideDirectory);
+  await fs.writeFile(path.join(outsideDirectory, 'note.md'), 'Keep this note.\n');
+  const linkedDirectory = path.join(workDirectory, generatedName('linked'));
+  await fs.symlink(outsideDirectory, linkedDirectory, process.platform === 'win32' ? 'junction' : 'dir');
   await fs.writeFile(path.join(workDirectory, generatedName('stale')), '<!-- OVERDRIVE generated work details: stale · 0 -->\nLeft by removed work.\n');
   await updateWork({ ...lane, key: 'deliver', status: 'done', owner: 'worker', summary: 'Delivered.' });
   await updateWork({ ...lane, key: 'other', status: 'running', owner: 'worker' });
@@ -1120,6 +1131,8 @@ test('a worker given only a claimed key finds its saved details while the packet
   await assert.rejects(fs.stat(path.join(workDirectory, generatedName('stale'))), error => error.code === 'ENOENT');
   for (const [name, content] of Object.entries(kept)) assert.equal(await fs.readFile(path.join(workDirectory, name), 'utf8'), content);
   assert.ok((await fs.stat(path.join(workDirectory, generatedName('folder')))).isDirectory());
+  assert.ok((await fs.lstat(linkedDirectory)).isSymbolicLink());
+  assert.equal(await fs.readFile(path.join(outsideDirectory, 'note.md'), 'utf8'), 'Keep this note.\n');
   assert.match(await fs.readFile(linkedDetails(next, 'other'), 'utf8'), /## Description\n\n```text\nUNRELATED description\n```\n\n## Acceptance\n\n```text\nUNRELATED acceptance\n```\n$/);
 });
 

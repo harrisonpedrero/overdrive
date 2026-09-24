@@ -391,6 +391,7 @@ function workDetails(feature, item) {
 }
 
 // Whether a regular file starts with the given text, reading only that much of it.
+// With a size requirement, comparing the entire expected content also proves equality.
 async function fileStartsWith(file, text, size) {
   let stat;
   try { stat = await fs.lstat(file); } catch (error) { if (error?.code === 'ENOENT') return false; throw error; }
@@ -399,13 +400,18 @@ async function fileStartsWith(file, text, size) {
   const handle = await fs.open(file, 'r');
   try {
     const head = Buffer.alloc(expected.length);
-    const { bytesRead } = await handle.read(head, 0, head.length, 0);
-    return bytesRead === head.length && head.equals(expected);
+    let bytesRead = 0;
+    while (bytesRead < head.length) {
+      const result = await handle.read(head, bytesRead, head.length - bytesRead, bytesRead);
+      if (result.bytesRead === 0) return false;
+      bytesRead += result.bytesRead;
+    }
+    return head.equals(expected);
   } finally { await handle.close(); }
 }
 
 // Writes details for running work and returns the file for each running key. Running work is
-// immutable, so a file whose size and digest marker already match is left untouched. Cleanup
+// immutable, so a file whose complete content already matches is left untouched. Cleanup
 // removes only regular files this code generated, proved by their exact name and marker, so notes
 // left in the directory survive.
 async function writeWorkDetails(ctx, feature, work) {
@@ -416,7 +422,7 @@ async function writeWorkDetails(ctx, feature, work) {
     if (!file) continue;
     const content = workDetails(feature, item);
     await ensureManagedPath(ctx.root, file);
-    if (!await fileStartsWith(file, content.slice(0, content.indexOf('\n') + 1), Buffer.byteLength(content))) await atomicWrite(ctx.root, file, content);
+    if (!await fileStartsWith(file, content, Buffer.byteLength(content))) await atomicWrite(ctx.root, file, content);
   }
   const current = new Set(files.values());
   let entries = [];
