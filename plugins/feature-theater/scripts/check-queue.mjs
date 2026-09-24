@@ -78,6 +78,21 @@ async function binding(ctx, job) {
   return feature;
 }
 
+// A direct run holds its lane's control lock while its command may leave transient files in the clone, so a
+// clone is judged only under that lock. It is tried, never awaited: a direct run can take this queue's lock
+// while holding its own, so waiting here could deadlock.
+async function whileLanesIdle(root, slugs, fn) {
+  const [slug, ...rest] = slugs;
+  if (!slug) return fn();
+  let held = false;
+  try {
+    return await withWorkspaceLock(root, `control-${slug}`, () => { held = true; return whileLanesIdle(root, rest, fn); }, { timeoutMs: 0 });
+  } catch (error) {
+    if (held || error?.code !== 'WORKSPACE_BUSY') throw error;
+    throw new TheaterError(`Waiting for a direct check or control operation on ${slug} to finish before judging its clone.`, 'LANE_BUSY');
+  }
+}
+
 function retiredJob(db, key) {
   const row = db.prepare(`SELECT details_json FROM events WHERE kind = ? AND json_extract(details_json, '$.job.key') = ?
     ORDER BY id DESC LIMIT 1`).get(RETIRED_EVENT, key);
@@ -223,16 +238,17 @@ export async function drainCheckQueue(args) {
             job.eligibleAt ??= now(); job.reason = 'Waiting for a reserved clone or shared resource.'; continue;
           }
           try {
-            for (const dependency of dependencies) {
-              const dependencyFeature = await binding(ctx, dependency);
-              const latest = verificationStatus(ctx, dependencyFeature, dependency.revision).checks.find(check => check.key === dependency.checkKey);
-              if (latest?.status !== 'passed') throw new TheaterError(`Dependency lacks current passing evidence: ${dependency.key}; review and replan.`, 'STALE_QUEUE_JOB');
-            }
-            const feature = await binding(ctx, job);
-            assertAgentIdle(feature);
+            await whileLanesIdle(root, [...new Set([job, ...dependencies].map(item => item.feature))].sort(), async () => {
+              for (const dependency of dependencies) {
+                const dependencyFeature = await binding(ctx, dependency);
+                const latest = verificationStatus(ctx, dependencyFeature, dependency.revision).checks.find(check => check.key === dependency.checkKey);
+                if (latest?.status !== 'passed') throw new TheaterError(`Dependency lacks current passing evidence: ${dependency.key}; review and replan.`, 'STALE_QUEUE_JOB');
+              }
+              assertAgentIdle(await binding(ctx, job));
+            });
           } catch (error) {
             job.reason = error.message;
-            if (error.code !== 'AGENT_BUSY') job.status = 'stale';
+            if (!['AGENT_BUSY', 'LANE_BUSY'].includes(error.code)) job.status = 'stale';
             continue;
           }
           job.eligibleAt ??= now();

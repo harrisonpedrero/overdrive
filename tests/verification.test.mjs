@@ -9,7 +9,7 @@ import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-run
 import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
 import { callTool } from '../plugins/feature-theater/scripts/tools.mjs';
 import { git, withWorkspaceLock } from '../plugins/feature-theater/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
+import { readEvidence, runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
 import { drainCheckQueue, enqueueChecks } from '../plugins/feature-theater/scripts/check-queue.mjs';
 import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards, markDescendantsUnconfirmed, readUnconfirmedDescendants, attestDescendantsStopped } from '../plugins/feature-theater/scripts/workspace.mjs';
 
@@ -549,6 +549,63 @@ test('an unconfirmed-descendants marker blocks checks and candidates until an at
   const recorded = await recordCandidate({ ...args, summary: 'Ready after its tools were confirmed stopped.', checks: ['README receipt'] });
   assert.equal(recorded.feature.status, 'review');
   assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => candidate.status), ['ready']);
+});
+
+test('a queued check waits for a direct run in its clone and is judged once that run settles', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-direct-overlap-'));
+  const release = path.join(workspace, 'release');
+  let direct;
+  t.after(async () => {
+    await fs.writeFile(release, '');
+    await direct?.catch(() => {});
+    await fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const queue = { workspace_path: workspace };
+  const args = { ...queue, feature: 'overlap' };
+  await initializeManagedProject({ ...queue, project_name: 'Overlap', description: 'Direct and queued checks share a clone.' });
+  const repo = (await createFeature({ ...args, title: 'Overlap', outcome: 'Queued checks survive a direct run.', spec: '# Overlap\n\nThe README exists.' })).feature.checkoutPath;
+  // The check leaves an untracked file in its clone until the release file exists (at most 20s), then removes it.
+  await updateChecks({ ...args, checks: [{ key: 'transient', purpose: 'Hold a transient untracked file', argv: [process.execPath, '-e',
+    `const fs = require('node:fs'); fs.readFileSync('README.md'); fs.writeFileSync('.transient', 'x'); const until = Date.now() + 20000;
+     while (!fs.existsSync(${JSON.stringify(release)}) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); fs.rmSync('.transient');`] }] });
+  await createFeature({ ...queue, feature: 'other', title: 'Other', outcome: 'Unrelated lane.', spec: '# Other\n\nThe README exists.' });
+  await updateChecks({ ...queue, feature: 'other', checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+  await enqueueChecks({ ...queue, jobs: [{ key: 'overlap-transient', feature: 'overlap', check_key: 'transient' }, { key: 'other-readme', feature: 'other', check_key: 'readme' }] });
+
+  direct = runChecks(args);
+  for (let attempt = 0; !(await fs.stat(path.join(repo, '.transient')).catch(() => null)); attempt++) {
+    assert.ok(attempt < 400, 'direct check did not start');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  const during = await drainCheckQueue(queue);
+  const waiting = during.jobs.find(job => job.key === 'overlap-transient');
+  assert.equal(waiting.status, 'queued');
+  assert.deepEqual(waiting.attempts, []);
+  assert.match(waiting.reason, /overlap/);
+  assert.equal(during.jobs.find(job => job.key === 'other-readme').status, 'passed');
+  assert.deepEqual(during.started, ['other-readme']);
+
+  await fs.writeFile(release, '');
+  assert.deepEqual((await direct).receipts.map(receipt => receipt.passed), [true]);
+  const after = (await drainCheckQueue(queue)).jobs.find(job => job.key === 'overlap-transient');
+  assert.equal(after.status, 'passed');
+  assert.equal(after.attempts.length, 1);
+  assert.equal((await readEvidence({ ...args, evidence_id: after.attempts[0].receiptId })).passed, true);
+
+  // Real drift in an idle clone still goes stale without running its command.
+  await enqueueChecks({ ...queue, jobs: [{ key: 'overlap-dirty', feature: 'overlap', check_key: 'transient' }] });
+  await fs.writeFile(path.join(repo, 'stray.txt'), 'dirt');
+  const dirty = (await drainCheckQueue(queue)).jobs.find(job => job.key === 'overlap-dirty');
+  assert.equal(dirty.status, 'stale');
+  assert.deepEqual(dirty.attempts, []);
+  await fs.rm(path.join(repo, 'stray.txt'));
+  await enqueueChecks({ ...queue, jobs: [{ key: 'overlap-moved', feature: 'overlap', check_key: 'transient' }] });
+  await fs.writeFile(path.join(repo, 'next.txt'), 'next');
+  await git(repo, 'add', 'next.txt');
+  await git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'Next');
+  const moved = (await drainCheckQueue(queue)).jobs.find(job => job.key === 'overlap-moved');
+  assert.equal(moved.status, 'stale');
+  assert.deepEqual(moved.attempts, []);
 });
 
 test('checks execute in saved order and reordering changes the contract', async t => {
