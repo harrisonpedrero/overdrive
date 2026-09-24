@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { assertAgentIdle, assertVerified, assertWorkersStopped, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
 import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, agentBusy, agentOwner, descendantsKey, ownerAlive, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
@@ -290,7 +290,7 @@ Before each turn, read:
 2. ${specFile}
 3. the repository's applicable AGENTS.md, CLAUDE.md and other local instructions under repo/
 
-Use the durable work graph in the context packet to choose the next useful work. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit OVERDRIVE state files directly. Do not put coordination artifacts into application commits.
+Use the durable work graph in the context packet to choose the next useful work. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key before implementing it. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit OVERDRIVE state files directly. Do not put coordination artifacts into application commits.
 
 The coordinator owns work-item claims, lease renewals and status changes; follow the assigned work key when provided. If that assigned item still appears ready or unowned, report the bookkeeping mismatch once and continue the authorized implementation without trying to claim it yourself. Surface a conflicting assignment or unmet prerequisite before proceeding with the affected work; your final report does not itself mark work done or create execution receipts.
 
@@ -364,6 +364,73 @@ export async function refreshLaneFiles(ctx, slug) {
   });
 }
 
+// Stored text goes in a fence longer than any backtick run it contains, so Markdown in it can
+// neither close the fence nor read as a section of the file.
+function verbatimBlock(text) {
+  if (!text) return '_None saved._\n';
+  const longest = (text.match(/`+/g) ?? []).reduce((most, run) => Math.max(most, run.length), 0);
+  const fence = '`'.repeat(Math.max(3, longest + 1));
+  return `${fence}text\n${text}\n${fence}\n`;
+}
+
+// Claimed work keeps its complete saved text in a keyed file beside the packet, so the packet stays
+// compact however many long items are running. The prefix keeps keys such as "con.x" from naming a
+// Windows device, and the digest keeps case-distinct keys apart on case-insensitive file systems.
+function workDetailsName(key) {
+  return `item-${key}-${createHash('sha256').update(key).digest('hex').slice(0, 8)}.md`;
+}
+
+// Every generated file starts with this marker, which also carries a digest of the text below it.
+function workDetailsMarker(key) {
+  return `<!-- OVERDRIVE generated work details: ${key} · `;
+}
+
+function workDetails(feature, item) {
+  const body = `# Work item \`${item.item_key}\`\n\nFeature: ${feature.slug}\nKind: ${item.kind}\nStatus: ${item.status}\n\nSaved text appears verbatim inside each fence.\n\n## Description\n\n${verbatimBlock(item.description)}\n## Acceptance\n\n${verbatimBlock(item.acceptance)}`;
+  return `${workDetailsMarker(item.item_key)}${createHash('sha256').update(body).digest('hex').slice(0, 16)} -->\n${body}`;
+}
+
+// Whether a regular file starts with the given text, reading only that much of it.
+async function fileStartsWith(file, text, size) {
+  let stat;
+  try { stat = await fs.lstat(file); } catch (error) { if (error?.code === 'ENOENT') return false; throw error; }
+  if (!stat.isFile() || (size !== undefined && stat.size !== size)) return false;
+  const expected = Buffer.from(text);
+  const handle = await fs.open(file, 'r');
+  try {
+    const head = Buffer.alloc(expected.length);
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    return bytesRead === head.length && head.equals(expected);
+  } finally { await handle.close(); }
+}
+
+// Writes details for running work and returns the file for each running key. Running work is
+// immutable, so a file whose size and digest marker already match is left untouched. Cleanup
+// removes only regular files this code generated, proved by their exact name and marker, so notes
+// left in the directory survive.
+async function writeWorkDetails(ctx, feature, work) {
+  const directory = await ensureManagedPath(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'work'));
+  const files = new Map(work.filter(item => item.status === 'running').map(item => [item.item_key, contained(directory, workDetailsName(item.item_key))]));
+  for (const item of work) {
+    const file = files.get(item.item_key);
+    if (!file) continue;
+    const content = workDetails(feature, item);
+    await ensureManagedPath(ctx.root, file);
+    if (!await fileStartsWith(file, content.slice(0, content.indexOf('\n') + 1), Buffer.byteLength(content))) await atomicWrite(ctx.root, file, content);
+  }
+  const current = new Set(files.values());
+  let entries = [];
+  try { entries = await fs.readdir(directory, { withFileTypes: true }); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  for (const entry of entries) {
+    const key = entry.name.match(/^item-([A-Za-z][A-Za-z0-9._-]{0,62})-[0-9a-f]{8}\.md$/)?.[1];
+    const file = contained(directory, entry.name);
+    if (!entry.isFile() || !key || workDetailsName(key) !== entry.name || current.has(file)) continue;
+    await ensureManagedPath(ctx.root, file);
+    if (await fileStartsWith(file, workDetailsMarker(key))) await fs.rm(file, { force: true });
+  }
+  return files;
+}
+
 export async function writeFeatureContext(ctx, featureOrSlug) {
   const feature = typeof featureOrSlug === 'string' ? featureBySlug(ctx.db, safeSlug(featureOrSlug)) : featureOrSlug;
   const work = workItems(ctx.db, feature.id);
@@ -376,8 +443,9 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
   catch (error) { snapshot = { unavailable: error.message }; }
+  const detailFiles = await writeWorkDetails(ctx, feature, work);
   const workLines = work.length
-    ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}`).join('\n')
+    ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}${detailFiles.has(item.item_key) ? `\n  - ${item.item_key} description and acceptance: ${detailFiles.get(item.item_key)}` : ''}`).join('\n')
     : '- No work items yet.';
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')

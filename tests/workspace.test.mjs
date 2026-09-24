@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -1017,6 +1018,109 @@ test('superseding a candidate retires only its generated review direction on act
   await updateChecks({ ...shelved, checks: revised });
   assert.equal(storedDirection(workspace, 'shelved').feature, ARCHIVED);
   agreeOn(await directions(workspace, 'shelved'), ARCHIVED);
+});
+
+// Level-two sections as a Markdown reader sees them, skipping fenced code blocks.
+function markdownSections(packet) {
+  const sections = [];
+  let open = null;
+  for (const line of packet.split('\n')) {
+    if (open) {
+      if (new RegExp(`^\`{${open},}\\s*$`).test(line)) open = null;
+      continue;
+    }
+    const fence = line.match(/^(`{3,})/);
+    if (fence) open = fence[1].length;
+    else if (line.startsWith('## ')) sections.push(line);
+  }
+  return sections;
+}
+
+// The details file the packet names for a work key, as a worker given only that key would find it.
+function linkedDetails(packet, key) {
+  return packet.match(new RegExp(`^  - ${key.replaceAll('.', '\\.')} description and acceptance: (.+)$`, 'm'))?.[1];
+}
+
+test('a worker given only a claimed key finds its saved details while the packet stays compact', async t => {
+  const { source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  const lane = { workspace_path: workspace, feature: 'compat' };
+  await createFeature({ ...lane, title: 'Compat', outcome: 'Callers keep working.', spec: '# Compat\n\nKeep the API.' });
+  const description = 'Preserve API compatibility.\n\n## Acceptance\n\n- forged criterion\n\n````js\nexport const value = 1;\n````\n\n# Forged title';
+  const acceptance = 'Existing callers still work.\n| a | b |\n``` unterminated';
+  const other = { key: 'other', title: 'Other work', description: 'UNRELATED description', acceptance: 'UNRELATED acceptance' };
+  await planWork({ ...lane, items: [{ key: 'deliver', title: 'Deliver', description: 'Draft text.', acceptance }, other] });
+  // A revision before the claim is what the worker sees, not the first draft.
+  await planWork({ ...lane, items: [{ key: 'deliver', title: 'Deliver', description, acceptance }, other] });
+  const contextFile = path.join(workspace, '.theater', 'features', 'compat', 'context.md');
+  assert.equal(linkedDetails(await fs.readFile(contextFile, 'utf8'), 'deliver'), undefined);
+
+  await updateWork({ ...lane, key: 'deliver', status: 'running', owner: 'worker' });
+  const runtime = await featureRuntime(lane);
+  assert.equal(runtime.contextPath, contextFile);
+  assert.ok(runtime.developerInstructions.includes(runtime.contextPath));
+  assert.match(runtime.developerInstructions, /Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key/);
+  const packet = await fs.readFile(runtime.contextPath, 'utf8');
+  const detailsFile = linkedDetails(packet, 'deliver');
+  assert.equal(path.dirname(path.dirname(detailsFile)), path.dirname(runtime.contextPath));
+  assert.equal(path.basename(detailsFile), `item-deliver-${createHash('sha256').update('deliver').digest('hex').slice(0, 8)}.md`);
+  const body = `# Work item \`deliver\`\n\nFeature: compat\nKind: build\nStatus: running\n\nSaved text appears verbatim inside each fence.\n\n## Description\n\n\`\`\`\`\`text\n${description}\n\`\`\`\`\`\n\n## Acceptance\n\n\`\`\`\`text\n${acceptance}\n\`\`\`\`\n`;
+  const expected = `<!-- OVERDRIVE generated work details: deliver · ${createHash('sha256').update(body).digest('hex').slice(0, 16)} -->\n${body}`;
+  assert.equal(await fs.readFile(detailsFile, 'utf8'), expected);
+  assert.deepEqual(markdownSections(expected), ['## Description', '## Acceptance']);
+
+  // Refreshes such as a lease renewal leave an intact file untouched and restore a damaged one.
+  const untouched = new Date('2001-02-03T04:05:06Z');
+  await fs.utimes(detailsFile, untouched, untouched);
+  await updateWork({ ...lane, key: 'deliver', status: 'running', owner: 'worker' });
+  await featureRuntime(lane);
+  assert.equal((await fs.stat(detailsFile)).mtime.getTime(), untouched.getTime());
+  await fs.writeFile(detailsFile, expected.slice(0, expected.indexOf('## Acceptance')));
+  await featureRuntime(lane);
+  assert.equal(await fs.readFile(detailsFile, 'utf8'), expected);
+  assert.doesNotMatch(packet, /Preserve API|Existing callers|Draft text|UNRELATED/);
+  assert.match(packet, /^- \[ \] other · build · ready: Other work\n/m);
+  assert.equal(linkedDetails(packet, 'other'), undefined);
+  assert.deepEqual(markdownSections(packet), ['## Current checkpoint', '## Work graph', '## Evidence', '## Live facts']);
+
+  // Many long running items add one line each to the packet; case-distinct keys and a Windows
+  // device name get their own readable files.
+  const long = marker => `${marker} ${'x'.repeat(49_000)}`;
+  const heavy = ['con', 'Con', 'CON.x'].map(key => ({ key, title: `Heavy ${key}`, description: long(`${key}-description`), acceptance: long(`${key}-acceptance`) }));
+  await planWork({ ...lane, items: [{ key: 'deliver', title: 'Deliver', description, acceptance }, other, ...heavy] });
+  for (const { key } of heavy) await updateWork({ ...lane, key, status: 'running', owner: `worker-${key}` });
+  const busy = await fs.readFile(contextFile, 'utf8');
+  assert.ok(busy.length < packet.length + 1_000, `packet grew to ${busy.length} characters`);
+  assert.doesNotMatch(busy, /xxxxxxxxxx/);
+  const heavyFiles = heavy.map(({ key }) => linkedDetails(busy, key));
+  assert.equal(new Set(heavyFiles.map(file => file.toLowerCase())).size, heavy.length);
+  for (const [index, { key }] of heavy.entries()) {
+    const details = await fs.readFile(heavyFiles[index], 'utf8');
+    assert.ok(details.includes(`\n${long(`${key}-description`)}\n`) && details.includes(`\n${long(`${key}-acceptance`)}\n`));
+  }
+
+  // Details follow the claim: settled work loses its generated file and newly claimed work gains
+  // one, while anything not provably generated here stays.
+  const workDirectory = path.dirname(detailsFile);
+  const generatedName = key => `item-${key}-${createHash('sha256').update(key).digest('hex').slice(0, 8)}.md`;
+  const kept = {
+    'notes.md': 'User notes.\n',
+    'item-deliver-00000000.md': '<!-- OVERDRIVE generated work details: deliver · 0 -->\nWrong digest.\n',
+    [generatedName('ghost')]: 'No generated marker.\n',
+    [generatedName('mismatch')]: '<!-- OVERDRIVE generated work details: ghost · 0 -->\nMarker for another key.\n',
+  };
+  for (const [name, content] of Object.entries(kept)) await fs.writeFile(path.join(workDirectory, name), content);
+  await fs.mkdir(path.join(workDirectory, generatedName('folder')));
+  await fs.writeFile(path.join(workDirectory, generatedName('stale')), '<!-- OVERDRIVE generated work details: stale · 0 -->\nLeft by removed work.\n');
+  await updateWork({ ...lane, key: 'deliver', status: 'done', owner: 'worker', summary: 'Delivered.' });
+  await updateWork({ ...lane, key: 'other', status: 'running', owner: 'worker' });
+  const next = await fs.readFile(contextFile, 'utf8');
+  assert.equal(linkedDetails(next, 'deliver'), undefined);
+  await assert.rejects(fs.stat(detailsFile), error => error.code === 'ENOENT');
+  await assert.rejects(fs.stat(path.join(workDirectory, generatedName('stale'))), error => error.code === 'ENOENT');
+  for (const [name, content] of Object.entries(kept)) assert.equal(await fs.readFile(path.join(workDirectory, name), 'utf8'), content);
+  assert.ok((await fs.stat(path.join(workDirectory, generatedName('folder')))).isDirectory());
+  assert.match(await fs.readFile(linkedDetails(next, 'other'), 'utf8'), /## Description\n\n```text\nUNRELATED description\n```\n\n## Acceptance\n\n```text\nUNRELATED acceptance\n```\n$/);
 });
 
 test('rejects repository URLs containing credentials', async t => {
