@@ -21,6 +21,29 @@ if (mode === 'guard') {
   setInterval(() => guard.isOpen, 1_000);
 } else if (mode === 'hold') {
   await withWorkspaceLock(workspace, 'features', () => { console.log('held'); return new Promise(() => setInterval(() => {}, 1_000)); });
+} else if (mode === 'crash-writing') {
+  // Die after persisting only a prefix of the lock record, whichever file receives it.
+  const { open, writeFile } = fs;
+  const inLocks = file => path.dirname(path.resolve(String(file))) === path.dirname(lockFile);
+  const crash = async (write, data) => { await write(String(data).slice(0, 10)); process.exit(86); };
+  fs.open = async function (file, ...rest) {
+    const handle = await open.call(this, file, ...rest);
+    if (inLocks(file)) { const write = handle.writeFile.bind(handle); handle.writeFile = data => crash(write, data); }
+    return handle;
+  };
+  fs.writeFile = async function (file, data, ...rest) {
+    if (inLocks(file)) return crash(prefix => writeFile.call(this, file, prefix, ...rest), data);
+    return writeFile.call(this, file, data, ...rest);
+  };
+  await withWorkspaceLock(workspace, 'features', () => { console.log('entered'); process.exit(1); });
+} else if (mode === 'crash-published') {
+  // Die immediately after the lock path is published, before the callback or any cleanup runs.
+  const { link } = fs;
+  fs.link = async function (from, to) {
+    await link.call(this, from, to);
+    if (same(to)) process.exit(87);
+  };
+  await withWorkspaceLock(workspace, 'features', () => { console.log('entered'); process.exit(1); });
 } else {
   const { readFile, rename } = fs;
   let observedDead = false;

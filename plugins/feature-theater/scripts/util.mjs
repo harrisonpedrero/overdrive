@@ -293,7 +293,7 @@ export async function normalizeRepositorySource(value) {
 }
 
 function lockOwnerAlive(record) {
-  if (!Number.isInteger(record.pid) || record.pid <= 0) return true;
+  if (!Number.isInteger(record?.pid) || record.pid <= 0) return true;
   try { process.kill(record.pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; }
   return true;
 }
@@ -317,6 +317,24 @@ async function reclaimDeadLock(root, lockFile, observed) {
   }
 }
 
+// Link a fully written pending record to publish it exclusively; a crash leaves no lock or a complete one.
+// Never fall back to rename, which could replace another owner's lock.
+async function publishLock(lockFile, operation, record) {
+  const pending = `${lockFile}.pending-${randomUUID()}`;
+  try {
+    await fs.writeFile(pending, record, { flag: 'wx', mode: 0o600 });
+    try {
+      await fs.link(pending, lockFile);
+      return true;
+    } catch (error) {
+      if (error?.code === 'EEXIST') return false;
+      throw new TheaterError(`Could not publish the ${operation} workspace lock: ${error?.message ?? error}`, 'LOCK_PUBLISH_FAILED', { code: error?.code });
+    }
+  } finally {
+    await fs.rm(pending, { force: true });
+  }
+}
+
 // A lock name is an operation name, or a lane control lock: `control-` followed by a whole feature
 // slug. The prefix sits outside the 63-character body so every accepted slug keeps a distinct lock.
 export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_000 } = {}) {
@@ -328,28 +346,20 @@ export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_0
   const lockFile = await ensureManagedPath(root, path.join(lockDirectory, `${operation}.lock`));
   const token = randomUUID();
   const deadline = Date.now() + timeoutMs;
-  let handle;
-  while (!handle) {
+  while (!await publishLock(lockFile, operation, JSON.stringify({ token, pid: process.pid, createdAt: now() }))) {
     try {
-      handle = await fs.open(lockFile, 'wx', 0o600);
-      await handle.writeFile(JSON.stringify({ token, pid: process.pid, createdAt: now() }));
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      try {
-        const stat = await fs.stat(lockFile);
-        const observed = await fs.readFile(lockFile, 'utf8');
-        if (!lockOwnerAlive(JSON.parse(observed)) && Date.now() - stat.mtimeMs > 500 && await reclaimDeadLock(root, lockFile, observed)) continue;
-      } catch (statError) {
-        if (!(statError instanceof SyntaxError) && !['ENOENT', 'EACCES'].includes(statError?.code)) throw statError;
-      }
-      if (Date.now() >= deadline) throw new TheaterError(`Timed out waiting for the ${operation} workspace lock.`, 'WORKSPACE_BUSY');
-      await sleep(150);
+      const stat = await fs.stat(lockFile);
+      const observed = await fs.readFile(lockFile, 'utf8');
+      if (!lockOwnerAlive(JSON.parse(observed)) && Date.now() - stat.mtimeMs > 500 && await reclaimDeadLock(root, lockFile, observed)) continue;
+    } catch (statError) {
+      if (!(statError instanceof SyntaxError) && !['ENOENT', 'EACCES'].includes(statError?.code)) throw statError;
     }
+    if (Date.now() >= deadline) throw new TheaterError(`Timed out waiting for the ${operation} workspace lock.`, 'WORKSPACE_BUSY');
+    await sleep(150);
   }
   try {
     return await fn();
   } finally {
-    await handle.close();
     try {
       const record = JSON.parse(await fs.readFile(lockFile, 'utf8'));
       if (record.token === token) await fs.rm(lockFile, { force: true });
