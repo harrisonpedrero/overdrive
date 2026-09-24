@@ -3,7 +3,7 @@ import { checkOutcome } from './check-outcome.mjs';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { CANDIDATE_REVIEW_ACTION, assertCheckReservation, bumpSemanticGeneration, contractSnapshotKey, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
+import { CANDIDATE_REVIEW_ACTION, COMPLETED_ACTION, DIRECTION_CHECKPOINTED_SQL, assertCheckReservation, bumpSemanticGeneration, contractSnapshotKey, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { unconfirmedDescendants, workersKey } from './ownership.mjs';
 import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
@@ -92,20 +92,17 @@ export function assertWorkersStopped(db, feature) {
 }
 
 // Reports whether a candidate or the lane status actually changed; callers own the generation bump.
-// Generated review text then yields to the work graph's direction on active, review, done and blocked
-// lanes (reactivation keeps a blocked lane's stored text), unless a checkpoint saved that exact text
-// after the latest candidate or archive event.
+// Generated review or accepted-delivery text then yields to the work graph's direction on active,
+// review, done and blocked lanes (reactivation keeps a blocked lane's stored text), unless a
+// checkpoint saved that exact text after the latest candidate, archive or completion event.
 export function invalidateCandidates(db, featureId) {
   const { status } = db.prepare('SELECT status FROM features WHERE id = ?').get(featureId);
   const superseded = db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId).changes;
   const reopened = db.prepare("UPDATE features SET status = 'active' WHERE id = ? AND status IN ('done','review')").run(featureId).changes;
   if (!superseded && !reopened) return false;
   if (['active', 'review', 'done', 'blocked'].includes(status)) {
-    db.prepare(`UPDATE features SET next_action = ? WHERE id = ? AND next_action = ? AND NOT EXISTS (
-      SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
-      AND json_extract(checkpointed.details_json, '$.nextAction') = features.next_action
-      AND checkpointed.id > COALESCE((SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind IN ('candidate.recorded', 'feature.archived')), 0)
-    )`).run(workGraphAction(workItems(db, featureId)), featureId, CANDIDATE_REVIEW_ACTION);
+    db.prepare(`UPDATE features SET next_action = ? WHERE id = ? AND next_action IN (?, ?) AND NOT ${DIRECTION_CHECKPOINTED_SQL}`)
+      .run(workGraphAction(workItems(db, featureId)), featureId, CANDIDATE_REVIEW_ACTION, COMPLETED_ACTION);
   }
   return true;
 }

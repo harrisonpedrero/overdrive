@@ -40,11 +40,14 @@ import {
 import {
   ARCHIVED_ACTION,
   CANDIDATE_REVIEW_ACTION,
+  COMPLETED_ACTION,
+  DIRECTION_CHECKPOINTED_SQL,
   PAUSED_ACTION,
   READY_WORK_ACTION,
   assertBoundCheckout,
   bumpSemanticGeneration,
   bindCandidateChecks,
+  candidateAction,
   candidateChecksKey,
   candidateRecordedSummary,
   featureBySlug,
@@ -1010,13 +1013,17 @@ export async function planWork({ workspace_path, feature, items }) {
         }
         validateWorkGraph(ctx.db, row.id);
         if (reconcileReady(ctx.db, row.id)) changed = true;
-        if (previousContract !== featureContract(ctx.db, row) && invalidateCandidates(ctx.db, row.id)) changed = true;
+        const contractChanged = previousContract !== featureContract(ctx.db, row);
+        if (contractChanged && invalidateCandidates(ctx.db, row.id)) changed = true;
         // An archived lane keeps its terminal or checkpointed direction until it is reactivated.
         const saved = ctx.db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(row.id);
         archived = saved.status === 'archived';
         paused = saved.status === 'paused';
+        // An unchanged plan keeps an explicit checkpoint direction; otherwise the current candidate
+        // or work graph supplies guidance after any contract change has superseded its candidate.
         if (!archived) {
-          nextAction = workGraphAction(workItems(ctx.db, row.id));
+          const checkpointed = !changed && !contractChanged && ctx.db.prepare(`SELECT ${DIRECTION_CHECKPOINTED_SQL} AS saved FROM features WHERE id = ?`).get(row.id).saved;
+          nextAction = checkpointed ? saved.next_action : candidateAction(ctx.db, row.id);
           if (saved.next_action !== nextAction) changed = true;
         }
         ctx.db.prepare('UPDATE features SET next_action = COALESCE(?, next_action), updated_at = ? WHERE id = ?').run(nextAction ?? null, stamp, row.id);
@@ -1279,9 +1286,12 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       // A paused lane projects the bare resume instruction when it has no direction to resume with:
       // none stored, or generated review text whose candidate was superseded while paused. Only
       // leaving the pause replaces it; pausing again keeps the stored guidance.
+      // A completed lane projects accepted-candidate guidance over generated review text; leaving
+      // completion stores the derived direction in its place, as for older completed lanes.
       const projected = featureBySlug(ctx.db, slug).next_action;
-      const terminal = projected === ARCHIVED_ACTION || (projected === PAUSED_ACTION && status !== 'paused');
-      const resumed = ctx.db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(row.id) ? CANDIDATE_REVIEW_ACTION : workGraphAction(workItems(ctx.db, row.id));
+      const settled = previous.status === 'done' && projected === COMPLETED_ACTION && previous.next_action !== COMPLETED_ACTION;
+      const terminal = projected === ARCHIVED_ACTION || (projected === PAUSED_ACTION && status !== 'paused') || settled;
+      const resumed = candidateAction(ctx.db, row.id);
       // Completion is refused on the same stopped-state condition, re-read in the write itself, so a
       // turn, worker guard or descendant marker recorded while the checkout was read cannot slip through.
       // Like assertAgentIdle, it also refuses a running status saved without a turn ID.

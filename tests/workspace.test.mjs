@@ -1020,6 +1020,109 @@ test('superseding a candidate retires only its generated review direction on act
   agreeOn(await directions(workspace, 'shelved'), ARCHIVED);
 });
 
+test('reopening a completed lane directs delivery of its accepted candidate instead of reviewing it', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-accepted-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const COMPLETED = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
+  const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }];
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Accepted', description: 'Exercise accepted candidate direction.' });
+  const completed = async (slug, beforeDone = async () => {}) => {
+    const lane = { workspace_path: workspace, feature: slug };
+    await createFeature({ ...lane, title: slug, outcome: 'An accepted candidate.', spec: '# Accepted\n\nThe README exists.' });
+    await planWork({ ...lane, items: [{ key: 'readme', title: 'Write the README' }] });
+    await updateWork({ ...lane, key: 'readme', status: 'running', owner: 'astra' });
+    await updateWork({ ...lane, key: 'readme', status: 'done', owner: 'astra', summary: 'The README exists.' });
+    await updateChecks({ ...lane, checks: check('Read the committed README') });
+    assert.equal((await runChecks(lane)).verification.ready, true);
+    await recordCandidate({ ...lane, summary: 'Ready.', checks: ['readme receipt'] });
+    agreeOn(await directions(workspace, slug), REVIEW);
+    await beforeDone(lane);
+    await setFeatureStatus({ ...lane, status: 'done' });
+    agreeOn(await directions(workspace, slug), COMPLETED);
+    return lane;
+  };
+
+  const candidates = slug => {
+    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    try { return db.prepare('SELECT c.status FROM candidates c JOIN features f ON f.id = c.feature_id WHERE f.slug = ? ORDER BY c.rowid').all(slug).map(row => row.status); }
+    finally { db.close(); }
+  };
+
+  // Reactivation keeps the accepted candidate's delivery guidance, and resubmitting the unchanged
+  // plan changes nothing; new work supersedes the candidate and directs as before.
+  const reopened = await completed('reopened');
+  assert.equal((await setFeatureStatus({ ...reopened, status: 'active' })).feature.nextAction, COMPLETED);
+  agreeOn(await directions(workspace, 'reopened'), COMPLETED);
+  const settledState = storedDirection(workspace, 'reopened');
+  assert.equal((await planWork({ ...reopened, items: [{ key: 'readme', title: 'Write the README' }] })).feature.nextAction, COMPLETED);
+  assert.deepEqual(storedDirection(workspace, 'reopened'), settledState);
+  assert.deepEqual(candidates('reopened'), ['accepted']);
+  agreeOn(await directions(workspace, 'reopened'), COMPLETED);
+  await planWork({ ...reopened, items: [{ key: 'readme', title: 'Write the README' }, { key: 'startup', title: 'Describe startup' }] });
+  assert.deepEqual(candidates('reopened'), ['superseded']);
+  agreeOn(await directions(workspace, 'reopened'), READY);
+
+  // Pausing a completed lane, then resuming it.
+  const rested = await completed('rested');
+  assert.equal((await setFeatureStatus({ ...rested, status: 'paused' })).feature.nextAction, pausedThen(COMPLETED));
+  agreeOn(await directions(workspace, 'rested'), pausedThen(COMPLETED));
+  assert.equal((await setFeatureStatus({ ...rested, status: 'active' })).feature.nextAction, COMPLETED);
+  agreeOn(await directions(workspace, 'rested'), COMPLETED);
+  // A lane paused from completion that still stores the generated review text resumes the same way.
+  const legacy = await completed('legacy');
+  await setFeatureStatus({ ...legacy, status: 'paused' });
+  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  db.prepare("UPDATE features SET next_action = ? WHERE slug = 'legacy'").run(REVIEW);
+  db.close();
+  assert.equal((await getFeatureContext(legacy)).feature.nextAction, PAUSED);
+  assert.equal((await setFeatureStatus({ ...legacy, status: 'active' })).feature.nextAction, COMPLETED);
+  agreeOn(await directions(workspace, 'legacy'), COMPLETED);
+
+  // Archiving a completed lane, then reactivating it.
+  const shelved = await completed('shelved');
+  assert.equal((await setFeatureStatus({ ...shelved, status: 'archived', disposition: 'Shipped.' })).feature.nextAction, ARCHIVED);
+  assert.equal((await setFeatureStatus({ ...shelved, status: 'active' })).feature.nextAction, COMPLETED);
+  agreeOn(await directions(workspace, 'shelved'), COMPLETED);
+
+  // Review text a checkpoint saved before acceptance is settled by completion.
+  const early = await completed('early', async lane => {
+    const reviewState = storedDirection(workspace, 'early');
+    assert.equal((await planWork({ ...lane, items: [{ key: 'readme', title: 'Write the README' }] })).feature.nextAction, REVIEW);
+    assert.deepEqual(storedDirection(workspace, 'early'), reviewState);
+    assert.deepEqual(candidates('early'), ['ready']);
+    await checkpointFeature({ ...lane, summary: 'Review expected.', next_action: REVIEW });
+  });
+  assert.equal((await setFeatureStatus({ ...early, status: 'active' })).feature.nextAction, COMPLETED);
+  // The same text saved after completion is explicit and stays authoritative through pause and reactivation.
+  const kept = await completed('kept');
+  await checkpointFeature({ ...kept, summary: 'Candidate kept for another look.', next_action: REVIEW });
+  agreeOn(await directions(workspace, 'kept'), REVIEW);
+  assert.equal((await setFeatureStatus({ ...kept, status: 'active' })).feature.nextAction, REVIEW);
+  assert.equal((await setFeatureStatus({ ...kept, status: 'paused' })).feature.nextAction, pausedThen(REVIEW));
+  assert.equal((await setFeatureStatus({ ...kept, status: 'active' })).feature.nextAction, REVIEW);
+  agreeOn(await directions(workspace, 'kept'), REVIEW);
+  const reviewCheckpoint = storedDirection(workspace, 'kept');
+  assert.equal((await planWork({ ...kept, items: [{ key: 'readme', title: 'Write the README' }] })).feature.nextAction, REVIEW);
+  assert.deepEqual(storedDirection(workspace, 'kept'), reviewCheckpoint);
+  const custom = 'Deliver the accepted candidate after the release window opens.';
+  await checkpointFeature({ ...kept, summary: 'Waiting for release.', next_action: custom });
+  const customCheckpoint = storedDirection(workspace, 'kept');
+  assert.equal((await planWork({ ...kept, items: [{ key: 'readme', title: 'Write the README' }] })).feature.nextAction, custom);
+  assert.deepEqual(storedDirection(workspace, 'kept'), customCheckpoint);
+  assert.deepEqual(candidates('kept'), ['accepted']);
+  agreeOn(await directions(workspace, 'kept'), custom);
+
+  // Superseding the accepted candidate retires its generated delivery guidance, also while paused.
+  await updateChecks({ ...reopened, checks: check('Read the README, revised') });
+  agreeOn(await directions(workspace, 'reopened'), READY);
+  await setFeatureStatus({ ...rested, status: 'paused' });
+  await updateChecks({ ...rested, checks: check('Read the README, revised') });
+  agreeOn(await directions(workspace, 'rested'), PAUSED);
+  assert.equal((await setFeatureStatus({ ...rested, status: 'active' })).feature.nextAction, 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.');
+  await updateChecks({ ...shelved, checks: check('Read the README, revised') });
+  agreeOn(await directions(workspace, 'shelved'), 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.');
+});
+
 // Level-two sections as a Markdown reader sees them, skipping fenced code blocks.
 function markdownSections(packet) {
   const sections = [];
