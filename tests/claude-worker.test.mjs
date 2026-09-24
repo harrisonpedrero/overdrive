@@ -87,7 +87,8 @@ test('theater.json selects the harness and per-lane model', () => {
 
 test('claude harness turn records only visible handoff and working diff, accepts a mid-turn steer, then resumes', async t => {
   const { args, argsFile, runtime } = await fixture(t);
-  const started = await runtime.startFeatureAgent(args);
+  // The fake CLI holds its first response until the steer arrives, so the steer is always mid-turn.
+  const started = await runtime.startFeatureAgent({ ...args, instruction: 'Write the first file; hold-for-steer.' });
   assert.equal(started.harness, 'claude');
   assert.equal(started.model, 'harness-default');
   const launch = JSON.parse(await fs.readFile(argsFile, 'utf8'));

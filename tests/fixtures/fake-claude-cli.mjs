@@ -28,6 +28,7 @@ let busy = false;
 // A resumed session continues numbering from the files earlier processes left behind.
 let count = fs.readdirSync(process.cwd()).filter(name => /^worker-\d+\.txt$/.test(name)).length;
 let buffer = '';
+let queued = null;
 
 function respond(message) {
   const text = message.message.content.map(part => part.text).join('\n');
@@ -57,15 +58,21 @@ function respond(message) {
     process.stderr.write('Error: connect ECONNREFUSED 127.0.0.1:9 (api_key=fake-stderr-secret-value)\n');
     return Promise.resolve();
   }
-  return new Promise(resolve => setTimeout(() => {
+  // "hold-for-steer" keeps the response active until the next user message is queued, so a
+  // steer is deterministically mid-turn; other responses finish after a fixed delay.
+  const ready = /hold-for-steer/.test(text) ? nextMessage() : new Promise(resolve => setTimeout(resolve, 1_500));
+  return ready.then(() => {
     const file = `worker-${n}.txt`;
     fs.writeFileSync(path.join(process.cwd(), file), `turn ${n}\n`);
     send({ type: 'assistant', session_id: sessionId, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tool-${n}`, name: 'Write', input: { file_path: file, content: `turn ${n}\n` } }] } });
     send({ type: 'user', session_id: sessionId, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: 'secret-tool-output-do-not-persist' }] } });
     send({ type: 'assistant', session_id: sessionId, message: { role: 'assistant', content: [{ type: 'text', text: `Handoff ${n}: wrote ${file}.` }] } });
     send({ type: 'result', subtype: 'success', is_error: false, num_turns: 2, result: `Handoff ${n}: wrote ${file}.`, session_id: sessionId, permission_denials: n === 1 ? [{ tool_name: 'WebFetch', tool_input: {} }] : [] });
-    resolve();
-  }, 1_500));
+  });
+}
+
+function nextMessage() {
+  return new Promise(resolve => { if (queue.length) resolve(); else queued = resolve; });
 }
 
 async function drain() {
@@ -84,6 +91,7 @@ process.stdin.on('data', chunk => {
     buffer = buffer.slice(at + 1);
     if (line) queue.push(JSON.parse(line));
   }
+  if (queued && queue.length) { queued(); queued = null; }
   void drain();
 });
 process.stdin.on('end', () => process.stdout.write('', () => process.stderr.write('', () => process.exit(0))));
