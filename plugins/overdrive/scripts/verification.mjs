@@ -3,7 +3,7 @@ import { checkOutcome } from './check-outcome.mjs';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { CANDIDATE_REVIEW_ACTION, COMPLETED_ACTION, DIRECTION_CHECKPOINTED_SQL, assertCheckReservation, bumpSemanticGeneration, contractSnapshotKey, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
+import { assertCheckReservation, contractSnapshotKey, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { unconfirmedDescendants, workersKey } from './ownership.mjs';
 import { OverdriveError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock, STATE_DIR } from './util.mjs';
@@ -87,24 +87,12 @@ export function assertWorkersStopped(db, feature) {
   }
   const marker = unconfirmedDescendants(db, feature.id);
   if (marker) {
-    throw new OverdriveError(`Tools launched by a stopped worker of this lane may still be running, so checks, candidate recording and completion must wait. Confirm no process is running in its checkout, then pause the lane with feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
+    throw new OverdriveError(`Tools launched by a stopped worker of this lane may still be running, so checks, candidate recording and completion must wait. Confirm no process is running in its checkout, then pause the lane with feature_update and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
   }
 }
 
-// Reports whether a candidate or the lane status actually changed; callers own the generation bump.
-// Generated review or accepted-delivery text then yields to the work graph's direction on active,
-// review, done and blocked lanes (reactivation keeps a blocked lane's stored text), unless a
-// checkpoint saved that exact text after the latest candidate, archive or completion event.
-export function invalidateCandidates(db, featureId) {
-  const { status } = db.prepare('SELECT status FROM features WHERE id = ?').get(featureId);
-  const superseded = db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId).changes;
-  const reopened = db.prepare("UPDATE features SET status = 'active' WHERE id = ? AND status IN ('done','review')").run(featureId).changes;
-  if (!superseded && !reopened) return false;
-  if (['active', 'review', 'done', 'blocked'].includes(status)) {
-    db.prepare(`UPDATE features SET next_action = ? WHERE id = ? AND next_action IN (?, ?) AND NOT ${DIRECTION_CHECKPOINTED_SQL}`)
-      .run(workGraphAction(workItems(db, featureId)), featureId, CANDIDATE_REVIEW_ACTION, COMPLETED_ACTION);
-  }
-  return true;
+function invalidateCandidates(db, featureId) {
+  db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status IN ('ready','accepted')").run(featureId);
 }
 
 export function verificationStatus(ctx, feature, revision) {
@@ -150,12 +138,6 @@ export function assertVerified(ctx, feature, revision, candidate = null) {
     throw new OverdriveError('Completion requires a saved specification and passing runtime receipts for every current required check at this commit.', 'COMPLETION_NOT_PROVEN', verification);
   }
   return verification;
-}
-
-// Superseding a candidate or reopening a lane changes its projected direction and status, so the
-// persisted packet and index follow. workspace.mjs imports this module, hence the deferred import.
-async function refreshLaneFiles(ctx, slug) {
-  await (await import('./workspace.mjs')).refreshLaneFiles(ctx, slug);
 }
 
 async function withFeature(args, fn, lockOptions) {
@@ -267,11 +249,9 @@ export async function updateChecks(args) {
       captureContract(ctx.db, feature, definition);
       meta(ctx.db, `checks:${feature.id}`, JSON.stringify(checks));
       invalidateCandidates(ctx.db, feature.id);
-      bumpSemanticGeneration(ctx.db, feature.id);
       ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(now(), feature.id);
       recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.updated', summary: `Configured ${checks.length} verification command(s).` });
     });
-    if (changed) await refreshLaneFiles(ctx, feature.slug);
     return { feature: feature.slug, changed, checks, contractHash: featureContract(ctx.db, feature) };
   });
 }
@@ -330,13 +310,8 @@ export async function runChecks(args, execution = {}) {
       throw new OverdriveError('Queued verification no longer matches the exact commit and full contract.', 'STALE_QUEUE_JOB');
     }
     captureContract(ctx.db, feature, definition);
-    // Receipts are live evidence; only a superseded candidate or reopened lane is a semantic change.
-    let invalidated = false;
     const invalidateUnverified = () => {
-      if (!verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head).ready && invalidateCandidates(ctx.db, feature.id)) {
-        bumpSemanticGeneration(ctx.db, feature.id);
-        invalidated = true;
-      }
+      if (!verificationStatus(ctx, featureBySlug(ctx.db, feature.slug), before.head).ready) invalidateCandidates(ctx.db, feature.id);
     };
     const receipts = [];
     for (const check of selectedChecks) {
@@ -380,7 +355,6 @@ export async function runChecks(args, execution = {}) {
     const selectedCheckKeys = selectedChecks.map(check => check.key);
     const completion = checkOutcome(selectedCheckKeys, receipts);
     recordEvent(ctx.db, { featureId: feature.id, kind: 'checks.executed', summary: `Run finished at ${before.head.slice(0, 12)}: ${receipts.length} executed, ${completion.failedCheckKeys.length} failed, ${completion.notRunCheckKeys.length} not run.`, details: { receipts: receipts.map(item => item.id), selectedCheckKeys, completion } });
-    if (invalidated) await refreshLaneFiles(ctx, feature.slug);
     return { feature: feature.slug, selectedCheckKeys, receipts, completion, verification, git: await repositorySnapshot(feature.checkout_path) };
   }, execution.receiptId ? { timeoutMs: 0 } : undefined);
 }

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { assertAgentIdle, assertVerified, assertWorkersStopped, captureFeatureContract, featureContract, invalidateCandidates, verificationStatus } from './verification.mjs';
-import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, agentBusy, agentOwner, descendantsKey, ownerAlive, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
+import { assertAgentIdle, assertVerified, assertWorkersStopped, captureFeatureContract, featureChecks, verificationStatus } from './verification.mjs';
+import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, descendantsKey, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { codexExecutable } from './app-server.mjs';
@@ -23,13 +23,8 @@ import {
   writeJson, STATE_DIR, CONFIG_FILE,
 } from './util.mjs';
 import {
-  checkoutFingerprint,
-  compareCheckoutFingerprints,
   createFeatureCheckout,
   diffSummary,
-  checkoutPath,
-  fingerprintComplete,
-  fingerprintSummary,
   initializeMirror,
   inspectMirror,
   mirrorPath,
@@ -41,16 +36,8 @@ import {
   verifyCheckoutRevision,
 } from './git.mjs';
 import {
-  ARCHIVED_ACTION,
-  CANDIDATE_REVIEW_ACTION,
-  COMPLETED_ACTION,
-  DIRECTION_CHECKPOINTED_SQL,
-  PAUSED_ACTION,
-  READY_WORK_ACTION,
   assertBoundCheckout,
-  bumpSemanticGeneration,
   bindCandidateChecks,
-  candidateAction,
   candidateChecksKey,
   candidateRecordedSummary,
   featureBySlug,
@@ -59,16 +46,12 @@ import {
   loadWorkspace,
   meta,
   newId,
-  normalizeFeature,
-  openDatabase,
   parseJson,
   readWorkspaceConfig,
   projectCandidateEvent,
   receiptCheckText,
   recordEvent,
   transaction,
-  unwrapPausedAction,
-  workGraphAction,
   workItems,
 } from './state.mjs';
 
@@ -109,137 +92,6 @@ function progressFor(db, featureId) {
 
 function latestSpec(db, featureId) {
   return db.prepare('SELECT revision, content, rationale, created_at FROM spec_revisions WHERE feature_id = ? ORDER BY revision DESC LIMIT 1').get(featureId);
-}
-
-// Insertion order, not the timestamp, identifies the latest checkpoint; milliseconds can tie.
-function latestCheckpoint(db, featureId) {
-  const row = db.prepare('SELECT * FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(featureId);
-  return row ? { ...row, unresolved: parseJson(row.unresolved_json, []) } : undefined;
-}
-
-// A checkpoint is fresh only when it recorded the lane's current semantic generation. Checkpoints
-// saved before generations existed cannot prove that and must be renewed.
-function assertCheckpointFresh(db, feature) {
-  const checkpoint = latestCheckpoint(db, feature.id);
-  const current = Number(db.prepare('SELECT semantic_generation FROM features WHERE id = ?').get(feature.id).semantic_generation);
-  const recorded = checkpoint?.semantic_generation ?? null;
-  if (recorded !== null && Number(recorded) === current) return;
-  throw new OverdriveError(`Checkpoint ${feature.slug} after its latest change before switching.`, 'CHECKPOINT_REQUIRED', {
-    feature: feature.slug,
-    reason: !checkpoint ? 'missing' : recorded === null ? 'legacy_checkpoint' : 'changed',
-    checkpointId: checkpoint?.id ?? null,
-    checkpointGeneration: recorded === null ? null : Number(recorded),
-    currentGeneration: current,
-  });
-}
-
-// A visible checkout-freshness caveat for a lane's recovery packet. Only a complete observation
-// that matched (a complete checkpoint fingerprint or an idle lane's fresh switch comparison) clears it.
-const checkoutCaveatKey = featureId => `checkout-caveat:${featureId}`;
-
-function checkoutCaveat(db, featureId) {
-  return parseJson(meta(db, checkoutCaveatKey(featureId)), null);
-}
-
-function setCheckoutCaveat(db, featureId, caveat) {
-  if (caveat) meta(db, checkoutCaveatKey(featureId), JSON.stringify(caveat));
-  else db.prepare('DELETE FROM meta WHERE key = ?').run(checkoutCaveatKey(featureId));
-}
-
-function indeterminateReasons(...fingerprints) {
-  return [...new Set(fingerprints.flatMap(fingerprint => fingerprint?.indeterminate ?? []).map(item => `${item.component} ${item.reason}`))];
-}
-
-// Only a complete capture clears a lane's caveat; an incomplete one replaces it with its own.
-function checkpointCaveat(checkpointId, fingerprint) {
-  if (fingerprintComplete(fingerprint)) return null;
-  const reasons = indeterminateReasons(fingerprint);
-  return {
-    source: 'checkpoint', status: 'indeterminate', changed: [], indeterminate: reasons, checkpointId, observedAt: fingerprint.observedAt,
-    message: `Checkpoint ${checkpointId} could not fingerprint the checkout completely (${reasons.join(', ')}); a later switch cannot prove the checkout unchanged.`,
-  };
-}
-
-function unavailableFingerprint(error) {
-  return { observedAt: now(), head: null, index: null, paths: null, contents: null, counts: null, excluded: [], indeterminate: [{ component: 'all', reason: 'checkout_unavailable', detail: { message: error.message } }] };
-}
-
-// Observes the outgoing checkout against its latest checkpoint. This is async Git and file I/O, so
-// it runs before the switch transaction; the policy is applied inside it.
-async function observeCheckout(db, feature) {
-  const checkpoint = latestCheckpoint(db, feature.id);
-  const saved = parseJson(checkpoint?.checkout_fingerprint_json ?? null, null);
-  let current = null;
-  if (saved) {
-    try { current = await checkoutFingerprint(feature.checkout_path); }
-    catch (error) { current = unavailableFingerprint(error); }
-  }
-  return { checkpoint, saved, current, comparison: compareCheckoutFingerprints(saved, current) };
-}
-
-// Durable turn state decides whether a worker may be writing; an idle session owner is not active.
-// Owner liveness, worker guards and unconfirmed descendants are reported, not used to decide.
-function workerEvidence(db, featureId) {
-  const row = db.prepare('SELECT active_turn_id, agent_status FROM features WHERE id = ?').get(featureId);
-  return {
-    active: agentBusy(row),
-    agentStatus: row.agent_status,
-    activeTurnId: row.active_turn_id ?? null,
-    ownerAlive: ownerAlive(agentOwner(db, featureId)),
-    workerGuards: parseJson(meta(db, workersKey(featureId)), []).length,
-    unconfirmedDescendants: Boolean(unconfirmedDescendants(db, featureId)),
-  };
-}
-
-// Git checkout freshness for the outgoing lane, applied inside the switch transaction after the
-// semantic-generation check. An idle lane cannot switch on definite drift or on a checkpoint
-// without a comparable fingerprint; an indeterminate comparison needs explicit acceptance. A lane
-// whose worker may be running switches with a caveat instead, since its checkout is still moving.
-function applyCheckoutFreshness(db, feature, observation, acceptUnverified) {
-  const { checkpoint, saved, current, comparison } = observation;
-  if (latestCheckpoint(db, feature.id)?.id !== checkpoint.id) {
-    throw new OverdriveError(`${feature.slug} was checkpointed while it was being switched; switch again.`, 'CHECKPOINT_CONFLICT', { feature: feature.slug, observedCheckpointId: checkpoint.id });
-  }
-  const worker = workerEvidence(db, feature.id);
-  const reasons = indeterminateReasons(saved, current);
-  const checkout = {
-    status: comparison.status,
-    ...(comparison.reason ? { reason: comparison.reason } : {}),
-    changed: comparison.changed,
-    indeterminate: comparison.indeterminate,
-    checkpoint: fingerprintSummary(saved),
-    current: fingerprintSummary(current),
-  };
-  const details = reason => ({ feature: feature.slug, reason, checkpointId: checkpoint.id, checkout, worker });
-  if (!worker.active) {
-    if (comparison.status === 'changed') {
-      throw new OverdriveError(`Checkpoint ${feature.slug} again before switching: its checkout changed after the checkpoint (${comparison.changed.join(', ')}).`, 'CHECKPOINT_REQUIRED', details('checkout_changed'));
-    }
-    if (comparison.status === 'unverified') {
-      throw new OverdriveError(`Checkpoint ${feature.slug} again before switching: its latest checkpoint has no comparable checkout fingerprint.`, 'CHECKPOINT_REQUIRED', details('checkout_unverified'));
-    }
-    if (comparison.status === 'indeterminate' && !acceptUnverified) {
-      throw new OverdriveError(`${feature.slug}'s checkout could not be compared completely with its checkpoint (${reasons.join(', ') || comparison.indeterminate.join(', ')}).`, 'CHECKOUT_INDETERMINATE', {
-        ...details('checkout_indeterminate'),
-        recovery: 'Retry once transient conditions clear, reduce dirty and untracked content below the limits (commit, stash or ignore generated files) and checkpoint again, or switch with accept_unverified_checkout: true to record an explicit unverified-checkout caveat.',
-      });
-    }
-  }
-  const accepted = !worker.active && comparison.status === 'indeterminate';
-  const cause = accepted ? 'the switch was explicitly accepted as unverified' : "the lane's worker was active at the switch";
-  // A matching observation of a lane whose worker may still write is not freshness; only an idle
-  // lane's fresh comparison clears the caveat.
-  const message = {
-    fresh: worker.active ? `Checkout matched checkpoint ${checkpoint.id} when observed, but the lane's worker was active at the switch, so the checkout may have changed since.` : null,
-    changed: `Checkout changed after checkpoint ${checkpoint.id} (${comparison.changed.join(', ')}); ${cause}, so the checkpoint may not describe the current checkout.`,
-    unverified: `Checkpoint ${checkpoint.id} has no comparable checkout fingerprint; ${cause}, so checkout freshness is unverified.`,
-    indeterminate: `Checkout freshness against checkpoint ${checkpoint.id} could not be established (${reasons.join(', ') || comparison.indeterminate.join(', ')}); ${cause}. The checkpoint is not proven to match the checkout.`,
-  }[comparison.status];
-  setCheckoutCaveat(db, feature.id, message ? {
-    source: 'switch', status: comparison.status, changed: comparison.changed, indeterminate: reasons,
-    worker: worker.active ? 'active' : 'idle', accepted, checkpointId: checkpoint.id, observedAt: current?.observedAt ?? null, message,
-  } : null);
-  return { ...checkout, worker: worker.active ? 'active' : 'idle', workerEvidence: worker, accepted, caveat: message, checkpointId: checkpoint.id };
 }
 
 function evidenceRows(db, featureId, limit = 50) {
@@ -295,7 +147,7 @@ async function ensureWorkspaceFiles(root, config) {
   }
   const agentsFile = contained(root, 'AGENTS.md');
   if (!await exists(agentsFile)) {
-    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the overdrive skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nOn a feature switch, checkpoint the outgoing lane, call the switch tool, honor its compaction directive, then load only the destination context packet. Recover from .overdrive/index.md, the focused context, live Git state, and the saved agent session. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
+    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the overdrive skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nRecover from .overdrive/index.md, each lane's context packet, live Git state, and the saved agent sessions. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
   }
 }
 
@@ -314,7 +166,7 @@ Before each turn, read:
 
 Use the durable work graph in the context packet to choose the next useful work. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key before implementing it. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit OVERDRIVE state files directly. Do not put coordination artifacts into application commits.
 
-The coordinator owns work-item claims, lease renewals and status changes; follow the assigned work key when provided. If that assigned item still appears ready or unowned, report the bookkeeping mismatch once and continue the authorized implementation without trying to claim it yourself. Surface a conflicting assignment or unmet prerequisite before proceeding with the affected work; your final report does not itself mark work done or create execution receipts.
+The coordinator owns work-item status changes; follow the assigned work key when provided. Surface a conflicting assignment or unmet prerequisite before proceeding with the affected work; your final report does not itself mark work done or create execution receipts.
 
 Your visible updates and final messages may be recorded as safe progress summaries. Never reveal private chain-of-thought. Record exact commands, revisions, and observed outcomes in your visible handoff. Remote pushes, pull requests, merges, destructive cleanup, and new external authority require explicit user authorization.
 
@@ -354,36 +206,25 @@ async function addEvent(ctx, event) {
 }
 
 export async function writeIndex(ctx) {
-  const focus = meta(ctx.db, 'focus') || '';
   const features = listFeatureRows(ctx.db, { includeArchived: true });
   const rows = features.map(feature => {
     const progress = progressFor(ctx.db, feature.id);
-    return `| ${feature.slug === focus ? '→' : ''} | ${markdownCell(feature.slug)} | ${markdownCell(feature.status)} | ${progress.done}/${progress.total || 0} | ${markdownCell(feature.agent_status)} | ${markdownCell(feature.next_action || '—')} |`;
+    return `| ${markdownCell(feature.slug)} | ${markdownCell(feature.status)} | ${progress.done}/${progress.total || 0} | ${markdownCell(feature.agent_status)} | ${markdownCell(feature.next_action || '—')} |`;
   });
   const managedLine = ctx.config.managedProject
     ? `Managed project: ${ctx.config.managedProject.name} · ${ctx.config.defaultBranch} @ ${ctx.config.defaultRevision.slice(0, 12)}\n`
     : '';
   const body = `# OVERDRIVE index
 
-Focused feature: ${focus || 'none'}
 ${managedLine}Updated: ${now()}
 
-| Focus | Feature | State | Work done | Agent | Next action |
-| --- | --- | --- | ---: | --- | --- |
-${rows.length ? rows.join('\n') : '| | _No features yet_ | | | | |'}
+| Feature | State | Work done | Agent | Next action |
+| --- | --- | ---: | --- | --- |
+${rows.length ? rows.join('\n') : '| _No features yet_ | | | | |'}
 
 This is a compact navigation projection. Load one feature's context packet instead of every spec.
 `;
   await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'index.md'), body);
-}
-
-// Rewrites a lane's context packet and the workspace index after a change made under the lane's
-// control lock alone, such as verification, taking the features lock in control-then-features order.
-export async function refreshLaneFiles(ctx, slug) {
-  await withWorkspaceLock(ctx.root, 'features', async () => {
-    await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
-    await writeIndex(ctx);
-  });
 }
 
 // Stored text goes in a fence longer than any backtick run it contains, so Markdown in it can
@@ -395,7 +236,7 @@ function verbatimBlock(text) {
   return `${fence}text\n${text}\n${fence}\n`;
 }
 
-// Claimed work keeps its complete saved text in a keyed file beside the packet, so the packet stays
+// Running work keeps its complete saved text in a keyed file beside the packet, so the packet stays
 // compact however many long items are running. The prefix keeps keys such as "con.x" from naming a
 // Windows device, and the digest keeps case-distinct keys apart on case-insensitive file systems.
 function workDetailsName(key) {
@@ -432,10 +273,9 @@ async function fileStartsWith(file, text, size) {
   } finally { await handle.close(); }
 }
 
-// Writes details for running work and returns the file for each running key. Running work is
-// immutable, so a file whose complete content already matches is left untouched. Cleanup
-// removes only regular files this code generated, proved by their exact name and marker, so notes
-// left in the directory survive.
+// Writes details for running work and returns the file for each running key, leaving a file whose
+// complete content already matches untouched. Cleanup removes only regular files this code
+// generated, proved by their exact name and marker, so notes left in the directory survive.
 async function writeWorkDetails(ctx, feature, work) {
   const directory = await ensureManagedPath(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'work'));
   const files = new Map(work.filter(item => item.status === 'running').map(item => [item.item_key, contained(directory, workDetailsName(item.item_key))]));
@@ -462,12 +302,10 @@ async function writeWorkDetails(ctx, feature, work) {
 export async function writeFeatureContext(ctx, featureOrSlug) {
   const feature = typeof featureOrSlug === 'string' ? featureBySlug(ctx.db, safeSlug(featureOrSlug)) : featureOrSlug;
   const work = workItems(ctx.db, feature.id);
-  const checkpoint = latestCheckpoint(ctx.db, feature.id);
   const evidence = evidenceRows(ctx.db, feature.id, 10);
   const pending = pendingRows(ctx.db, feature.id);
   const canonicalSpec = latestSpec(ctx.db, feature.id);
   if (canonicalSpec) await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'spec.md'), `${canonicalSpec.content.trim()}\n`);
-  const caveat = checkoutCaveat(ctx.db, feature.id);
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
   catch (error) { snapshot = { unavailable: error.message }; }
@@ -485,9 +323,9 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
-  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}${caveat ? `- CHECKOUT FRESHNESS CAVEAT: ${caveat.message}\n` : ''}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'context.md'), packet);
-  return { feature, work, checkpoint, evidence, pending, snapshot, commitIdentity: identity, checkoutCaveat: caveat };
+  return { feature, work, evidence, pending, snapshot, commitIdentity: identity };
 }
 
 async function existingInitialization(root, normalized) {
@@ -667,7 +505,6 @@ export function overview(ctx) {
           defaultBranch: ctx.config.managedProject.defaultBranch,
         }
       : null,
-    focus: meta(ctx.db, 'focus') || null,
     featureCount: Number(ctx.db.prepare('SELECT COUNT(*) AS count FROM features').get().count),
   };
 }
@@ -793,29 +630,19 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const profile = defaultProfile && base === refreshed.defaultRevision
         ? defaultProfile
         : await profileRepository(root, base, path.join(clone.destination, '.git'));
-      let fingerprint;
-      try { fingerprint = await checkoutFingerprint(clone.destination); }
-      catch (error) { fingerprint = unavailableFingerprint(error); }
       const created = now();
       const id = newId('feature');
-      const creationCheckpoint = newId('checkpoint');
       transaction(ctx.db, () => {
         if (!selectedBase) {
           meta(ctx.db, 'default_revision', refreshed.defaultRevision);
           meta(ctx.db, 'default_branch', refreshed.defaultBranch);
         }
         ctx.db.prepare(`
-          INSERT INTO features(id, slug, title, outcome, status, priority, base_revision, branch, checkout_path, spec_revision, summary, next_action, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(id, slug, cleanTitle, cleanOutcome, priority, base, clone.branch, clone.destination, initialSpec ? 1 : 0, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', created, created);
+          INSERT INTO features(id, slug, title, outcome, status, priority, base_revision, branch, checkout_path, spec_revision, summary, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, slug, cleanTitle, cleanOutcome, priority, base, clone.branch, clone.destination, initialSpec ? 1 : 0, 'Feature lane created.', created, created);
         if (initialSpec) ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, 1, ?, ?, ?)')
           .run(newId('spec'), id, initialSpec, 'Initial feature specification.', created);
-        // The creation checkpoint covers the lane's initial generation, including any initial spec,
-        // and the new clone's checkout.
-        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, summary, next_action, unresolved_json, semantic_generation, checkout_fingerprint_json, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)')
-          .run(creationCheckpoint, id, base, 'Feature lane created.', initialSpec ? 'Plan the first bounded work from the accepted spec.' : 'Refine and save the feature specification.', '[]', JSON.stringify(fingerprint), created);
-        setCheckoutCaveat(ctx.db, id, checkpointCaveat(creationCheckpoint, fingerprint));
-        if (!meta(ctx.db, 'focus')) meta(ctx.db, 'focus', slug);
       });
       const row = featureBySlug(ctx.db, slug);
       const specBody = initialSpec || `# ${cleanTitle}\n\n## Outcome\n\n${cleanOutcome}\n\n## User-visible behavior\n\n## Constraints and compatibility\n\n## Acceptance criteria\n\n## Out of scope\n\n## Open decisions\n`;
@@ -834,7 +661,7 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
         commitIdentity: clone.commitIdentity,
         contextPath: contained(root, STATE_DIR, 'features', slug, 'context.md'),
         specPath: contained(root, STATE_DIR, 'features', slug, 'spec.md'),
-        next: `${initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call spec_update.'}${clone.commitIdentity.automation ? ' Disclose that this lane commits as the OVERDRIVE automation identity and show the optional lane-local override from commitIdentity.override; work and commits need not wait for an answer.' : clone.commitIdentity.overridden ? ' Disclose that inherited Git identity overrides decide this lane\'s author and committer (see commitIdentity).' : ''}`,
+        next: `${initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then save it with feature_update.'}${clone.commitIdentity.automation ? ' Disclose that this lane commits as the OVERDRIVE automation identity and show the optional lane-local override from commitIdentity.override; work and commits need not wait for an answer.' : clone.commitIdentity.overridden ? ' Disclose that inherited Git identity overrides decide this lane\'s author and committer (see commitIdentity).' : ''}`,
       };
     } finally { ctx.db.close(); }
   });
@@ -868,11 +695,9 @@ function summarizeFeature(ctx, feature) {
 
 export async function listFeatures({ workspace_path, include_archived = false, refresh_git = false }) {
   return await withContext(workspace_path, async ctx => {
-    const focus = meta(ctx.db, 'focus') || null;
     const features = [];
     for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived) })) {
       const result = summarizeFeature(ctx, recoverAgentState(ctx, feature));
-      result.focused = feature.slug === focus;
       if (refresh_git) {
         try { result.git = await repositorySnapshot(assertBoundCheckout(feature).checkout_path, feature.base_revision); }
         catch (error) { result.git = { error: error.message }; }
@@ -886,60 +711,22 @@ export async function listFeatures({ workspace_path, include_archived = false, r
 export async function getFeatureContext({ workspace_path, feature, timeline_limit = 20 }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
-    // Repairing inconsistent readiness here is still a work-status change.
-    transaction(ctx.db, () => {
-      if (reconcileReady(ctx.db, row.id)) bumpSemanticGeneration(ctx.db, row.id);
-    });
     const projection = await writeFeatureContext(ctx, row);
     const spec = latestSpec(ctx.db, row.id);
     const timeline = timelineRows(ctx.db, row.id, timeline_limit);
     return {
-      feature: summarizeFeature(ctx, featureBySlug(ctx.db, row.slug)),
+      feature: summarizeFeature(ctx, row),
       specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), 'utf8') },
       workItems: projection.work,
-      checkpoint: projection.checkpoint,
       evidence: projection.evidence,
       candidates: candidateRows(ctx.db, row.id),
       verification: verificationStatus(ctx, row, projection.snapshot.head),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
       commitIdentity: projection.commitIdentity,
-      checkoutCaveat: projection.checkoutCaveat,
       timeline,
       contextPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md'),
     };
-  });
-}
-
-export async function updateSpec({ workspace_path, feature, content, rationale = '' }) {
-  const cleanContent = requiredText(content, 'content', { max: 500_000 });
-  const cleanRationale = optionalText(rationale, 'rationale', { max: 20_000 }) || '';
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  return await withWorkspaceLock(root, 'features', async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      const previous = latestSpec(ctx.db, row.id)?.content || '';
-      if (previous.trim() === cleanContent.trim()) return { changed: false, revision: row.spec_revision, diff: { added: 0, removed: 0 } };
-      const revision = row.spec_revision + 1;
-      const stamp = now();
-      transaction(ctx.db, () => {
-        invalidateCandidates(ctx.db, row.id);
-        ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(newId('spec'), row.id, revision, cleanContent, cleanRationale, stamp);
-        // A historical edit leaves an archived lane's terminal or checkpointed direction in place.
-        ctx.db.prepare("UPDATE features SET spec_revision = ?, updated_at = ?, next_action = CASE WHEN status = 'archived' THEN next_action ELSE ? END WHERE id = ?")
-          .run(revision, stamp, 'Reconcile the work graph with the revised specification.', row.id);
-        bumpSemanticGeneration(ctx.db, row.id);
-      });
-      const diff = lineDiff(previous, cleanContent);
-      await atomicWrite(root, contained(root, STATE_DIR, 'features', slug, 'spec.md'), `${cleanContent}\n`);
-      await addEvent(ctx, { featureId: row.id, kind: 'spec.revised', summary: `Saved spec revision ${revision} (+${diff.added}/-${diff.removed} logical lines).`, details: { revision, rationale: cleanRationale } });
-      await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
-      await writeIndex(ctx);
-      return { changed: true, revision, diff, specPath: contained(root, STATE_DIR, 'features', slug, 'spec.md'), next: 'Update the durable work graph to reflect this revision.' };
-    } finally { ctx.db.close(); }
   });
 }
 
@@ -947,6 +734,12 @@ function workKey(value, name = 'work item key') {
   const key = requiredText(value, name, { max: 63 });
   if (!/^[A-Za-z][A-Za-z0-9._-]{0,62}$/.test(key)) throw new OverdriveError(`${name} has an invalid format.`, 'INVALID_WORK_KEY');
   return key;
+}
+
+// An omitted field stays unchanged; null or blank text clears it.
+function editableText(value, name, max) {
+  if (value === undefined) return undefined;
+  return optionalText(value, name, { max }) ?? '';
 }
 
 function validateWorkGraph(db, featureId) {
@@ -968,227 +761,96 @@ function validateWorkGraph(db, featureId) {
   for (const key of graph.keys()) visit(key);
 }
 
-export function reconcileReady(db, featureId) {
+// Planned and ready are derived from dependency completion; every other status is set explicitly.
+function reconcileReady(db, featureId) {
   const items = workItems(db, featureId);
   const status = new Map(items.map(item => [item.item_key, item.status]));
-  const updates = [];
+  const statement = db.prepare('UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?');
   for (const item of items) {
     if (!['planned', 'ready'].includes(item.status)) continue;
-    const runnable = item.dependencies.every(key => status.get(key) === 'done');
-    const next = runnable ? 'ready' : 'planned';
-    if (next !== item.status) updates.push([next, now(), item.id]);
+    const next = item.dependencies.every(key => status.get(key) === 'done') ? 'ready' : 'planned';
+    if (next !== item.status) statement.run(next, now(), item.id);
   }
-  const statement = db.prepare('UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?');
-  for (const update of updates) statement.run(...update);
-  return updates.length;
 }
 
-// Refresh the stored direction only while it is still a work-graph default. Spec revisions,
-// candidates, promotion, done/archived lifecycle and any checkpoint saved since the last
-// derivation keep their deliberately chosen text. Plans made while archived derive nothing.
-// Event ids give the exact order; timestamps can tie.
-function refreshWorkAction(db, featureId, previousItems) {
-  const feature = db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(featureId);
-  if (['done', 'archived'].includes(feature.status)) return null;
-  const stored = feature.next_action;
-  if (stored !== READY_WORK_ACTION && stored !== workGraphAction(previousItems)) return null;
-  const latest = db.prepare(`
-    SELECT kind, json_extract(details_json, '$.nextAction') AS next_action FROM events
-    WHERE feature_id = ? AND (kind = 'feature.checkpointed'
-      OR (kind = 'work.planned' AND json_extract(details_json, '$.directionKept') IS NULL)
-      OR (kind LIKE 'work.%' AND json_extract(details_json, '$.nextAction') IS NOT NULL))
-    ORDER BY id DESC LIMIT 1
-  `).get(featureId);
-  if (latest?.kind === 'feature.checkpointed' && latest.next_action === stored) return null;
-  const next = workGraphAction(workItems(db, featureId));
-  if (next === stored) return null;
-  db.prepare('UPDATE features SET next_action = ? WHERE id = ?').run(next, featureId);
-  return next;
+function workItemInput(item, index) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) throw new OverdriveError(`items[${index}] must be an object.`, 'INVALID_INPUT');
+  const key = workKey(item.key, `items[${index}].key`);
+  if (item.kind !== undefined && !WORK_KINDS.has(item.kind)) throw new OverdriveError(`Unknown work kind: ${item.kind}`, 'INVALID_INPUT');
+  if (item.status !== undefined && !WORK_STATUSES.has(item.status)) throw new OverdriveError(`Unknown work status: ${item.status}`, 'INVALID_INPUT');
+  if (item.depends_on !== undefined && (!Array.isArray(item.depends_on) || item.depends_on.length > 100)) throw new OverdriveError(`Invalid depends_on for ${key}.`, 'INVALID_INPUT');
+  return {
+    key,
+    title: item.title === undefined ? undefined : requiredText(item.title, `${key}.title`, { max: 500 }),
+    description: editableText(item.description, `${key}.description`, 50_000),
+    acceptance: editableText(item.acceptance, `${key}.acceptance`, 50_000),
+    kind: item.kind,
+    status: item.status,
+    result: editableText(item.result, `${key}.result`, 50_000),
+    blocker: editableText(item.blocker, `${key}.blocker`, 20_000),
+    dependsOn: item.depends_on && [...new Set(item.depends_on.map(dep => workKey(dep, `${key}.depends_on`)))],
+  };
 }
 
-export async function planWork({ workspace_path, feature, items }) {
-  if (!Array.isArray(items) || !items.length || items.length > 200) throw new OverdriveError('items must contain 1 to 200 work items.', 'INVALID_INPUT');
-  const normalized = items.map((item, index) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new OverdriveError(`items[${index}] must be an object.`, 'INVALID_INPUT');
-    const key = workKey(item.key, `items[${index}].key`);
-    const kind = item.kind || 'build';
-    if (!WORK_KINDS.has(kind)) throw new OverdriveError(`Unknown work kind: ${kind}`, 'INVALID_INPUT');
-    const priority = item.priority ?? 0;
-    if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new OverdriveError(`Invalid priority for ${key}.`, 'INVALID_INPUT');
-    const dependencies = item.dependencies ?? [];
-    if (!Array.isArray(dependencies) || dependencies.length > 100) throw new OverdriveError(`Invalid dependencies for ${key}.`, 'INVALID_INPUT');
-    return {
-      key,
-      title: requiredText(item.title, `${key}.title`, { max: 500 }),
-      description: optionalText(item.description, `${key}.description`, { max: 50_000 }) || '',
-      acceptance: optionalText(item.acceptance, `${key}.acceptance`, { max: 50_000 }) || '',
-      kind,
-      priority,
-      dependencies: [...new Set(dependencies.map(dep => workKey(dep, `${key}.dependency`)))],
-    };
-  });
-  if (new Set(normalized.map(item => item.key)).size !== normalized.length) throw new OverdriveError('Work item keys must be unique in one plan call.', 'INVALID_INPUT');
+export async function updateWork({ workspace_path, feature, items = [], remove = [] }) {
+  if (!Array.isArray(items) || items.length > 200) throw new OverdriveError('items must contain at most 200 work items.', 'INVALID_INPUT');
+  if (!Array.isArray(remove) || remove.length > 200) throw new OverdriveError('remove must contain at most 200 work keys.', 'INVALID_INPUT');
+  const normalized = items.map(workItemInput);
+  const removed = new Set(remove.map((key, index) => workKey(key, `remove[${index}]`)));
+  const keys = new Set(normalized.map(item => item.key));
+  if (keys.size !== normalized.length) throw new OverdriveError('Work item keys must be unique in one call.', 'INVALID_INPUT');
+  if (!keys.size && !removed.size) throw new OverdriveError('Submit work items or keys to remove.', 'INVALID_INPUT');
+  if ([...removed].some(key => keys.has(key))) throw new OverdriveError('A work item cannot be updated and removed in one call.', 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      assertAgentIdle(row);
-      const previousContract = featureContract(ctx.db, row);
       const stamp = now();
-      let nextAction;
-      let archived = false;
-      let paused = false;
       transaction(ctx.db, () => {
-        const existing = workItems(ctx.db, row.id);
-        const byKey = new Map(existing.map(item => [item.item_key, item]));
-        const immutable = new Set();
-        // Re-submitting the current plan is not a lane change; anything it alters is.
-        let changed = false;
+        const existing = new Map(workItems(ctx.db, row.id).map(item => [item.item_key, item]));
+        for (const key of removed) if (!existing.has(key)) throw new OverdriveError(`Unknown work item: ${key}`, 'WORK_ITEM_NOT_FOUND');
+        // A check scoped to removed work could no longer resolve its scope, which every verification read needs.
+        const scoped = featureChecks(ctx.db, row.id).find(check => check.work_scope?.some(key => removed.has(key)));
+        if (scoped) throw new OverdriveError(`Check ${scoped.key} is scoped to work being removed; change its work_scope with checks_update first.`, 'INVALID_INPUT');
+        const ids = new Map([...existing].map(([key, item]) => [key, item.id]));
         for (const item of normalized) {
-          const found = byKey.get(item.key);
+          const found = existing.get(item.key);
+          if (!found && item.title === undefined) throw new OverdriveError(`${item.key}.title is required for a new work item.`, 'INVALID_INPUT');
+          const values = [
+            item.title ?? found.title, item.description ?? found?.description ?? '', item.kind ?? found?.kind ?? 'build',
+            item.status ?? found?.status ?? 'planned', item.acceptance ?? found?.acceptance ?? '', item.result ?? found?.result_summary ?? '',
+            item.blocker ?? found?.blocker ?? '', stamp,
+          ];
           if (found) {
-            const definitionChanged = found.title !== item.title
-              || found.description !== item.description
-              || found.kind !== item.kind
-              || Number(found.priority) !== item.priority
-              || found.acceptance !== item.acceptance
-              || JSON.stringify([...found.dependencies].sort()) !== JSON.stringify([...item.dependencies].sort());
-            if (['running', 'review', 'done', 'cancelled'].includes(found.status)) {
-              if (definitionChanged) throw new OverdriveError(`${found.status} item ${item.key} is immutable; add a new repair or follow-up item.`, 'INVALID_TRANSITION');
-              immutable.add(item.key);
-              continue;
-            }
-            changed ||= definitionChanged;
-            ctx.db.prepare(`UPDATE work_items SET title = ?, description = ?, kind = ?, status = ?, priority = ?, acceptance = ?, updated_at = ? WHERE id = ?`)
-              .run(item.title, item.description, item.kind, found.status, item.priority, item.acceptance, stamp, found.id);
+            ctx.db.prepare('UPDATE work_items SET title = ?, description = ?, kind = ?, status = ?, acceptance = ?, result_summary = ?, blocker = ?, updated_at = ? WHERE id = ?').run(...values, found.id);
           } else {
             const id = newId('work');
-            ctx.db.prepare(`INSERT INTO work_items(id, feature_id, item_key, title, description, kind, status, priority, acceptance, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-              .run(id, row.id, item.key, item.title, item.description, item.kind, 'planned', item.priority, item.acceptance, stamp, stamp);
-            byKey.set(item.key, { id, item_key: item.key, status: 'planned' });
-            changed = true;
+            ctx.db.prepare('INSERT INTO work_items(title, description, kind, status, acceptance, result_summary, blocker, updated_at, id, feature_id, item_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...values, id, row.id, item.key, stamp);
+            ids.set(item.key, id);
           }
         }
-        for (const item of normalized) {
-          if (immutable.has(item.key)) continue;
-          const id = byKey.get(item.key).id;
-          ctx.db.prepare('DELETE FROM work_dependencies WHERE work_item_id = ?').run(id);
-          for (const dependency of item.dependencies) {
-            const target = byKey.get(dependency) ?? ctx.db.prepare('SELECT id FROM work_items WHERE feature_id = ? AND item_key = ?').get(row.id, dependency);
-            if (!target) throw new OverdriveError(`Unknown dependency ${dependency} for ${item.key}.`, 'UNKNOWN_DEPENDENCY');
-            ctx.db.prepare('INSERT INTO work_dependencies(work_item_id, depends_on_id) VALUES (?, ?)').run(id, target.id);
+        for (const item of normalized.filter(item => item.dependsOn)) {
+          ctx.db.prepare('DELETE FROM work_dependencies WHERE work_item_id = ?').run(ids.get(item.key));
+          for (const dependency of item.dependsOn) {
+            if (!ids.has(dependency)) throw new OverdriveError(`Unknown dependency ${dependency} for ${item.key}.`, 'UNKNOWN_DEPENDENCY');
+            ctx.db.prepare('INSERT INTO work_dependencies(work_item_id, depends_on_id) VALUES (?, ?)').run(ids.get(item.key), ids.get(dependency));
           }
         }
+        // Removal would silently drop the edges of work that still depends on the removed item.
+        const dependent = workItems(ctx.db, row.id).find(item => !removed.has(item.item_key) && item.dependencies.some(key => removed.has(key)));
+        if (dependent) throw new OverdriveError(`${dependent.item_key} still depends on removed work.`, 'UNKNOWN_DEPENDENCY');
+        for (const key of removed) ctx.db.prepare('DELETE FROM work_items WHERE id = ?').run(ids.get(key));
         validateWorkGraph(ctx.db, row.id);
-        if (reconcileReady(ctx.db, row.id)) changed = true;
-        const contractChanged = previousContract !== featureContract(ctx.db, row);
-        if (contractChanged && invalidateCandidates(ctx.db, row.id)) changed = true;
-        // An archived lane keeps its terminal or checkpointed direction until it is reactivated.
-        const saved = ctx.db.prepare('SELECT status, next_action FROM features WHERE id = ?').get(row.id);
-        archived = saved.status === 'archived';
-        paused = saved.status === 'paused';
-        // An unchanged plan keeps explicit checkpoint direction for a current candidate. Without
-        // candidate guidance, planning restores the work graph direction as before.
-        if (!archived) {
-          const derivedAction = candidateAction(ctx.db, row.id);
-          const candidateGuidance = derivedAction === CANDIDATE_REVIEW_ACTION || derivedAction === COMPLETED_ACTION;
-          const checkpointed = !changed && !contractChanged && candidateGuidance
-            && ctx.db.prepare(`SELECT ${DIRECTION_CHECKPOINTED_SQL} AS saved FROM features WHERE id = ?`).get(row.id).saved;
-          nextAction = checkpointed ? saved.next_action : derivedAction;
-          if (saved.next_action !== nextAction) changed = true;
-        }
-        ctx.db.prepare('UPDATE features SET next_action = COALESCE(?, next_action), updated_at = ? WHERE id = ?').run(nextAction ?? null, stamp, row.id);
-        if (changed) bumpSemanticGeneration(ctx.db, row.id);
-      });
-      await addEvent(ctx, { featureId: row.id, kind: 'work.planned', summary: `Reconciled ${normalized.length} work item(s) with spec revision ${row.spec_revision}.`, details: { keys: normalized.map(item => item.key), ...(archived ? { directionKept: true } : { nextAction }) } });
-      const current = featureBySlug(ctx.db, slug);
-      await writeFeatureContext(ctx, current);
-      await writeIndex(ctx);
-      const submittedKeys = new Set(normalized.map(item => item.key));
-      const next = archived
-        ? `${slug} is archived; reactivate it with feature_status before claiming or dispatching its work.`
-        : paused
-          // A paused lane still derives its post-resume direction, but dispatches nothing yet.
-          ? `${slug} is paused; resume it with feature_status (status active) before claiming or dispatching its work.`
-          : 'Claim the selected ready work with work_update, then dispatch its key and outcome to the feature agent.';
-      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => submittedKeys.has(item.item_key)), next };
-    } finally { ctx.db.close(); }
-  });
-}
-
-const ALLOWED_WORK_TRANSITIONS = {
-  planned: new Set(['planned', 'ready', 'running', 'blocked', 'cancelled']),
-  ready: new Set(['planned', 'ready', 'running', 'blocked', 'cancelled']),
-  running: new Set(['running', 'blocked', 'review', 'done', 'failed', 'cancelled']),
-  blocked: new Set(['planned', 'ready', 'running', 'blocked', 'cancelled']),
-  review: new Set(['running', 'review', 'done', 'failed', 'cancelled']),
-  failed: new Set(['planned', 'ready', 'running', 'failed', 'cancelled']),
-  done: new Set(['done']),
-  cancelled: new Set(['cancelled']),
-};
-
-export async function updateWork({ workspace_path, feature, key, status, owner, summary, blocker, result_revision, lease_seconds = 3600 }) {
-  if (!WORK_STATUSES.has(status)) throw new OverdriveError(`Unknown work status: ${status}`, 'INVALID_INPUT');
-  if (!Number.isInteger(lease_seconds) || lease_seconds < 60 || lease_seconds > 86_400) throw new OverdriveError('lease_seconds must be from 60 to 86400.', 'INVALID_INPUT');
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  const itemKey = workKey(key);
-  return await withWorkspaceLock(root, 'features', async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      const featureWork = workItems(ctx.db, row.id);
-      const item = featureWork.find(candidate => candidate.item_key === itemKey);
-      if (!item) throw new OverdriveError(`Unknown work item: ${itemKey}`, 'WORK_ITEM_NOT_FOUND');
-      if (!ALLOWED_WORK_TRANSITIONS[item.status]?.has(status)) throw new OverdriveError(`Invalid work transition: ${item.status} -> ${status}`, 'INVALID_TRANSITION');
-      const cleanOwner = optionalText(owner, 'owner', { max: 200 });
-      // An owner renewing running work keeps whichever saved text it omits; blank text still clears it.
-      const renewing = item.status === 'running' && status === 'running' && item.owner === cleanOwner;
-      const cleanSummary = renewing && summary === undefined ? item.result_summary : optionalText(summary, 'summary', { max: 50_000 }) || '';
-      const cleanBlocker = renewing && blocker === undefined ? item.blocker : optionalText(blocker, 'blocker', { max: 20_000 }) || '';
-      if (status === 'running' && !cleanOwner) throw new OverdriveError('Running work requires an owner.', 'INVALID_INPUT');
-      // An inactive lane gains no new running claim; while paused its current owner may still renew.
-      if (status === 'running' && (['done', 'archived'].includes(row.status) || (row.status === 'paused' && !renewing))) {
-        throw new OverdriveError(`Feature ${slug} is ${row.status}; ${row.status === 'paused' ? 'resume' : 'reactivate'} it with feature_status before claiming running work.`, 'INVALID_TRANSITION');
-      }
-      if (status === 'done' && !cleanSummary) throw new OverdriveError('Completed work requires a result summary.', 'INVALID_INPUT');
-      if (['blocked', 'failed'].includes(status) && !cleanBlocker) throw new OverdriveError(`${status} work requires a blocker or failure description.`, 'INVALID_INPUT');
-      if (status === 'running') {
-        const statuses = new Map(featureWork.map(candidate => [candidate.item_key, candidate.status]));
-        const waitingOn = item.dependencies.filter(dependency => statuses.get(dependency) !== 'done');
-        if (waitingOn.length) throw new OverdriveError(`${itemKey} is waiting on: ${waitingOn.join(', ')}.`, 'DEPENDENCY_NOT_READY');
-      }
-      let revision = optionalText(result_revision, 'result_revision', { max: 200 });
-      if (revision) revision = await verifyCheckoutRevision(row.checkout_path, revision);
-      if (item.status === 'running' && item.owner && item.owner !== cleanOwner && item.lease_expires_at && item.lease_expires_at > now()) {
-        throw new OverdriveError(`${itemKey} is leased to ${item.owner} until ${item.lease_expires_at}. To renew or change this claimed work as its owner, pass owner "${item.owner}".`, 'WORK_LEASED');
-      }
-      const lease = status === 'running' ? new Date(Date.now() + lease_seconds * 1000).toISOString() : null;
-      const clearResultRevision = ['planned', 'ready', 'running'].includes(status);
-      const stamp = now();
-      const detail = renewing && cleanSummary === item.result_summary && cleanBlocker !== item.blocker
-        ? (cleanBlocker ? `blocker: ${cleanBlocker}` : 'blocker cleared')
-        : cleanSummary || cleanBlocker;
-      let nextAction = null;
-      transaction(ctx.db, () => {
-        ctx.db.prepare(`UPDATE work_items SET status = ?, owner = ?, result_summary = ?, blocker = ?, result_revision = CASE WHEN ? THEN NULL ELSE COALESCE(?, result_revision) END, lease_expires_at = ?, updated_at = ? WHERE id = ?`)
-          .run(status, status === 'running' ? cleanOwner : item.owner, cleanSummary, cleanBlocker, clearResultRevision ? 1 : 0, revision ?? null, lease, stamp, item.id);
-        // A lease renewal alone is bookkeeping; every other field here is lane state.
-        const saved = ctx.db.prepare('SELECT status, owner, result_summary, blocker, result_revision FROM work_items WHERE id = ?').get(item.id);
-        let changed = Object.keys(saved).some(field => saved[field] !== item[field]);
-        if (reconcileReady(ctx.db, row.id)) changed = true;
-        nextAction = refreshWorkAction(ctx.db, row.id, featureWork);
-        if (nextAction) changed = true;
+        reconcileReady(ctx.db, row.id);
         ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(stamp, row.id);
-        if (changed) bumpSemanticGeneration(ctx.db, row.id);
       });
-      await addEvent(ctx, { featureId: row.id, workItemId: item.id, kind: `work.${status}`, summary: `${itemKey} is ${status}${detail ? `: ${detail}` : '.'}`, details: { owner: cleanOwner, revision, leaseExpiresAt: lease, ...(nextAction ? { nextAction } : {}) } });
+      await addEvent(ctx, { featureId: row.id, kind: 'work.updated', summary: `Updated ${keys.size} work item(s)${removed.size ? ` and removed ${removed.size}` : ''}.`, details: { keys: [...keys], removed: [...removed] } });
       const current = featureBySlug(ctx.db, slug);
       await writeFeatureContext(ctx, current);
       await writeIndex(ctx);
-      return { item: workItems(ctx.db, row.id).find(candidate => candidate.item_key === itemKey), feature: summarizeFeature(ctx, current) };
+      return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => keys.has(item.item_key)) };
     } finally { ctx.db.close(); }
   });
 }
@@ -1199,203 +861,66 @@ function cleanStringArray(value, name, max = 100) {
   return value.map((entry, index) => requiredText(entry, `${name}[${index}]`, { max: 20_000 }));
 }
 
-export async function checkpointFeature({ workspace_path, feature, summary, next_action, unresolved = [] }) {
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  const requested = requiredText(next_action, 'next_action', { max: 20_000 });
-  const openQuestions = cleanStringArray(unresolved, 'unresolved');
-  return await withWorkspaceLock(root, 'features', async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      const next = row.status === 'paused' ? unwrapPausedAction(requested) : requested;
-      // Verification holds only the lane's control lock, so it can change the lane during the Git
-      // snapshot. The checkpoint covers the generation seen before it and refuses to bless a later one.
-      const semanticGeneration = Number(row.semantic_generation);
-      // A best-effort observation of the checkout; the snapshot below is a separate one.
-      const fingerprint = await checkoutFingerprint(row.checkout_path);
-      const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-      if (fingerprint.head && fingerprint.head.oid !== snapshot.head) {
-        throw new OverdriveError(`${slug}'s HEAD moved while it was being checkpointed; checkpoint again once it settles.`, 'CHECKPOINT_CONFLICT', { feature: slug, reason: 'checkout_moved', fingerprintHead: fingerprint.head.oid, snapshotHead: snapshot.head });
-      }
-      const complete = fingerprintComplete(fingerprint);
-      const stamp = now();
-      const id = newId('checkpoint');
-      transaction(ctx.db, () => {
-        const current = Number(ctx.db.prepare('SELECT semantic_generation FROM features WHERE id = ?').get(row.id).semantic_generation);
-        if (current !== semanticGeneration) {
-          throw new OverdriveError(`${slug} changed while it was being checkpointed; review its current state and checkpoint again.`, 'CHECKPOINT_CONFLICT', { feature: slug, observedGeneration: semanticGeneration, currentGeneration: current });
-        }
-        ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, dirty_summary, summary, next_action, unresolved_json, semantic_generation, checkout_fingerprint_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, row.id, snapshot.head, snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`, cleanSummary, next, JSON.stringify(openQuestions), semanticGeneration, JSON.stringify(fingerprint), stamp);
-        ctx.db.prepare('UPDATE features SET summary = ?, next_action = ?, compaction_pending = 1, updated_at = ? WHERE id = ?').run(cleanSummary, next, stamp, row.id);
-        setCheckoutCaveat(ctx.db, row.id, checkpointCaveat(id, fingerprint));
-      });
-      await addEvent(ctx, { featureId: row.id, kind: 'feature.checkpointed', summary: cleanSummary, details: { head: snapshot.head, clean: snapshot.clean, checkoutFingerprint: complete ? 'complete' : 'indeterminate', nextAction: next, unresolved: openQuestions } });
-      const current = featureBySlug(ctx.db, slug);
-      await writeFeatureContext(ctx, current);
-      await writeIndex(ctx);
-      return {
-        checkpointId: id, semanticGeneration, feature: summarizeFeature(ctx, current), git: snapshot, checkoutFingerprint: fingerprint,
-        ...(complete ? {} : { warnings: [`The checkout fingerprint is indeterminate (${indeterminateReasons(fingerprint).join(', ')}); an idle switch can still detect definite drift from it, but cannot prove freshness without accept_unverified_checkout.`] }),
-        compaction: { featureSession: Boolean(row.thread_id), metaSession: 'recommended_at_switch' },
-      };
-    } finally { ctx.db.close(); }
-  });
+// Validates an update before anything acts on it, such as stopping a worker.
+export function featureUpdateInput({ status, spec, spec_rationale, summary, next_action, blocker, unresolved }) {
+  if (status !== undefined && !FEATURE_STATUSES.has(status)) throw new OverdriveError(`Unknown feature status: ${status}`, 'INVALID_INPUT');
+  return {
+    status,
+    spec: spec === undefined ? undefined : requiredText(spec, 'spec', { max: 500_000 }),
+    rationale: optionalText(spec_rationale, 'spec_rationale', { max: 20_000 }) || '',
+    summary: editableText(summary, 'summary', 50_000),
+    nextAction: editableText(next_action, 'next_action', 20_000),
+    // A blocker describes the blocked state, so another status given without one clears it.
+    blocker: editableText(blocker, 'blocker', 20_000) ?? (status !== undefined && status !== 'blocked' ? '' : undefined),
+    unresolved: unresolved === undefined ? undefined : cleanStringArray(unresolved, 'unresolved'),
+  };
 }
 
-export async function switchFeature({ workspace_path, feature, accept_unverified_checkout = false }) {
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  if (typeof accept_unverified_checkout !== 'boolean') throw new OverdriveError('accept_unverified_checkout must be a boolean.', 'INVALID_INPUT');
-  return await withWorkspaceLock(root, 'features', async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const destination = featureBySlug(ctx.db, slug);
-      if (destination.status === 'archived') throw new OverdriveError('Archived features cannot become the active focus.', 'INVALID_TRANSITION');
-      const outgoingSlug = meta(ctx.db, 'focus') || null;
-      if (outgoingSlug === slug) {
-        const packet = await writeFeatureContext(ctx, destination);
-        return { changed: false, focus: slug, feature: summarizeFeature(ctx, destination), git: packet.snapshot, coordinatorCompactionRecommended: false };
-      }
-      // An archived lane has no live work to checkpoint; an older workspace may still focus one.
-      const focused = outgoingSlug ? featureBySlug(ctx.db, outgoingSlug) : null;
-      const outgoing = focused?.status === 'archived' ? null : focused;
-      let observation = null;
-      if (outgoing) {
-        // Semantic freshness takes precedence and is cheap, so a stale lane fails before any Git scan.
-        assertCheckpointFresh(ctx.db, outgoing);
-        observation = await observeCheckout(ctx.db, outgoing);
-      }
-      let checkoutFreshness = null;
-      transaction(ctx.db, () => {
-        if (outgoing) {
-          // Checked inside the transaction: verification writes hold only the lane's control lock.
-          assertCheckpointFresh(ctx.db, outgoing);
-          // Worker state is re-read here, after the scan, before the active-worker exception applies.
-          checkoutFreshness = applyCheckoutFreshness(ctx.db, outgoing, observation, accept_unverified_checkout);
-          // Compaction scheduling is housekeeping, not a lane change, so it leaves the generation alone.
-          ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(outgoing.id);
-        }
-        meta(ctx.db, 'focus', slug);
-      });
-      const freshnessEvent = checkoutFreshness && { status: checkoutFreshness.status, changed: checkoutFreshness.changed, worker: checkoutFreshness.worker, accepted: checkoutFreshness.accepted, caveat: checkoutFreshness.caveat };
-      await addEvent(ctx, { featureId: destination.id, kind: 'focus.switched', summary: `Focused ${slug}${outgoing ? ` after checkpointing ${outgoing.slug}` : ''}.`, details: { from: outgoingSlug, to: slug, ...(freshnessEvent ? { checkoutFreshness: freshnessEvent } : {}) } });
-      const current = featureBySlug(ctx.db, slug);
-      const packet = await writeFeatureContext(ctx, current);
-      if (outgoing) await writeFeatureContext(ctx, outgoing.slug);
-      await writeIndex(ctx);
-      return {
-        changed: true,
-        from: outgoing ? summarizeFeature(ctx, featureBySlug(ctx.db, outgoing.slug)) : null,
-        focus: slug,
-        feature: summarizeFeature(ctx, current),
-        contextPath: contained(root, STATE_DIR, 'features', slug, 'context.md'),
-        git: packet.snapshot,
-        checkoutFreshness,
-        compactFeatureThreadId: outgoing?.thread_id ?? null,
-        coordinatorCompactionRecommended: Boolean(outgoing),
-        compactionDirective: outgoing
-          ? 'Compact the outgoing feature session now if idle. The coordinator has a durable semantic checkpoint; recommend /compact after this response when the outgoing lane contributed substantial context, then reload only the destination packet.'
-          : 'Load only the destination context packet.',
-      };
-    } finally { ctx.db.close(); }
-  });
-}
-
-// Validates a lifecycle transition before anything acts on it, such as stopping a worker.
-export function featureStatusInput({ status, blocker, disposition }) {
-  if (!FEATURE_STATUSES.has(status)) throw new OverdriveError(`Unknown feature status: ${status}`, 'INVALID_INPUT');
-  const cleanBlocker = optionalText(blocker, 'blocker', { max: 20_000 }) || '';
-  const cleanDisposition = optionalText(disposition, 'disposition', { max: 20_000 }) || '';
-  if (status === 'blocked' && !cleanBlocker) throw new OverdriveError('A blocked feature requires a blocker.', 'INVALID_INPUT');
-  if (status === 'archived' && !cleanDisposition) throw new OverdriveError('Archiving requires a disposition.', 'INVALID_INPUT');
-  return { cleanBlocker, cleanDisposition };
-}
-
-export async function setFeatureStatus(args) {
-  if (!FEATURE_STATUSES.has(args.status)) throw new OverdriveError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
+export async function updateFeature(args) {
+  const input = featureUpdateInput(args);
   const root = await resolveWorkspace(args.workspace_path);
-  const slug = safeSlug(args.feature);
-  return await withCheckoutLock(root, slug, () => applyFeatureStatus(root, slug, args));
+  return await withWorkspaceLock(root, 'features', () => applyFeatureUpdate(root, safeSlug(args.feature), input));
 }
 
-// Records a stopping transition (pause or archive) for a caller that already holds the lane's
-// control lock and has stopped its worker. The write itself refuses a lane whose worker may still
-// be live, so the new status can never claim a stop that did not happen.
-export async function setStoppedFeatureStatus(args) {
-  if (!FEATURE_STATUSES.has(args.status)) throw new OverdriveError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
+// Records an update for a caller that already holds the lane's control lock and has stopped its
+// worker. The write itself refuses a lane whose worker may still be live, so a pause or archive
+// can never claim a stop that did not happen.
+export async function updateStoppedFeature(args) {
+  const input = featureUpdateInput(args);
   const root = await resolveWorkspace(args.workspace_path);
-  const slug = safeSlug(args.feature);
-  return await withWorkspaceLock(root, 'features', () => applyFeatureStatus(root, slug, args, { requireStopped: true }));
+  return await withWorkspaceLock(root, 'features', () => applyFeatureUpdate(root, safeSlug(args.feature), input, { requireStopped: true }));
 }
 
-async function applyFeatureStatus(root, slug, args, { requireStopped = false } = {}) {
-  const { status } = args;
+async function applyFeatureUpdate(root, slug, { status, spec, rationale, summary, nextAction, blocker, unresolved }, { requireStopped = false } = {}) {
   const ctx = await loadWorkspace(root);
   try {
     const row = featureBySlug(ctx.db, slug);
-    if (row.status === status && status === 'archived') return { feature: summarizeFeature(ctx, row), unchanged: true };
-    const { cleanBlocker, cleanDisposition } = featureStatusInput(args);
-    let completionCandidate = null;
-    if (status === 'done') {
-      assertAgentIdle(row);
-      assertWorkersStopped(ctx.db, row);
-      const progress = progressFor(ctx.db, row.id);
-      if (progress.open > 0) throw new OverdriveError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
-      completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY rowid DESC LIMIT 1").get(row.id);
-      if (!completionCandidate) throw new OverdriveError('Feature completion requires a ready integration candidate.', 'COMPLETION_NOT_PROVEN');
-      const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-      if (!snapshot.clean || snapshot.head !== completionCandidate.revision) throw new OverdriveError('The ready candidate must still be the clean checkout HEAD.', 'STALE_CANDIDATE');
-      assertVerified(ctx, row, completionCandidate.revision, completionCandidate);
-      if (row.status === status) return { feature: summarizeFeature(ctx, row), unchanged: true };
-    }
+    const previousSpec = latestSpec(ctx.db, row.id)?.content || '';
+    const specChanged = spec !== undefined && previousSpec.trim() !== spec;
+    const revision = row.spec_revision + (specChanged ? 1 : 0);
     const stamp = now();
-    let focusCleared = false;
     transaction(ctx.db, () => {
-      const previous = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
-      // Archiving ends the lane's work, so its direction becomes terminal; a later checkpoint may
-      // still record explicit historical direction, which a repeated archive leaves in place.
-      // Leaving the archive replaces only that terminal text, with the candidate or work graph direction.
-      // The projected direction also treats a legacy archive's stored review text as terminal.
-      // A paused lane projects the bare resume instruction when it has no direction to resume with:
-      // none stored, or generated review text whose candidate was superseded while paused. Only
-      // leaving the pause replaces it; pausing again keeps the stored guidance.
-      // A completed lane projects accepted-candidate guidance over generated review text; leaving
-      // completion stores the derived direction in its place, as for older completed lanes.
-      const projected = featureBySlug(ctx.db, slug).next_action;
-      const settled = previous.status === 'done' && projected === COMPLETED_ACTION && previous.next_action !== COMPLETED_ACTION;
-      const terminal = projected === ARCHIVED_ACTION || (projected === PAUSED_ACTION && status !== 'paused') || settled;
-      const resumed = candidateAction(ctx.db, row.id);
-      // Completion is refused on the same stopped-state condition, re-read in the write itself, so a
-      // turn, worker guard or descendant marker recorded while the checkout was read cannot slip through.
-      // Like assertAgentIdle, it also refuses a running status saved without a turn ID.
-      const stopped = ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}`;
-      const changed = ctx.db.prepare(`UPDATE features SET status = ?, blocker = ?, summary = CASE WHEN ? <> '' THEN ? ELSE summary END, next_action = CASE WHEN ? = 'archived' THEN ? WHEN ? THEN ? ELSE next_action END, updated_at = ? WHERE id = ?${requireStopped ? stopped : completionCandidate ? `${stopped} AND agent_status IS NOT 'running'` : ''}`)
-        .run(status, cleanBlocker, cleanDisposition, cleanDisposition, status, ARCHIVED_ACTION, terminal ? 1 : 0, resumed, stamp, row.id);
-      if (!changed.changes && completionCandidate) {
-        const current = featureBySlug(ctx.db, slug);
-        assertAgentIdle(current);
-        assertWorkersStopped(ctx.db, current);
-      }
+      if (specChanged) ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(newId('spec'), row.id, revision, spec, rationale, stamp);
+      const stopped = requireStopped ? ` AND NOT ${AGENT_BUSY_SQL} AND ${DESCENDANTS_CLEAR_SQL} AND ${WORKERS_CLEAR_SQL}` : '';
+      const changed = ctx.db.prepare(`UPDATE features SET status = COALESCE(?, status), spec_revision = ?, summary = COALESCE(?, summary), next_action = COALESCE(?, next_action), blocker = COALESCE(?, blocker), updated_at = ? WHERE id = ?${stopped}`)
+        .run(status ?? null, revision, summary ?? null, nextAction ?? null, blocker ?? null, stamp, row.id);
       if (!changed.changes) throw new OverdriveError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
-      if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
-      const saved = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
-      if (completionCandidate || Object.keys(saved).some(field => saved[field] !== previous[field])) bumpSemanticGeneration(ctx.db, row.id);
-      // An archived lane cannot hold focus, so archiving the focused lane leaves the workspace unfocused
-      // rather than making the next switch checkpoint a terminal lane. Other lanes keep their focus.
-      if (status === 'archived' && meta(ctx.db, 'focus') === slug) {
-        ctx.db.prepare("DELETE FROM meta WHERE key = 'focus'").run();
-        meta(ctx.db, 'updated_at', stamp);
-        focusCleared = true;
-      }
     });
-    await addEvent(ctx, { featureId: row.id, kind: `feature.${status}`, summary: cleanDisposition || cleanBlocker || `Feature marked ${status}.`, details: focusCleared ? { focusCleared: true } : {} });
+    let specResult;
+    if (specChanged) {
+      const diff = lineDiff(previousSpec, spec);
+      specResult = { revision, diff, specPath: contained(root, STATE_DIR, 'features', slug, 'spec.md') };
+      await addEvent(ctx, { featureId: row.id, kind: 'spec.revised', summary: `Saved spec revision ${revision} (+${diff.added}/-${diff.removed} logical lines).`, details: { revision, rationale } });
+    }
+    const statusChanged = status !== undefined && status !== row.status;
+    const notes = Object.fromEntries(Object.entries({ summary, nextAction, blocker, unresolved }).filter(([, value]) => value !== undefined));
+    if (statusChanged || Object.keys(notes).length) {
+      await addEvent(ctx, { featureId: row.id, kind: statusChanged ? `feature.${status}` : 'feature.updated', summary: summary || blocker || (statusChanged ? `Feature marked ${status}.` : 'Feature notes updated.'), details: notes });
+    }
     const current = featureBySlug(ctx.db, slug);
     await writeFeatureContext(ctx, current);
     await writeIndex(ctx);
-    return { feature: summarizeFeature(ctx, current), ...(focusCleared ? { focusCleared: true } : {}) };
+    return { feature: summarizeFeature(ctx, current), ...(specResult ? { spec: specResult } : {}) };
   } finally { ctx.db.close(); }
 }
 
@@ -1439,9 +964,9 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
     try {
       const row = featureBySlug(ctx.db, slug);
       // Recording moves the lane to review, so an archived lane must be reactivated explicitly first.
-      if (row.status === 'archived') throw new OverdriveError(`Feature ${slug} is archived; reactivate it with feature_status before recording a candidate.`, 'INVALID_TRANSITION');
+      if (row.status === 'archived') throw new OverdriveError(`Feature ${slug} is archived; reactivate it with feature_update before recording a candidate.`, 'INVALID_TRANSITION');
       // Likewise a paused lane stays paused until it is explicitly resumed.
-      if (row.status === 'paused') throw new OverdriveError(`Feature ${slug} is paused; resume it with feature_status before recording a candidate.`, 'INVALID_TRANSITION');
+      if (row.status === 'paused') throw new OverdriveError(`Feature ${slug} is paused; resume it with feature_update before recording a candidate.`, 'INVALID_TRANSITION');
       assertAgentIdle(row);
       assertWorkersStopped(ctx.db, row);
       const resolved = await verifyCheckoutRevision(row.checkout_path, revision);
@@ -1461,9 +986,7 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
         ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
         captureFeatureContract(ctx.db, row);
         meta(ctx.db, candidateChecksKey(id), JSON.stringify({ version: 1, source: 'executed-receipts', receipts: derived.map(check => check.receipt) }));
-        ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, next_action = ?, updated_at = ? WHERE id = ?")
-          .run(cleanSummary, CANDIDATE_REVIEW_ACTION, stamp, row.id);
-        bumpSemanticGeneration(ctx.db, row.id);
+        ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, updated_at = ? WHERE id = ?").run(cleanSummary, stamp, row.id);
       });
       await addEvent(ctx, {
         featureId: row.id, kind: 'candidate.recorded',
@@ -1503,18 +1026,17 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
       const project = await ensureManagedPath(root, contained(root, 'project'));
       if (path.resolve(managed.path) !== project) throw new OverdriveError('Managed project path does not match this workspace.', 'INVALID_STATE');
       const row = featureBySlug(ctx.db, slug);
-      if (row.status !== 'done') throw new OverdriveError('Complete the feature evidence and candidate gates before promotion.', 'PROMOTION_NOT_READY');
       assertAgentIdle(row);
       let resolved = optionalText(revision, 'revision', { max: 200 });
       if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
       const candidate = resolved
-        ? ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND revision = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id, resolved)
-        : ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id);
-      if (!candidate) throw new OverdriveError('No accepted candidate matches this promotion request.', 'PROMOTION_NOT_READY');
+        ? ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND revision = ? AND status IN ('ready','accepted') ORDER BY created_at DESC LIMIT 1").get(row.id, resolved)
+        : ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY created_at DESC LIMIT 1").get(row.id);
+      if (!candidate) throw new OverdriveError('No recorded candidate matches this promotion request.', 'PROMOTION_NOT_READY');
       assertVerified(ctx, row, candidate.revision, candidate);
       const featureSnapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       if (!featureSnapshot.clean || featureSnapshot.head !== candidate.revision) {
-        throw new OverdriveError('The accepted candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
+        throw new OverdriveError('The candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
       }
       const projectSnapshot = await repositorySnapshot(project);
       if (!projectSnapshot.clean) throw new OverdriveError('The managed project has uncommitted changes; preserve or resolve them before promotion.', 'DIRTY_MANAGED_PROJECT');
@@ -1524,7 +1046,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
       const candidateRef = `refs/overdrive/candidates/${slug}/${candidate.revision}`;
       await run(['git', 'fetch', '--no-tags', row.checkout_path, `${candidate.revision}:${candidateRef}`], { cwd: project });
       const fetched = await verifyCheckoutRevision(project, candidateRef);
-      if (fetched !== candidate.revision) throw new OverdriveError('Fetched candidate revision does not match the accepted candidate.', 'STALE_CANDIDATE');
+      if (fetched !== candidate.revision) throw new OverdriveError('Fetched candidate revision does not match the candidate.', 'STALE_CANDIDATE');
       const alreadyIncluded = await isGitAncestor(project, candidate.revision, projectSnapshot.head);
       if (!alreadyIncluded) {
         const canFastForward = await isGitAncestor(project, projectSnapshot.head, candidate.revision);
@@ -1546,11 +1068,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
       transaction(ctx.db, () => {
         meta(ctx.db, 'default_revision', refreshed.defaultRevision);
         meta(ctx.db, 'default_branch', refreshed.defaultBranch);
-        if (!alreadyIncluded) {
-          ctx.db.prepare('UPDATE features SET summary = ?, next_action = ?, updated_at = ? WHERE id = ?')
-            .run(cleanSummary || candidate.summary, 'Create the next feature lane from the promoted managed-project revision.', stamp, row.id);
-          bumpSemanticGeneration(ctx.db, row.id);
-        }
+        if (!alreadyIncluded) ctx.db.prepare('UPDATE features SET summary = ?, updated_at = ? WHERE id = ?').run(cleanSummary || candidate.summary, stamp, row.id);
       });
       await writeJson(root, contained(root, CONFIG_FILE), ctx.config);
       if (!alreadyIncluded) {
@@ -1580,13 +1098,6 @@ function timelineRows(db, featureId, limit = 30) {
   const bounded = Math.max(1, Math.min(Number(limit) || 30, 200));
   return db.prepare('SELECT id, kind, summary, details_json, created_at FROM events WHERE feature_id = ? ORDER BY id DESC LIMIT ?').all(featureId, bounded)
     .map(row => projectCandidateEvent(db, { id: Number(row.id), kind: row.kind, summary: row.summary, details: parseJson(row.details_json, {}), createdAt: row.created_at }));
-}
-
-export async function readTimeline({ workspace_path, feature, limit = 30 }) {
-  return await withContext(workspace_path, async ctx => {
-    const row = featureBySlug(ctx.db, safeSlug(feature));
-    return { feature: row.slug, events: timelineRows(ctx.db, row.id, limit), safety: 'Only explicit instructions, visible messages/plans, Git facts, and generated progress summaries are recorded. Private reasoning is excluded.' };
-  });
 }
 
 export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false }) {

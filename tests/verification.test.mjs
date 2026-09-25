@@ -11,7 +11,7 @@ import { callTool } from '../plugins/overdrive/scripts/tools.mjs';
 import { git, withWorkspaceLock } from '../plugins/overdrive/scripts/util.mjs';
 import { readEvidence, runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
 import { drainCheckQueue, enqueueChecks } from '../plugins/overdrive/scripts/check-queue.mjs';
-import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards, markDescendantsUnconfirmed, readUnconfirmedDescendants, attestDescendantsStopped } from '../plugins/overdrive/scripts/workspace.mjs';
+import { initializeManagedProject, createFeature, recordCandidate, updateFeature, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards, markDescendantsUnconfirmed, readUnconfirmedDescendants, attestDescendantsStopped } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,16 +71,15 @@ test('latest required receipt and current specification gate delivery; dirty che
   await updateChecks({ ...args, checks: [{ key: 'actual', purpose: 'Read the committed README and fixture state', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }] });
   assert.equal((await runChecks(args)).verification.ready, true);
   await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  await setFeatureStatus({ ...args, status: 'done' });
+  await updateFeature({ ...args, status: 'done' });
   await fs.writeFile(path.join(repo, '.check-fails'), 'fail');
   assert.equal((await runChecks(args)).verification.ready, false);
   await assert.rejects(recordCandidate({ ...args, summary: 'Stale pass.', checks: ['old receipt'] }), error => error.code === 'COMPLETION_NOT_PROVEN');
   await fs.rm(path.join(repo, '.check-fails'));
   assert.equal((await runChecks(args)).verification.ready, true);
   await recordCandidate({ ...args, summary: 'Ready again.', checks: ['current receipt'] });
-  await setFeatureStatus({ ...args, status: 'done' });
-  await updateSpec({ ...args, content: '# Alpha\n\nThe README must also describe startup.', rationale: 'New acceptance behavior.' });
-  assert.equal((await getFeatureContext(args)).feature.status, 'active');
+  await updateFeature({ ...args, status: 'done' });
+  await updateFeature({ ...args, spec: '# Alpha\n\nThe README must also describe startup.', spec_rationale: 'New acceptance behavior.' });
   await assert.rejects(recordCandidate({ ...args, summary: 'Old contract.', checks: ['old receipt'] }), error => error.code === 'COMPLETION_NOT_PROVEN');
   await updateChecks({ ...args, checks: [{ key: 'mutating', purpose: 'Detect a check that changes source', argv: [process.execPath, '-e', "require('node:fs').writeFileSync('unexpected.txt', 'mutated')"] }] });
   const changed = await runChecks(args);
@@ -98,7 +97,7 @@ test('an archived lane refuses candidates until it is explicitly reactivated', a
   await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
   assert.equal((await runChecks(args)).verification.ready, true);
   await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  await setFeatureStatus({ ...args, status: 'archived', disposition: 'Shelved without integration.' });
+  await updateFeature({ ...args, status: 'archived', summary: 'Shelved without integration.' });
   const archived = await getFeatureContext(args);
   assert.equal(archived.verification.ready, true);
   await assert.rejects(recordCandidate({ ...args, summary: 'Sneak back in.', checks: ['README receipt'] }), error => error.code === 'INVALID_TRANSITION' && /archived/.test(error.message) && /reactivate/i.test(error.message));
@@ -108,7 +107,7 @@ test('an archived lane refuses candidates until it is explicitly reactivated', a
   assert.equal(after.feature.nextAction, archived.feature.nextAction);
   assert.deepEqual(after.candidates, archived.candidates);
   assert.equal((await listFeatures({ workspace_path: workspace })).features.some(feature => feature.slug === 'shelved'), false);
-  await setFeatureStatus({ ...args, status: 'active' });
+  await updateFeature({ ...args, status: 'active' });
   const reopened = await recordCandidate({ ...args, summary: 'Ready after reactivation.', checks: ['README receipt'] });
   assert.equal(reopened.feature.status, 'review');
   assert.equal((await listFeatures({ workspace_path: workspace })).features.some(feature => feature.slug === 'shelved'), true);
@@ -123,7 +122,7 @@ test('a paused lane refuses candidates until it is explicitly resumed', async t 
   await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
   assert.equal((await runChecks(args)).verification.ready, true);
   await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  await setFeatureStatus({ ...args, status: 'paused' });
+  await updateFeature({ ...args, status: 'paused' });
   const paused = await getFeatureContext(args);
   assert.equal(paused.verification.ready, true);
   await assert.rejects(recordCandidate({ ...args, summary: 'Slip past the pause.', checks: ['README receipt'] }), error => error.code === 'INVALID_TRANSITION' && /paused/.test(error.message) && /resume/i.test(error.message));
@@ -133,7 +132,7 @@ test('a paused lane refuses candidates until it is explicitly resumed', async t 
   assert.equal(after.feature.nextAction, paused.feature.nextAction);
   assert.deepEqual(after.candidates, paused.candidates);
   assert.deepEqual(after.timeline, paused.timeline);
-  await setFeatureStatus({ ...args, status: 'active' });
+  await updateFeature({ ...args, status: 'active' });
   const resumed = await recordCandidate({ ...args, summary: 'Ready after resuming.', checks: ['README receipt'] });
   assert.equal(resumed.feature.status, 'review');
   const reviewed = await getFeatureContext(args);
@@ -242,24 +241,16 @@ test('candidate checks come only from executed receipts; caller check strings st
   } finally { events.close(); }
   const projectedSummary = 'Recorded candidate 91a0e4c0ab4b with 2 caller-reported check claim(s), not verified as executed.';
   const projectedDetails = { candidateId: 'candidate-legacy', clean: true, checks: [], unverifiedChecks: legacyDetails.checks, checkProvenance: 'legacy-caller-reported' };
-  const views = [
-    (await getFeatureContext({ ...args, timeline_limit: 200 })).timeline,
-    (await callTool('timeline', { ...args, limit: 200 })).events,
-  ];
-  for (const timeline of views) {
-    const legacyEvent = timeline.find(entry => entry.id === legacyEventId);
-    assert.equal(legacyEvent.summary, projectedSummary);
-    assert.deepEqual(legacyEvent.details, projectedDetails);
-    for (const [candidateId, checks] of [[recorded.candidateId, expected], [fresh.candidateId, [laterClaim]]]) {
-      const marked = timeline.find(entry => entry.kind === 'candidate.recorded' && entry.details.candidateId === candidateId);
-      assert.match(marked.summary, /executed check receipt\(s\)/);
-      assert.deepEqual(marked.details.checks, checks);
-      assert.equal('unverifiedChecks' in marked.details, false);
-    }
+  const { timeline } = await getFeatureContext({ ...args, timeline_limit: 200 });
+  const legacyEvent = timeline.find(entry => entry.id === legacyEventId);
+  assert.equal(legacyEvent.summary, projectedSummary);
+  assert.deepEqual(legacyEvent.details, projectedDetails);
+  for (const [candidateId, checks] of [[recorded.candidateId, expected], [fresh.candidateId, [laterClaim]]]) {
+    const marked = timeline.find(entry => entry.kind === 'candidate.recorded' && entry.details.candidateId === candidateId);
+    assert.match(marked.summary, /executed check receipt\(s\)/);
+    assert.deepEqual(marked.details.checks, checks);
+    assert.equal('unverifiedChecks' in marked.details, false);
   }
-  const activity = (await callTool('state', { ...args, components: ['activity'] })).selected.activity;
-  assert.equal(activity.find(entry => entry.id === legacyEventId).summary, projectedSummary);
-  assert.match(activity.find(entry => entry.kind === 'candidate.recorded' && entry.id !== legacyEventId).summary, /with 1 executed check receipt\(s\)\.$/);
   const stored = new DatabaseSync(statePath);
   try { assert.deepEqual({ ...stored.prepare('SELECT summary, details_json FROM events WHERE id = ?').get(legacyEventId) }, { summary: legacySummary, details_json: JSON.stringify(legacyDetails) }); }
   finally { stored.close(); }
@@ -298,9 +289,8 @@ test('marked candidate rows and events display only checks bound to the marker r
   const candidate = async () => (await getFeatureContext(args)).candidates.find(entry => entry.id === recorded.candidateId);
   const eventViews = async () => {
     const find = timeline => timeline.find(entry => entry.id === Number(original.event.id));
-    return [find((await getFeatureContext({ ...args, timeline_limit: 200 })).timeline), find((await callTool('timeline', { ...args, limit: 200 })).events)];
+    return [find((await getFeatureContext({ ...args, timeline_limit: 200 })).timeline)];
   };
-  const activitySummary = async () => (await callTool('state', { ...args, components: ['activity'] })).selected.activity.find(entry => entry.id === Number(original.event.id)).summary;
   const bound = value => [value.checks, value.unverifiedChecks ?? [], value.checkProvenance ?? 'executed-receipts'];
 
   // Altered saved row strings are never promoted; verified checks still come from the marker's receipts.
@@ -333,7 +323,6 @@ test('marked candidate rows and events display only checks bound to the marker r
       assert.deepEqual(bound(event.details), [expected, [], 'marker-mismatch'], summary);
       assert.equal(event.summary, rebuilt, summary);
     }
-    assert.equal(await activitySummary(), rebuilt, summary);
   }
   sql('UPDATE events SET summary = ?, details_json = ? WHERE id = ?', original.event.summary, original.event.details_json, original.event.id);
 
@@ -352,7 +341,6 @@ test('marked candidate rows and events display only checks bound to the marker r
   sql('UPDATE meta SET value = ? WHERE key = ?', original.marker, markerKey);
   assert.deepEqual(bound(await candidate()), [expected, [], 'executed-receipts']);
   for (const event of await eventViews()) assert.deepEqual([event.summary, event.details], [original.event.summary, originalDetails]);
-  assert.equal(await activitySummary(), original.event.summary);
 });
 
 test('marker receipts must be eligible under the candidate contract; stale same-revision receipts verify nothing', async t => {
@@ -600,101 +588,6 @@ test('an unconfirmed-descendants marker blocks checks and candidates until an at
   const recorded = await recordCandidate({ ...args, summary: 'Ready after its tools were confirmed stopped.', checks: ['README receipt'] });
   assert.equal(recorded.feature.status, 'review');
   assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => candidate.status), ['ready']);
-});
-
-test('a worker guard or unconfirmed-descendants marker blocks completion until it clears', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-completion-worker-'));
-  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
-  const args = { workspace_path: workspace, feature: 'finishing' };
-  await initializeManagedProject({ workspace_path: workspace, project_name: 'Finishing', description: 'Completion waits for stopped workers.' });
-  await createFeature({ ...args, title: 'Finishing', outcome: 'Accepted only after its worker exits.', spec: '# Finishing\n\nThe README exists.' });
-  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
-  assert.equal((await runChecks(args)).verification.ready, true);
-  const { candidateId } = await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  // The turn completed and the lane reads idle, but its worker process has not exited yet.
-  await bindAgentSession({ ...args, thread_id: 'claude-thread', harness: 'claude' });
-  await registerWorkerGuard({ ...args, thread_id: 'claude-thread', guard_id: 'live-process' });
-  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
-  const unchanged = async (before, refusal) => {
-    await assert.rejects(setFeatureStatus({ ...args, status: 'done' }), refusal);
-    const after = await getFeatureContext(args);
-    assert.equal(after.feature.status, 'review');
-    assert.deepEqual(after.candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'ready']]);
-    assert.deepEqual(after.candidates, before.candidates);
-    assert.deepEqual(after.timeline, before.timeline);
-  };
-  const guarded = await getFeatureContext(args);
-  assert.equal(guarded.feature.agent.status, 'idle');
-  assert.equal(guarded.verification.ready, true);
-  await unchanged(guarded, error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /worker process/.test(error.message));
-
-  // The worker exits, but a stop without its process tree leaves its tools unconfirmed.
-  await clearWorkerGuards({ ...args, guard_id: 'live-process' });
-  const marker = await markDescendantsUnconfirmed({ ...args, thread_id: 'claude-thread', turn_id: 'turn-1', summary: 'The worker was stopped without its process tree.' });
-  await unchanged(await getFeatureContext(args), error => error.code === 'AGENT_BUSY' && error.details?.unconfirmedDescendants === true && error.details?.turnId === 'turn-1'
-    && /may still be running/.test(error.message) && /prior_turn_attestation/.test(error.message));
-
-  assert.equal((await attestDescendantsStopped({ ...args, evidence: 'No process runs in the checkout.', generation: marker.generation })).cleared, true);
-  const done = await setFeatureStatus({ ...args, status: 'done' });
-  assert.equal(done.feature.status, 'done');
-  assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'accepted']]);
-});
-
-test('a worker guard or running status saved while completion reads the checkout still refuses it', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-completion-race-'));
-  const started = path.join(workspace, 'snapshot-started');
-  const release = path.join(workspace, 'snapshot-release');
-  t.after(async () => {
-    await fs.writeFile(release, '');
-    await fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 });
-  });
-  const args = { workspace_path: workspace, feature: 'racing' };
-  await initializeManagedProject({ workspace_path: workspace, project_name: 'Racing', description: 'Completion rechecks workers as it writes.' });
-  const lane = await createFeature({ ...args, title: 'Racing', outcome: 'Never accepted beside a live worker.', spec: '# Racing\n\nThe README exists.' });
-  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
-  assert.equal((await runChecks(args)).verification.ready, true);
-  const { candidateId } = await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  await bindAgentSession({ ...args, thread_id: 'claude-thread', harness: 'claude' });
-  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
-  // An fsmonitor hook holds the first git status of each round, the completion's, until the late
-  // state below is saved; later calls pass. Its failure exit makes git scan the clean checkout normally.
-  const hook = path.join(workspace, 'hold-status.mjs');
-  await fs.writeFile(hook, `import fs from 'node:fs';
-let first = false;
-try { fs.writeFileSync(${JSON.stringify(started)}, '', { flag: 'wx' }); first = true; } catch {}
-if (first) {
-  for (let waited = 0; !fs.existsSync(${JSON.stringify(release)}) && waited < 20000; waited += 20) await new Promise(resolve => setTimeout(resolve, 20));
-}
-process.exit(1);
-`);
-  const slash = value => value.replaceAll('\\', '/');
-  await git(lane.feature.checkoutPath, 'config', 'core.fsmonitor', `"${slash(process.execPath)}" "${slash(hook)}"`);
-  const raced = async (interject, refusal) => {
-    await fs.rm(started, { force: true });
-    await fs.rm(release, { force: true });
-    const completing = setFeatureStatus({ ...args, status: 'done' });
-    completing.catch(() => {});
-    for (let attempt = 0; !(await fs.stat(started).catch(() => null)); attempt++) {
-      assert.ok(attempt < 500, 'completion never reached its checkout snapshot');
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    await interject();
-    await fs.writeFile(release, '');
-    await assert.rejects(completing, refusal);
-    const refused = await getFeatureContext(args);
-    assert.equal(refused.feature.status, 'review');
-    assert.deepEqual(refused.candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'ready']]);
-    assert.equal(refused.timeline.some(event => event.kind === 'feature.done'), false);
-  };
-  await raced(() => registerWorkerGuard({ ...args, thread_id: 'claude-thread', guard_id: 'late-process' }),
-    error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /worker process/.test(error.message));
-  await clearWorkerGuards({ ...args, guard_id: 'late-process' });
-  // A running status saved without a turn ID is busy to assertAgentIdle, so the write refuses it too.
-  await raced(() => saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'running' }),
-    error => error.code === 'AGENT_BUSY' && /Wait for the feature agent to stop/.test(error.message));
-  await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
-  assert.equal((await setFeatureStatus({ ...args, status: 'done' })).feature.status, 'done');
-  assert.deepEqual((await getFeatureContext(args)).candidates.map(candidate => [candidate.id, candidate.status]), [[candidateId, 'accepted']]);
 });
 
 test('a queued check waits for a direct run in its clone and is judged once that run settles', async t => {

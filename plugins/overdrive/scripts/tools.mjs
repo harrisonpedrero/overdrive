@@ -1,24 +1,18 @@
 import {
-  checkpointFeature,
   createFeature,
   doctorWorkspace,
   getFeatureContext,
   initializeManagedProject,
   initializeWorkspace,
   listFeatures,
-  planWork,
   promoteManagedCandidate,
-  readTimeline,
   recordCandidate,
   recordEvidence,
-  setFeatureStatus,
-  switchFeature,
-  updateSpec,
+  updateFeature,
   updateWork,
 } from './workspace.mjs';
 import {
   compactFeatureAgent,
-  compactOutgoingAfterSwitch,
   inspectFeatureAgent,
   interruptFeatureAgent,
   resolveFeatureAgentRequest,
@@ -30,7 +24,7 @@ import {
 } from './agent-runtime.mjs';
 import { readEvidence, runChecks, updateChecks } from './verification.mjs';
 import { enqueueChecks, inspectCheckQueue, drainCheckQueue, resolveCheckJob } from './check-queue.mjs';
-import { STATE_SECTIONS, composeView, snapshotState } from './presentation.mjs';
+import { composeView } from './presentation.mjs';
 
 const string = (description, extra = {}) => ({ type: 'string', description, ...extra });
 const boolean = description => ({ type: 'boolean', description });
@@ -59,12 +53,6 @@ const priorTurnAttestation = consequence => ({
 
 const workspace = { workspace_path: string('Absolute path to the OVERDRIVE control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
-const state = {
-  ...workspace, ...feature,
-  components: { type: 'array', minItems: 1, maxItems: 6, uniqueItems: true, items: string('State data section.', { enum: Object.keys(STATE_SECTIONS) }), description: 'Read only the data needed for the reply. Defaults to features. Other sections use the named or focused feature; these are data, not UI panels.' },
-  include_archived: boolean('Include archived feature lanes in the overview.'),
-};
-
 export const TOOLS = [
   tool('agents_wait', 'Receive the next feature handoff', 'Wait on up to eight unreconciled feature workers together. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
     ...workspace,
@@ -92,13 +80,11 @@ export const TOOLS = [
     reason: string('Observed cause and resolution; for interruption, include how command and child-process termination was established.'),
     execution_stopped: boolean('Required true for interrupted jobs, only after verifying the old command and children stopped.'),
   }, ['workspace_path', 'job_key', 'action', 'reason']), { destructiveHint: false }),
-  tool('view_catalog', 'Work graph pattern', 'Describe the built-in work graph. Other state is answered in normal conversation, not separate panels or controls.', object({}), { readOnlyHint: true, idempotentHint: true }),
-  tool('state', 'Observe scoped feature state', 'Read a versioned, bounded data snapshot for a normal conversational reply. Only load selected sections; an overview never loads other specifications or raw logs.', object(state, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
   tool('view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
     ...workspace, ...feature,
     work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
     page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
-  }, ['workspace_path']), { destructiveHint: false }),
+  }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
   tool('checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Commands execute in the submitted order, so list setup before dependent checks; reordering changes the contract. Changes invalidate earlier candidates; execute through checks_run or the verification queue.', object({
     ...workspace, ...feature,
     checks: { type: 'array', maxItems: 50, items: object({
@@ -118,7 +104,7 @@ export const TOOLS = [
     check_keys: { type: 'array', minItems: 1, maxItems: 50, uniqueItems: true, items: string('Exact configured check key.'), description: 'Optional nonempty selection of known checks, executed in saved order. Omit to run all. Does not edit the contract or create receipts for omitted checks.' },
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks, context, or state views.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
+  tool('evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks or feature context.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
 
   tool('agent_wait', 'Wait for a feature result', 'Wait up to 60 seconds for a feature completion or input request and return compact progress. Use after dispatch when the coordinator is continuing the work; no repeated model polling is needed.', object({ ...workspace, ...feature, timeout_seconds: integer('Bounded wait; defaults to 30 seconds.', 1, 60) }, ['workspace_path', 'feature']), { readOnlyHint: true, openWorldHint: true }),
 
@@ -155,70 +141,44 @@ export const TOOLS = [
     refresh_git: boolean('Refresh Git status for each clone; slower on many features.'),
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, checkpoint, safe timeline, Git facts, evidence, candidate, and pending agent requests.', object({
+  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, safe timeline, Git facts, evidence, candidate, and pending agent requests.', object({
     ...workspace,
     ...feature,
     timeline_limit: integer('Number of recent safe events.', 1, 200),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('spec_update', 'Save feature spec revision', 'Save a complete new Markdown spec revision and report its logical line delta. Use after iterating on behavior, constraints, acceptance criteria, and scope with the user.', object({
-    ...workspace,
-    ...feature,
-    content: string('Complete Markdown specification for the new revision.'),
-    rationale: string('Concise reason this revision changed.'),
-  }, ['workspace_path', 'feature', 'content']), { destructiveHint: false }),
-
-  tool('work_plan', 'Reconcile feature work graph', 'Upsert bounded work items and their dependencies. Returns only submitted work items with current feature progress and next action; use feature_get for all work or view for the graph. Existing completed work cannot be silently reopened; represent regressions or follow-up as repair work.', object({
-    ...workspace,
-    ...feature,
-    items: {
-      type: 'array', minItems: 1, maxItems: 200,
-      items: object({
-        key: string('Stable item key such as design-api or T-001.'),
-        title: string('Short work title.'),
-        description: string('Bounded assignment or transformation.'),
-        kind: string('Work phase.', { enum: ['scope', 'design', 'build', 'review', 'validate', 'repair', 'integrate'] }),
-        priority: integer('Relative item priority.', -100, 100),
-        acceptance: string('Observable acceptance criteria.'),
-        dependencies: { type: 'array', items: string('A prerequisite work item key.'), maxItems: 100 },
-      }, ['key', 'title']),
-    },
-  }, ['workspace_path', 'feature', 'items']), { destructiveHint: false }),
-
-  tool('work_update', 'Update work item', 'Change one work item state, enforce ownership leases, and record result or blocker details. A paused, done or archived lane refuses new running claims; while paused, its current owner may still renew and non-running outcomes can still be recorded.', object({
-    ...workspace,
-    ...feature,
-    key: string('Stable work item key.'),
-    status: string('New work state.', { enum: ['planned', 'ready', 'running', 'blocked', 'review', 'done', 'failed', 'cancelled'] }),
-    owner: string('Stable owner identifier. Required when starting work; while that lease is active, pass the same owner to renew, complete, block, fail, or otherwise change the claimed item.'),
-    summary: string('Required result summary when completing work. Omit when renewing running work to keep its saved progress.'),
-    blocker: string('Required blocker/failure detail for blocked or failed work. Omit when renewing running work to keep its saved detail.'),
-    result_revision: string('Exact resulting Git revision when one exists.'),
-    lease_seconds: integer('Running ownership lease duration.', 60, 86400),
-  }, ['workspace_path', 'feature', 'key', 'status']), { destructiveHint: false }),
-
-  tool('checkpoint', 'Checkpoint feature context', 'Write a compact semantic checkpoint plus exact Git facts. Call before switching features and at major milestones.', object({
-    ...workspace,
-    ...feature,
-    summary: string('What is now true and why it matters; no private reasoning.'),
-    next_action: string('Single most useful next action.'),
-    unresolved: { type: 'array', items: string('Open decision, risk, or blocker.'), maxItems: 100 },
-  }, ['workspace_path', 'feature', 'summary', 'next_action']), { destructiveHint: false }),
-
-  tool('feature_switch', 'Switch feature focus', 'Switch coordinator focus after an outgoing checkpoint. Queues feature-session compaction, returns the destination recovery packet, and signals a high-value coordinator compaction boundary. The outgoing checkout is compared with its checkpoint fingerprint: an idle lane whose checkout changed (CHECKPOINT_REQUIRED, reason checkout_changed) or whose checkpoint has no fingerprint (checkout_unverified) must be checkpointed again; a lane with a possibly running worker switches with a checkoutFreshness caveat. The comparison is a best-effort observation, not an atomic proof.', object({
-    ...workspace,
-    ...feature,
-    accept_unverified_checkout: boolean('Switch an idle lane whose checkout comparison is indeterminate (CHECKOUT_INDETERMINATE: oversized, unreadable or unstable state) and record an explicit unverified-checkout caveat. Never overrides definite drift.'),
-  }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
-
-  tool('feature_status', 'Set feature lifecycle state', 'Pause, resume, block, review, complete, or archive a lane without moving its checkout. Completion requires closed work and passing evidence. Pausing or archiving first stops the lane worker and records the status only once no turn is running; if the stop cannot be confirmed the status is unchanged and STOP_UNCONFIRMED explains what is still running. A paused lane dispatches nothing until it is made active again.', object({
+  tool('feature_update', 'Update feature lane', 'Change a lane’s status, spec, summary, next action, blocker or unresolved notes in one call. Omitted fields stay unchanged; blank text clears a field. A changed spec is saved as a new durable revision. Statuses change freely, except that pausing or archiving first stops the lane worker and records the update only once no turn is running; if the stop cannot be confirmed nothing changes and STOP_UNCONFIRMED explains what is still running. A paused, done or archived lane dispatches nothing until it is made active again.', object({
     ...workspace,
     ...feature,
     status: string('Lifecycle state.', { enum: ['planned', 'active', 'paused', 'blocked', 'review', 'done', 'archived'] }),
-    blocker: string('Required when blocking.'),
-    disposition: string('Required when archiving; state what shipped or remains.'),
+    spec: string('Complete Markdown specification for a new revision.'),
+    spec_rationale: string('Concise reason the spec changed.'),
+    summary: string('What is now true and why it matters; no private reasoning.'),
+    next_action: string('Single most useful next action.'),
+    blocker: string('What blocks the lane. Setting a status other than blocked without one clears it.'),
+    unresolved: { type: 'array', items: string('Open decision, risk, or blocker.'), maxItems: 100, description: 'Recorded in the timeline.' },
     prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot be paused or archived.'),
-  }, ['workspace_path', 'feature', 'status']), { destructiveHint: false, openWorldHint: true }),
+  }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
+
+  tool('work_update', 'Update work graph', 'Upsert work items and their dependencies, or remove items. Omitted fields keep their saved values; a new item needs a title. Any status may follow any other, except that planned and ready follow from whether every dependency is done. Returns the submitted items; use feature_get for all work or view for the graph.', object({
+    ...workspace,
+    ...feature,
+    items: {
+      type: 'array', maxItems: 200,
+      items: object({
+        key: string('Stable item key such as design-api or T-001.'),
+        title: string('Short work title; required for a new item.'),
+        description: string('Bounded assignment or transformation.'),
+        acceptance: string('Observable acceptance criteria.'),
+        kind: string('Work phase.', { enum: ['scope', 'design', 'build', 'review', 'validate', 'repair', 'integrate'] }),
+        depends_on: { type: 'array', items: string('A prerequisite work item key.'), maxItems: 100, description: 'Replaces the item’s prerequisites.' },
+        status: string('Work state.', { enum: ['planned', 'ready', 'running', 'blocked', 'review', 'done', 'failed', 'cancelled'] }),
+        result: string('Result summary.'),
+        blocker: string('Blocker or failure detail.'),
+      }, ['key']),
+    },
+    remove: { type: 'array', items: string('Key of a work item to remove.'), maxItems: 200 },
+  }, ['workspace_path', 'feature']), { destructiveHint: false }),
 
   tool('evidence_record', 'Record feature evidence', 'Record an actually executed check, artifact inspection, review, or other evidence at an exact revision when available.', object({
     ...workspace,
@@ -241,17 +201,17 @@ export const TOOLS = [
     allow_dirty: boolean('Deprecated: true is refused because evidence must describe a clean commit.'),
   }, ['workspace_path', 'feature', 'summary']), { destructiveHint: false }),
 
-  tool('candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
+  tool('candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to a recorded feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
     ...workspace,
     ...feature,
-    revision: string('Accepted candidate revision; defaults to the latest accepted candidate.'),
+    revision: string('Candidate revision; defaults to the latest recorded candidate.'),
     summary: string('Optional concise promotion disposition.'),
   }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
 
-  tool('agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
+  tool('agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only that feature context and the repository instructions. For a bounded work item, include its key and outcome in instruction.', object({
     ...workspace,
     ...feature,
-    instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),
+    instruction: string('Optional immediate direction; otherwise the lane’s next action is used.'),
     effort: string('Worker reasoning effort.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
     force_new_session: boolean('Create a replacement task on the currently configured harness instead of resuming the recorded one. A recorded task otherwise always resumes on the harness that created it.'),
     prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot dispatch.'),
@@ -263,14 +223,14 @@ export const TOOLS = [
     include_thread: boolean('Read the persisted native worker task as well as local OVERDRIVE state.'),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
 
-  tool('agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. This does not claim work items. Before dispatching or resuming an existing bounded item, claim its exact key as running under a stable owner with work_update, then include its key and outcome in instruction; do not claim unrelated ready items.', object({
+  tool('agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. For a bounded work item, include its key and outcome in instruction.', object({
     ...workspace,
     ...feature,
     instruction: string('Clear replacement, correction, constraint, or follow-up direction.'),
     effort: string('Reasoning effort for a new follow-up turn.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
   }, ['workspace_path', 'feature', 'instruction']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('agent_compact', 'Compact feature agent', 'Compact an idle feature task at its durable checkpoint. If a turn is active, leave compaction queued.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
+  tool('agent_compact', 'Compact feature agent', 'Compact an idle feature task. If a turn is active, leave compaction queued.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
   tool('agent_interrupt', 'Interrupt feature agent', 'Interrupt an active feature turn while preserving the task and checkout.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: true, openWorldHint: true }),
 
@@ -282,17 +242,9 @@ export const TOOLS = [
     response: { type: 'object', description: 'Structured response for a question or elicitation.', additionalProperties: true },
     scope: string('Permission grant scope.', { enum: ['turn', 'session'] }),
   }, ['workspace_path', 'feature', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
-
-  tool('timeline', 'Read safe feature timeline', 'Read the append-only user-visible activity timeline for one feature. It never contains private chain-of-thought.', object({
-    ...workspace,
-    ...feature,
-    limit: integer('Number of recent events.', 1, 200),
-  }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
 ];
 
 const handlers = {
-  view_catalog: () => ({ schemaVersion: 2, components: { work: 'Native dependency graph with actual task states and blockers. Arrows run from prerequisite to dependent work.' }, interaction: 'Use the existing conversation. No embedded controls.', stateSections: Object.keys(STATE_SECTIONS) }),
-  state: snapshotState,
   view: composeView,
   checks_update: updateChecks,
   checks_run: runChecks,
@@ -309,13 +261,10 @@ const handlers = {
   feature_create: createFeature,
   feature_list: listFeatures,
   feature_get: getFeatureContext,
-  spec_update: updateSpec,
-  work_plan: planWork,
-  work_update: updateWork,
-  checkpoint: checkpointFeature,
-  async feature_status(args) {
-    return await (['paused', 'archived'].includes(args.status) ? stopFeatureLane(args) : setFeatureStatus(args));
+  async feature_update(args) {
+    return await (['paused', 'archived'].includes(args.status) ? stopFeatureLane(args) : updateFeature(args));
   },
+  work_update: updateWork,
   evidence_record: recordEvidence,
   candidate_record: recordCandidate,
   candidate_promote: promoteManagedCandidate,
@@ -325,23 +274,6 @@ const handlers = {
   agent_compact: compactFeatureAgent,
   agent_interrupt: interruptFeatureAgent,
   agent_request_resolve: resolveFeatureAgentRequest,
-  timeline: readTimeline,
-  async feature_switch(args) {
-    const result = await switchFeature(args);
-    if (result.compactFeatureThreadId) {
-      try { result.featureSessionCompaction = await compactOutgoingAfterSwitch(result, args.workspace_path); }
-      catch (error) { result.featureSessionCompaction = { attempted: true, compacted: false, warning: error.message }; }
-    }
-    if (result.coordinatorCompactionRecommended) {
-      result.coordinatorCompaction = {
-        semanticCheckpoint: true,
-        nativeCommand: '/compact',
-        automatic: false,
-        reason: 'Codex does not expose the currently loaded host task to its MCP process. Run /compact after the switch response when the outgoing lane contributed substantial context.',
-      };
-    }
-    return result;
-  },
 };
 
 export async function callTool(name, args) {

@@ -71,7 +71,7 @@ test('MCP server advertises the native OVERDRIVE command surface', async t => {
   assert.equal(initialized.result.serverInfo.title, 'OVERDRIVE');
   const listed = await request(2, 'tools/list');
   const names = listed.result.tools.map(tool => tool.name);
-  for (const expected of ['workspace_init', 'project_create', 'feature_create', 'spec_update', 'feature_switch', 'agent_start', 'agent_steer', 'candidate_promote', 'checks_update', 'checks_run', 'state', 'view', 'agent_wait']) assert.ok(names.includes(expected));
+  for (const expected of ['workspace_init', 'project_create', 'feature_create', 'feature_update', 'work_update', 'agent_start', 'agent_steer', 'candidate_promote', 'checks_update', 'checks_run', 'view', 'agent_wait']) assert.ok(names.includes(expected));
   assert.equal(new Set(names).size, names.length);
   server.stdin.end();
 });

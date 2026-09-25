@@ -204,9 +204,7 @@ function migrate(db, currentVersion) {
       DROP TABLE pending_agent_requests_v1;
     `);
     const additions = {
-      // Checkpoints saved before generations existed stay NULL and never prove freshness.
       features: { thread_harness: 'TEXT', semantic_generation: 'INTEGER NOT NULL DEFAULT 0' },
-      // Checkpoints saved before checkout fingerprints existed stay NULL: their checkout is unverified.
       checkpoints: { semantic_generation: 'INTEGER', checkout_fingerprint_json: 'TEXT' },
       evidence: {
         source: "TEXT NOT NULL DEFAULT 'reported'", spec_revision: 'INTEGER NOT NULL DEFAULT -1',
@@ -277,7 +275,6 @@ export function initializeDatabase(root, config) {
     repository_kind: config.repositoryKind,
     default_revision: config.defaultRevision,
     default_branch: config.defaultBranch ?? '',
-    focus: '',
     created_at: stamp,
     updated_at: stamp,
   };
@@ -380,34 +377,8 @@ export function assertBoundCheckout(feature) {
   );
 }
 
-export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded candidate.';
-export const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
-export const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
-export const PAUSED_ACTION = 'Paused. Resume the lane with feature_status (status active) before claiming or dispatching work.';
-
-// Whether an explicit checkpoint saved the lane's stored direction, word for word, since the latest
-// candidate, archive or completion, each of which regenerates or settles candidate direction.
-export const DIRECTION_CHECKPOINTED_SQL = `EXISTS (
-  SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
-  AND json_extract(checkpointed.details_json, '$.nextAction') = features.next_action
-  AND checkpointed.id > COALESCE((SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind IN ('candidate.recorded', 'feature.archived', 'feature.done')), 0)
-)`;
-
-// Whether an explicit checkpoint followed the lane's latest archive, whether a completed lane's
-// stored review direction is generated text that completion settled, and whether a paused lane's
-// generated candidate text has since been superseded: no ready candidate remains for review text,
-// or no accepted one for delivery text. Event ids give the exact order.
-const FEATURE_COLUMNS = `*, CASE WHEN status = 'archived' THEN EXISTS (
-  SELECT 1 FROM events checkpointed WHERE checkpointed.feature_id = features.id AND checkpointed.kind = 'feature.checkpointed'
-  AND checkpointed.id > (SELECT MAX(id) FROM events WHERE feature_id = features.id AND kind = 'feature.archived')
-) ELSE 0 END AS checkpointed_after_archive, CASE WHEN status = 'done' AND next_action = '${CANDIDATE_REVIEW_ACTION}' THEN NOT ${DIRECTION_CHECKPOINTED_SQL} ELSE 0 END AS review_settled,
-CASE WHEN status = 'paused' AND next_action IN ('${CANDIDATE_REVIEW_ACTION}', '${COMPLETED_ACTION}') THEN NOT EXISTS (
-  SELECT 1 FROM candidates WHERE candidates.feature_id = features.id
-  AND candidates.status = CASE WHEN features.next_action = '${COMPLETED_ACTION}' THEN 'accepted' ELSE 'ready' END
-) AND NOT ${DIRECTION_CHECKPOINTED_SQL} ELSE 0 END AS review_superseded`;
-
 export function readFeatureRow(db, slug) {
-  const row = db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE slug = ?`).get(slug);
+  const row = db.prepare('SELECT * FROM features WHERE slug = ?').get(slug);
   if (!row) throw new OverdriveError(`Unknown feature: ${slug}`, 'FEATURE_NOT_FOUND');
   return normalizeFeature(row, databaseRoots.get(db));
 }
@@ -416,30 +387,13 @@ export function featureBySlug(db, slug) {
   return assertBoundCheckout(readFeatureRow(db, slug));
 }
 
-// A paused lane's checkpoint may echo its exact projected direction; only the direction after
-// resume is stored. The bare resume instruction is kept as is, and resuming replaces it.
-export function unwrapPausedAction(text) {
-  const prefix = `${PAUSED_ACTION} Then: `;
-  return text.startsWith(prefix) && text.length > prefix.length ? text.slice(prefix.length) : text;
-}
-
-export function normalizeFeature({ checkpointed_after_archive: checkpointedAfterArchive, review_settled: reviewSettled, review_superseded: reviewSuperseded, ...row }, root = undefined) {
+function normalizeFeature(row, root = undefined) {
   const feature = {
     ...row,
     priority: Number(row.priority),
     spec_revision: Number(row.spec_revision),
     compaction_pending: Boolean(row.compaction_pending),
   };
-  // Completion accepts the reviewed candidate but does not prove delivery; the stored review
-  // instruction stays as history until the lane leaves completion, and any explicit checkpoint
-  // direction saved after completion is shown as saved, even word for word the review text.
-  if (reviewSettled) feature.next_action = COMPLETED_ACTION;
-  // Archiving closes the lane with a disposition, so a recorded candidate is no longer awaiting review.
-  // Archives now store the terminal direction; this covers older ones unless a checkpoint followed.
-  if (row.status === 'archived' && row.next_action === CANDIDATE_REVIEW_ACTION && !checkpointedAfterArchive) feature.next_action = ARCHIVED_ACTION;
-  // A paused lane dispatches nothing, so resuming comes first; the stored direction still evolves
-  // with edits and is shown as what follows, unless it is generated text for a superseded candidate.
-  if (row.status === 'paused') feature.next_action = row.next_action && row.next_action !== PAUSED_ACTION && !reviewSuperseded ? `${PAUSED_ACTION} Then: ${row.next_action}` : PAUSED_ACTION;
   if (root) {
     feature.checkout_location = checkoutLocation(root, row);
     // Only the path under the current root is ever exposed as the lane's checkout.
@@ -450,8 +404,8 @@ export function normalizeFeature({ checkpointed_after_archive: checkpointedAfter
 
 export function listFeatureRows(db, { includeArchived = false } = {}) {
   const rows = includeArchived
-    ? db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features ORDER BY status = 'active' DESC, priority DESC, updated_at DESC`).all()
-    : db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE status <> 'archived' ORDER BY status = 'active' DESC, priority DESC, updated_at DESC`).all();
+    ? db.prepare("SELECT * FROM features ORDER BY status = 'active' DESC, priority DESC, updated_at DESC").all()
+    : db.prepare("SELECT * FROM features WHERE status <> 'archived' ORDER BY status = 'active' DESC, priority DESC, updated_at DESC").all();
   const root = databaseRoots.get(db);
   return rows.map(row => normalizeFeature(row, root));
 }
@@ -472,47 +426,6 @@ export function workItems(db, featureId) {
   }
   return db.prepare('SELECT * FROM work_items WHERE feature_id = ? ORDER BY priority DESC, created_at, item_key').all(featureId)
     .map(row => ({ ...row, priority: Number(row.priority), dependencies: byKey.get(row.item_key) ?? [] }));
-}
-
-export const READY_WORK_ACTION = 'Start or continue the highest-priority ready work.';
-
-function workKeyList(items) {
-  const keys = items.map(item => item.item_key);
-  return keys.length > 3 ? `${keys.slice(0, 3).join(', ')} and ${keys.length - 3} more` : keys.join(', ');
-}
-
-// Default lane direction implied by the work graph. It never claims delivery: settled work still
-// needs lane verification and a candidate.
-export function workGraphAction(items) {
-  const having = (...statuses) => items.filter(item => statuses.includes(item.status));
-  if (having('ready').length) return READY_WORK_ACTION;
-  const stuck = having('blocked', 'failed');
-  if (stuck.length) {
-    const [first] = stuck;
-    const reason = String(first.blocker || '').replace(/\s+/g, ' ').trim();
-    const shown = reason.length > 240 ? `${reason.slice(0, 239)}…` : reason;
-    return `Resolve ${first.status} ${first.item_key}${shown ? `: ${shown}` : '.'}${stuck.length > 1 ? ` (+${stuck.length - 1} more blocked or failed)` : ''}`;
-  }
-  if (having('review').length) return `Review work awaiting acceptance: ${workKeyList(having('review'))}.`;
-  if (having('running').length) return `Await or reconcile running work: ${workKeyList(having('running'))}.`;
-  if (having('planned').length) return `Replan work waiting on cancelled dependencies: ${workKeyList(having('planned'))}.`;
-  if (items.length) return 'Planned work is settled; verify the lane result, then record a candidate or plan follow-up work.';
-  return 'Plan bounded work from the current spec.';
-}
-
-// The work graph's direction, except that an accepted candidate is delivered while no work is open.
-export function deliveryAction(db, featureId) {
-  const items = workItems(db, featureId);
-  const accepted = items.every(item => ['done', 'cancelled'].includes(item.status))
-    && db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'accepted'").get(featureId);
-  return accepted ? COMPLETED_ACTION : workGraphAction(items);
-}
-
-// Direction for a lane regaining generated guidance: review a ready candidate, else deliver an
-// accepted one while no work is open, else follow the work graph.
-export function candidateAction(db, featureId) {
-  if (db.prepare("SELECT 1 FROM candidates WHERE feature_id = ? AND status = 'ready'").get(featureId)) return CANDIDATE_REVIEW_ACTION;
-  return deliveryAction(db, featureId);
 }
 
 export function recordEvent(db, { featureId = null, workItemId = null, kind, summary, details = {} }) {
@@ -610,13 +523,6 @@ export function projectCandidateEvent(db, event) {
     && event.summary === candidateRecordedSummary(revision, bound.checks.length, notes.length)) return event;
   const summary = `Candidate ${revision ? revision.slice(0, 12) : details.candidateId} event does not match its receipt record; ${bound.checks.length} executed check receipt(s) verified.`;
   return { ...event, summary, details: { ...details, ...bound, checkProvenance: 'marker-mismatch' } };
-}
-
-// Counts semantic lane changes (spec, work graph, lifecycle, verification definition, candidates).
-// Call it inside the transaction that makes the change, so a checkpoint that recorded the previous
-// generation is provably stale even when timestamps tie or the controller dies before logging.
-export function bumpSemanticGeneration(db, featureId) {
-  db.prepare('UPDATE features SET semantic_generation = semantic_generation + 1 WHERE id = ?').run(featureId);
 }
 
 export function newId(prefix) {

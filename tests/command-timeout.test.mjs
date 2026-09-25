@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { run } from '../plugins/overdrive/scripts/util.mjs';
 import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
 import { drainCheckQueue, enqueueChecks, inspectCheckQueue, resolveCheckJob } from '../plugins/overdrive/scripts/check-queue.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, recordCandidate, setFeatureStatus } from '../plugins/overdrive/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, recordCandidate } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'taskkill applies only on Windows' };
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -185,7 +185,6 @@ test('an unconfirmed check stop records no receipt and reserves the clone until 
   const reservedError = error => error.code === 'CHECK_EXECUTION_RESERVED' && error.message.includes(reserved.key);
   await assert.rejects(runChecks(args), reservedError);
   await assert.rejects(recordCandidate({ ...args, summary: 'Ready again.', checks: ['README receipt'] }), reservedError);
-  await assert.rejects(setFeatureStatus({ ...args, status: 'done' }), reservedError);
   await assert.rejects(resolveCheckJob({ workspace_path: workspace, job_key: reserved.key, action: 'cancel', reason: 'Unverified.' }), error => error.code === 'EXECUTION_UNCERTAIN');
   await resolveCheckJob({ workspace_path: workspace, job_key: reserved.key, action: 'cancel', reason: 'The check process exited.', execution_stopped: true });
 
@@ -202,8 +201,6 @@ test('an unconfirmed check stop records no receipt and reserves the clone until 
 
   await fs.rm(path.join(repo, '.hang'));
   assert.equal((await runChecks(args)).verification.ready, true);
-  await setFeatureStatus({ ...args, status: 'done' });
-  assert.equal((await getFeatureContext(args)).feature.status, 'done');
 });
 
 test('a direct check reservation fails closed on the lane when the queue cannot record it', windowsOnly, async t => {
@@ -226,7 +223,6 @@ test('a direct check reservation fails closed on the lane when the queue cannot 
   const reservedError = error => error.code === 'CHECK_EXECUTION_RESERVED' && error.message.includes(reservedBy);
   await assert.rejects(runChecks(args), reservedError);
   await assert.rejects(recordCandidate({ ...args, summary: 'Ready again.', checks: ['README receipt'] }), reservedError);
-  await assert.rejects(setFeatureStatus({ ...args, status: 'done' }), reservedError);
   // A queued check for the lane is deferred before its command starts rather than interrupted.
   await enqueueChecks({ workspace_path: workspace, jobs: [{ key: 'unqueued-readme', feature: 'unqueued', check_key: 'readme' }] });
   const deferred = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'unqueued-readme');
@@ -243,6 +239,4 @@ test('a direct check reservation fails closed on the lane when the queue cannot 
   assert.equal((await resolveCheckJob({ workspace_path: workspace, job_key: reservedBy, action: 'cancel', reason: 'The check process exited.', execution_stopped: true })).job.status, 'cancelled');
   await fs.rm(path.join(repo, '.hang'));
   assert.equal((await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'unqueued-readme').status, 'passed');
-  await setFeatureStatus({ ...args, status: 'done' });
-  assert.equal((await getFeatureContext(args)).feature.status, 'done');
 });

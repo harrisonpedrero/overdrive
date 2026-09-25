@@ -189,8 +189,6 @@ function commandDescription(argv) {
   return argv.map(part => (/^[a-zA-Z0-9_./:@\\=-]+$/.test(part) ? part : JSON.stringify(part))).join(' ');
 }
 
-// binary returns stdout as a byte-exact Buffer capped at maxOutput bytes, for output such as raw
-// Git paths that must never pass through per-chunk text decoding.
 // On Windows a timed-out command's process tree is ended with taskkill /T; when taskkill cannot
 // run, fails or stalls, the command itself is terminated directly, which cannot reach processes it
 // started. The result waits for taskkill's outcome, and settles within two grace periods of the
@@ -198,7 +196,7 @@ function commandDescription(argv) {
 // named as terminationUncertain in a timed-out result or in the COMMAND_FAILED message; with
 // confirmTermination it rejects with COMMAND_TERMINATION_UNCERTAIN instead. Only this child's PID
 // is ever targeted, and never after it has exited.
-export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, binary = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
+export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new OverdriveError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
@@ -237,17 +235,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       if (next.length > maxOutput) overflow = true;
       return next.slice(0, maxOutput);
     };
-    const bytes = [];
-    let byteCount = 0;
-    const collectBytes = chunk => {
-      const room = maxOutput - byteCount;
-      if (chunk.length > room) overflow = true;
-      if (room <= 0) return;
-      const part = chunk.subarray(0, room);
-      bytes.push(part);
-      byteCount += part.length;
-    };
-    child.stdout.on('data', chunk => { if (binary) collectBytes(chunk); else stdout = collect(stdout, chunk); });
+    child.stdout.on('data', chunk => { stdout = collect(stdout, chunk); });
     child.stderr.on('data', chunk => { stderr = collect(stderr, chunk); });
     let timedOut = false;
     let unconfirmed = null;
@@ -257,7 +245,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
     let closeDeadline = null;
     const exited = () => child.exitCode !== null || child.signalCode !== null;
     const uncertain = reason => new OverdriveError(`${commandDescription(argv)} passed its deadline and ${reason}; processes it started may still be running.`, 'COMMAND_TERMINATION_UNCERTAIN',
-      { pid: child.pid, commandExited: exited(), output: `${binary ? '' : stdout}\n${stderr}`.trim().slice(-4_000) });
+      { pid: child.pid, commandExited: exited(), output: `${stdout}\n${stderr}`.trim().slice(-4_000) });
     const stopDirectly = reason => {
       unconfirmed ??= reason;
       if (!exited()) { try { child.kill(); } catch { /* reported by the close deadline */ } }
@@ -304,10 +292,9 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       const uncertainty = deadline ?? (unconfirmed && `${unconfirmed}, so its process tree was not confirmed stopped`);
       if (uncertainty && confirmTermination) return reject(uncertain(uncertainty));
       const terminationUncertain = uncertainty ? `Passed its deadline and ${uncertainty}; processes it started may still be running.` : null;
-      if (binary) stdout = Buffer.concat(bytes);
-      if (allowFailure) return resolve({ stdout: binary ? stdout : stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs, argv, ...(terminationUncertain ? { terminationUncertain } : {}) });
-      if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput || binary ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
-      const detail = stderr.trim().slice(-4_000) || (binary ? '' : stdout.trim().slice(-4_000)) || 'No output';
+      if (allowFailure) return resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs, argv, ...(terminationUncertain ? { terminationUncertain } : {}) });
+      if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
+      const detail = stderr.trim().slice(-4_000) || stdout.trim().slice(-4_000) || 'No output';
       reject(new OverdriveError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}${terminationUncertain ? ` (${terminationUncertain})` : ''}: ${detail}`, 'COMMAND_FAILED'));
     }
   });

@@ -9,7 +9,7 @@ import {
   bindAgentSession,
   clearWorkerGuards,
   featureRuntime,
-  featureStatusInput,
+  featureUpdateInput,
   getFeatureContext,
   markCompacted,
   markDescendantsUnconfirmed,
@@ -23,7 +23,7 @@ import {
   resolveAgentRequestRecord,
   saveAgentSession,
   savePendingAgentRequest,
-  setStoppedFeatureStatus,
+  updateStoppedFeature,
   queueCompaction,
 } from './workspace.mjs';
 
@@ -811,9 +811,8 @@ async function stopWorker(runtime, status, attestation) {
 }
 
 async function stopForStatus({ prior_turn_attestation = undefined, ...args }, row, busy, foreignOwner) {
-  // Validate the transition before stopping anything, so a refused transition never interrupts
-  // work. Archiving an archived lane stays a no-op transition, as it always was.
-  if (!(row.status === 'archived' && args.status === 'archived')) featureStatusInput(args);
+  // Validate the update before stopping anything, so a refused update never interrupts work.
+  featureUpdateInput(args);
   const attestation = priorTurnAttestation(prior_turn_attestation);
   const lane = { workspace_path: args.workspace_path, feature: row.slug, lifecycle: row.status };
   // An attestation can only speak for processes that could be checked before it was given, so it
@@ -861,7 +860,7 @@ async function stopForStatus({ prior_turn_attestation = undefined, ...args }, ro
     if (running) throw await stopUnconfirmed(lane, args.status, `${running} worker process tree(s) from this lane still exist, so tools they launched may still be running and an attestation cannot cover them. Stop them from the controller holding them, or wait for them to end.`, { workerGuards: guards.length, runningJobs: running });
     await clearWorkerGuards({ ...args, evidence: attestation.evidence });
   }
-  const result = await setStoppedFeatureStatus(args);
+  const result = await updateStoppedFeature(args);
   return interruption ? { ...result, interruption } : result;
 }
 async function resolveRequestOwned({ workspace_path, feature, request_id, action, response, scope = 'turn' }) {
@@ -890,12 +889,6 @@ async function resolveRequestOwned({ workspace_path, feature, request_id, action
   return { resolved: true, requestId: String(request_id), action, feature };
 }
 
-async function compactOutgoingAfterSwitch(switchResult, workspacePath) {
-  if (!switchResult?.from?.slug || !switchResult.compactFeatureThreadId) return { attempted: false };
-  const result = await compactFeatureAgent({ workspace_path: workspacePath, feature: switchResult.from.slug });
-  return { attempted: true, ...result };
-}
-
 // Resolves after the bridge has shut down, with the worker processes it could not stop.
 async function shutdownAgentRuntime() {
   shuttingDown = true;
@@ -905,7 +898,7 @@ async function shutdownAgentRuntime() {
   return { unstopped: stopped?.unstopped ?? [] };
 }
 
-// An omitted instruction falls back to the checkpoint next action; a supplied one, even an empty
+// An omitted instruction falls back to the lane's next action; a supplied one, even an empty
 // string, must be valid before the lane's control lock or native session is touched.
 const startFeatureAgent = async args => {
   const direction = args.instruction === undefined || args.instruction === null ? undefined : requiredText(args.instruction, 'instruction', { max: 100_000 });
@@ -928,7 +921,7 @@ const stopFeatureLane = async args => {
   if (!['paused', 'archived'].includes(args.status)) throw new OverdriveError('Only pausing or archiving stops a lane.', 'INVALID_INPUT');
   return await withLaneStop(args, ownerToken, (row, busy, foreignOwner) => stopForStatus(args, row, busy, foreignOwner));
 };
-return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, compactOutgoingAfterSwitch, shutdownAgentRuntime };
+return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, shutdownAgentRuntime };
 }
 
-export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, compactOutgoingAfterSwitch, shutdownAgentRuntime } = createAgentRuntime();
+export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, shutdownAgentRuntime } = createAgentRuntime();

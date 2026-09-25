@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
-import { initializeManagedProject, createFeature, getFeatureContext, checkpointFeature } from '../plugins/overdrive/scripts/workspace.mjs';
+import { initializeManagedProject, createFeature, getFeatureContext, updateFeature } from '../plugins/overdrive/scripts/workspace.mjs';
 
 class Bridge extends EventEmitter {
   constructor() { super(); this.turns = []; this.starts = 0; this.compactions = 0; this.quick = false; this.requests = []; }
@@ -164,7 +164,7 @@ test('native compaction inside a normal turn retains the final handoff', async t
   bridge.emit('notification', { method: 'item/completed', params: { threadId: 'fixture-thread', turnId: 'turn-1', item: { type: 'contextCompaction' } } });
   bridge.finish();
   await eventually(async () => (await getFeatureContext(args)).feature.summary === 'Verified fixture result.');
-  await checkpointFeature({ ...args, summary: 'Saved the result.', next_action: 'Review.' });
+  await updateFeature({ ...args, summary: 'Saved the result.', next_action: 'Review.' });
   await runtime.shutdownAgentRuntime();
 });
 
@@ -175,7 +175,7 @@ test('rejected compaction preserves the checkpoint and can be retried', async t 
   const runtime = createAgentRuntime(bridge);
   await runtime.startFeatureAgent(args);
   await eventually(async () => (await getFeatureContext(args)).feature.agent.status === 'idle');
-  await checkpointFeature({ ...args, summary: 'Verified handoff to preserve.', next_action: 'Review.' });
+  await updateFeature({ ...args, summary: 'Verified handoff to preserve.', next_action: 'Review.' });
   bridge.failCompaction = true;
   await assert.rejects(runtime.compactFeatureAgent(args), /fixture compaction rejected/);
   const failed = await getFeatureContext(args);

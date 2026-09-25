@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
 import { ClaudeWorkerBridge, ISOLATION_ARGS, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/overdrive/scripts/claude-worker.mjs';
 import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, recordCandidate, setFeatureStatus, workerHarness } from '../plugins/overdrive/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, recordCandidate, updateFeature, workerHarness } from '../plugins/overdrive/scripts/workspace.mjs';
 import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -454,7 +454,7 @@ test('a pause that ends the worker but not the tools it launched is refused unti
 
   // Retrying is refused, and so is an archive.
   await assert.rejects(pause(), error => error.code === 'STOP_UNCONFIRMED' && error.details?.descendantsUnconfirmed === true);
-  await assert.rejects(runtime.stopFeatureLane({ ...args, status: 'archived', disposition: 'Dropped.' }), error => error.code === 'STOP_UNCONFIRMED');
+  await assert.rejects(runtime.stopFeatureLane({ ...args, status: 'archived', summary: 'Dropped.' }), error => error.code === 'STOP_UNCONFIRMED');
   assert.ok(alive(first));
   assert.equal((await lane()).status, 'active');
 
@@ -497,7 +497,7 @@ test('a second controller cannot pause an idle lane whose owner may still hold a
   const other = createAgentRuntime(new WorkerBridge({ claude }));
   t.after(() => other.shutdownAgentRuntime());
   await assert.rejects(other.stopFeatureLane({ ...args, status: 'paused' }), error => error.code === 'STOP_UNCONFIRMED' && error.details?.foreignOwnerPid === process.pid);
-  await assert.rejects(other.stopFeatureLane({ ...args, status: 'archived', disposition: 'Dropped.' }), error => error.code === 'STOP_UNCONFIRMED');
+  await assert.rejects(other.stopFeatureLane({ ...args, status: 'archived', summary: 'Dropped.' }), error => error.code === 'STOP_UNCONFIRMED');
   assert.equal(worker.exitCode, null);
   assert.equal((await getFeatureContext(args)).feature.status, 'active');
 
@@ -532,7 +532,7 @@ test('after owner loss an idle lingering Claude worker requires durable stop evi
   assert.equal((await restarted.stopFeatureLane({ ...args, status: 'paused' })).feature.status, 'paused');
   assert.deepEqual(await readWorkerGuards(args), []);
   assert.ok((await getFeatureContext({ ...args, timeline_limit: 50 })).timeline.some(entry => entry.kind === 'agent.worker_stopped' && entry.details?.basis === 'job_gone'));
-  await setFeatureStatus({ ...args, status: 'active' });
+  await updateFeature({ ...args, status: 'active' });
   assert.ok((await restarted.startFeatureAgent(args)).turnId);
   await restarted.shutdownAgentRuntime();
 });
@@ -550,7 +550,7 @@ test('a normally completed Claude turn clears its worker guard before an idle pa
 
 const lingeringTool = path.join(here, 'fixtures', 'lingering-tool.mjs');
 
-test('a tool that outlives its Claude turn keeps checks, candidates, completion and the next turn closed until its tree ends', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
+test('a tool that outlives its Claude turn keeps checks, candidates and the next turn closed until its tree ends', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
   // 'tool-tree' is an ordinary shell -> test runner -> test process chain, as npm test run by a
   // Bash tool call; 'spoof' also writes forged containment reports to the stderr it shares.
   for (const [mode, ending] of [['detached', 'exits'], ['tool-tree', 'exits'], ['spoof', 'exits'], ['detached', 'pause'], ['tool-tree', 'next-turn']]) {
@@ -579,7 +579,6 @@ test('a tool that outlives its Claude turn keeps checks, candidates, completion 
     const guarded = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1;
     await assert.rejects(runChecks(args), guarded);
     await assert.rejects(recordCandidate({ ...args, summary: 'While the tool runs.', checks: ['README receipt'] }), guarded);
-    await assert.rejects(setFeatureStatus({ ...args, status: 'done' }), guarded);
     assert.equal((await getFeatureContext(args)).feature.status, 'active');
 
     if (ending === 'exits') {

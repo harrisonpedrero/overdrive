@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
 import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
 import { OverdriveError, refusedRequest } from '../plugins/overdrive/scripts/util.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, setFeatureStatus } from '../plugins/overdrive/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, updateFeature } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -437,7 +437,6 @@ test('a confirmed pause blocks dispatch until the lane is made active again', as
   turns().at(-1).status = 'completed';
   const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
   assert.deepEqual({ status: paused.feature.status, agent: paused.feature.agent.status, interrupted: paused.interruption.interrupted }, { status: 'paused', agent: 'idle', interrupted: false });
-  assert.match(paused.feature.nextAction, /^Paused\. Resume the lane/);
   await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'INVALID_TRANSITION');
   await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Keep going.' }), error => error.code === 'INVALID_TRANSITION');
   // Pausing an idle lane again is a plain transition that contacts no backend.
@@ -445,7 +444,7 @@ test('a confirmed pause blocks dispatch until the lane is made active again', as
   assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' })).interruption, undefined);
   assert.equal(f.calls.length, calls);
   assert.equal(turns().length, 1);
-  await setFeatureStatus({ ...f.args, status: 'active' });
+  await updateFeature({ ...f.args, status: 'active' });
   assert.equal((await f.runtime.startFeatureAgent(f.args)).turnId, `${started.threadId}-turn-2`);
 });
 
@@ -491,13 +490,13 @@ test('an unsettled turn request blocks a pause until native history or an attest
 test('archiving validates before stopping the worker and then stops it like a pause', async t => {
   const f = await fixture(t, 'codex', { stopSettleMs: 200 });
   const started = await f.runtime.startFeatureAgent(f.args);
-  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'archived' }), error => error.code === 'INVALID_INPUT');
+  await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'archived', summary: 'x'.repeat(50_001) }), error => error.code === 'INVALID_INPUT');
   await assert.rejects(f.runtime.stopFeatureLane({ ...f.args, status: 'blocked', blocker: 'x' }), error => error.code === 'INVALID_INPUT');
   assert.ok(!f.calls.some(call => call.method === 'turn/interrupt'));
   assert.equal(f.stores.codex.get(started.threadId).turns.at(-1).status, 'inProgress');
-  const archived = await f.runtime.stopFeatureLane({ ...f.args, status: 'archived', disposition: 'Superseded.' });
+  const archived = await f.runtime.stopFeatureLane({ ...f.args, status: 'archived', summary: 'Superseded.' });
   assert.deepEqual({ status: archived.feature.status, agent: archived.feature.agent.status, interrupted: archived.interruption.interrupted }, { status: 'archived', agent: 'interrupted', interrupted: true });
-  assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'archived' })).unchanged, true);
+  assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'archived' })).feature.status, 'archived');
 });
 
 test('an idle lane owned by another live controller is paused only by its owner or on attestation', async t => {
@@ -516,11 +515,11 @@ test('an idle lane owned by another live controller is paused only by its owner 
   assert.equal(attested.feature.status, 'paused');
 
   // The owner itself pauses its idle lane as before.
-  await setFeatureStatus({ ...f.args, status: 'active' });
+  await updateFeature({ ...f.args, status: 'active' });
   assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' })).feature.status, 'paused');
 
   // Once the owning controller has ended, an ordinary idle pause needs nothing more.
-  await setFeatureStatus({ ...f.args, status: 'active' });
+  await updateFeature({ ...f.args, status: 'active' });
   const dead = spawnSync(process.execPath, ['-e', '']).pid;
   f.sql("UPDATE meta SET value = json_object('token', 'ended-controller', 'pid', ?) WHERE key LIKE 'agent-owner:%'", dead);
   assert.equal((await pause()).feature.status, 'paused');
@@ -544,7 +543,7 @@ test('a late completion cannot recreate an attested descendant marker', async t 
   assert.equal(await readUnconfirmedDescendants(f.args), null);
   assert.deepEqual(await markDescendantsUnconfirmed(marker), { recorded: false, attested: true });
   assert.equal(await readUnconfirmedDescendants(f.args), null);
-  await setFeatureStatus({ ...f.args, status: 'active' });
+  await updateFeature({ ...f.args, status: 'active' });
   const next = await f.runtime.startFeatureAgent(f.args);
   const fresh = await markDescendantsUnconfirmed({ ...marker, turn_id: next.turnId });
   assert.ok(fresh.generation && fresh.generation !== first.generation);
