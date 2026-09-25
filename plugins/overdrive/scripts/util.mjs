@@ -43,7 +43,7 @@ export function optionalText(value, name, options) {
 
 const RESERVED_NAMES = new Set([
   'archive', 'aux', 'cache', 'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
-  'con', 'coordinator', 'features', 'integration', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9', 'nul',
+  'con', 'features', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9', 'nul',
   'paused', 'prn', 'runtime', 'overdrive', 'tmp',
 ]);
 
@@ -52,6 +52,13 @@ export function safeSlug(value, name = 'feature') {
   if (!/^[a-z][a-z0-9-]{0,62}$/.test(slug) || slug.includes('--') || RESERVED_NAMES.has(slug)) {
     throw new OverdriveError(`${name} must start with a letter and use lowercase letters, digits, or single hyphens.`, 'INVALID_SLUG');
   }
+  return slug;
+}
+
+// Message and lab addresses; refused only for new agents, so an older lane of that name stays reachable.
+export function newAgentSlug(value, name = 'feature') {
+  const slug = safeSlug(value, name);
+  if (slug === 'coordinator' || slug === 'integration') throw new OverdriveError(`${name} ${slug} is reserved.`, 'INVALID_SLUG');
   return slug;
 }
 

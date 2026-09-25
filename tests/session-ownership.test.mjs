@@ -154,7 +154,7 @@ test('unknown legacy ownership fails clearly without contacting a backend and ca
   const f = await fixture(t, 'claude');
   f.sql("UPDATE features SET thread_id = 'legacy-thread', thread_harness = NULL, agent_status = 'idle'");
   await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'SESSION_OWNER_UNKNOWN' && /force_new_session/.test(error.message));
-  await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Continue.' }), error => error.code === 'SESSION_OWNER_UNKNOWN');
+  await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, message: 'Continue.' }), error => error.code === 'SESSION_OWNER_UNKNOWN');
   const inspected = await f.runtime.inspectFeatureAgent(f.args);
   assert.match(inspected.warning, /force_new_session/);
   assert.equal(inspected.feature.agent.harness, 'unknown');
@@ -426,7 +426,8 @@ test('a pause whose worker cannot be confirmed stopped leaves the lane active an
 });
 
 test('a confirmed pause blocks dispatch until the lane is made active again', async t => {
-  const f = await fixture(t, 'codex', { stopSettleMs: 200 });
+  // The steer queued while paused is delivered by the explicit start below, not by a delivery sweep.
+  const f = await fixture(t, 'codex', { stopSettleMs: 200, deliveryIntervalMs: 600_000 });
   const started = await f.runtime.startFeatureAgent(f.args);
   const turns = () => f.stores.codex.get(started.threadId).turns;
   // A turn that ended without its completion being delivered is settled from the native session.
@@ -434,7 +435,7 @@ test('a confirmed pause blocks dispatch until the lane is made active again', as
   const paused = await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
   assert.deepEqual({ status: paused.feature.status, agent: paused.feature.agent.status, interrupted: paused.interruption.interrupted }, { status: 'paused', agent: 'idle', interrupted: false });
   await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'INVALID_TRANSITION');
-  await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Keep going.' }), error => error.code === 'INVALID_TRANSITION');
+  assert.equal((await f.runtime.steerFeatureAgent({ ...f.args, message: 'Keep going.' })).mode, 'queued');
   // Pausing an idle lane again is a plain transition that contacts no backend.
   const calls = f.calls.length;
   assert.equal((await f.runtime.stopFeatureLane({ ...f.args, status: 'paused' })).interruption, undefined);
@@ -454,15 +455,15 @@ test('dispatch requested while a pause is stopping the worker cannot restart it'
   const pausing = f.runtime.stopFeatureLane({ ...f.args, status: 'paused' });
   await interrupting;
   // Both wait for the lane's control lock; their outcomes are captured as soon as they settle.
-  const outcome = promise => promise.then(() => 'dispatched', error => error.code);
+  const outcome = promise => promise.then(result => (result.mode === 'queued' ? 'queued' : 'dispatched'), error => error.code);
   const starting = outcome(f.runtime.startFeatureAgent(f.args));
-  const steering = outcome(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Keep going.' }));
+  const steering = outcome(f.runtime.steerFeatureAgent({ ...f.args, message: 'Keep going.' }));
   await new Promise(resolve => setTimeout(resolve, 400));
   // Until the worker has stopped, the lane does not claim to be paused.
   assert.equal((await lifecycle(f.args)).status, 'active');
   open();
   assert.equal((await pausing).feature.status, 'paused');
-  assert.deepEqual(await Promise.all([starting, steering]), ['INVALID_TRANSITION', 'INVALID_TRANSITION']);
+  assert.deepEqual(await Promise.all([starting, steering]), ['INVALID_TRANSITION', 'queued']);
   assert.equal(f.stores.codex.get(started.threadId).turns.length, 1);
   assert.ok(!f.calls.some(call => call.method === 'turn/steer'));
   const lane = await lifecycle(f.args);
@@ -554,7 +555,7 @@ test('an invalid steer leaves lane ownership, agent state and the native task un
   };
   const owners = () => read("SELECT key, value FROM meta WHERE key LIKE 'agent-owner:%' ORDER BY key");
   const lane = () => read("SELECT agent_status, thread_id, thread_harness, active_turn_id FROM features WHERE slug = 'alpha'")[0];
-  const invalid = [{ instruction: ' \n\t ' }, { instruction: '' }, { instruction: 42 }, {}, { instruction: 'a\0b' }, { instruction: 'Continue.', effort: 'extreme' }];
+  const invalid = [{ message: ' \n\t ' }, { message: '' }, { message: 42 }, {}, { message: 'a\0b' }, { message: 'Continue.', effort: 'extreme' }];
   const rejectAll = async () => {
     for (const input of invalid) {
       await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, ...input }), error => error.code === 'INVALID_INPUT', JSON.stringify(input));
@@ -578,7 +579,7 @@ test('an invalid steer leaves lane ownership, agent state and the native task un
   assert.ok(!(await getFeatureContext({ ...f.args, timeline_limit: 50 })).timeline.some(entry => entry.kind === 'coordinator.steered'));
 
   // A valid steer still takes over the lane and steers the running turn.
-  const steered = await f.runtime.steerFeatureAgent({ ...f.args, instruction: '  Also cover the edge case.  ' });
+  const steered = await f.runtime.steerFeatureAgent({ ...f.args, message: '  Also cover the edge case.  ' });
   assert.deepEqual({ mode: steered.mode, turnId: steered.turnId }, { mode: 'mid_turn', turnId: started.turnId });
   assert.deepEqual(f.calls.filter(call => call.method === 'turn/steer'), [{ harness: 'codex', method: 'turn/steer', threadId: started.threadId }]);
   assert.notDeepEqual(owners(), before.owners);

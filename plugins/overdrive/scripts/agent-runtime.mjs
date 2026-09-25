@@ -1,17 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
 import { denialNote, workerServer } from './worker-policy.mjs';
-import { summarizePatch, OverdriveError, parseJsonObject, requiredText, redactString, resolveWorkspace } from './util.mjs';
+import { summarizePatch, OverdriveError, parseJsonObject, refusedRequest, requiredText, redactString, resolveWorkspace } from './util.mjs';
 import { adoptAgentObservation, agentBusy, withAgentControl, withLaneStop } from './ownership.mjs';
 import { workerJobState } from './process-tree.mjs';
 import {
+  agentInbox,
   attestDescendantsStopped,
   bindAgentSession,
   clearWorkerGuards,
+  deliverableAgents,
   featureRuntime,
   featureUpdateInput,
   getFeatureContext,
+  markDelivered,
   markDescendantsUnconfirmed,
+  openCoordinatorInbox,
   pendingAgentRequest,
   readUnconfirmedDescendants,
   readWorkerGuards,
@@ -22,18 +26,34 @@ import {
   resolveAgentRequestRecord,
   saveAgentSession,
   savePendingAgentRequest,
+  sendAgentMessage,
+  takeCoordinatorMessages,
   updateStoppedFeature,
 } from './workspace.mjs';
 
-// stopSettleMs bounds how long a pause or archive waits for an interrupted turn to be recorded as ended.
-export function createAgentRuntime(bridge = new WorkerBridge(), { stopSettleMs = 15_000 } = {}) {
+// After a failed delivery an agent's messages wait this long before the next attempt.
+const DELIVERY_RETRY_MS = 60_000;
+// Where a steer cannot reach the agent now, the message waits in its inbox instead.
+const QUEUED_WHEN = new Set(['INVALID_TRANSITION', 'DISPATCH_UNCERTAIN', 'AGENT_OWNED', 'TURN_MISMATCH']);
+
+const messageText = message => `Message from ${message.from_agent} (${message.created_at}):\n${message.body}`;
+const messageBlock = messages => messages.map(messageText).join('\n\n');
+const reportDeliveryFailure = error => process.stderr.write(`[overdrive] message delivery failed: ${redactString(error.message)}\n`);
+
+// stopSettleMs bounds how long a pause or archive waits for an interrupted turn to be recorded as
+// ended; deliveryIntervalMs is the period of the message delivery sweep.
+export function createAgentRuntime(bridge = new WorkerBridge(), { stopSettleMs = 15_000, deliveryIntervalMs = 2_000 } = {}) {
 const ownerToken = randomUUID();
 const registrations = new Map();
 const turnMessages = new Map();
 const turnDiffs = new Map();
 const turnPlans = new Map();
 const completedTurns = new Set();
+const deliveryRetry = new Map();
 let notificationQueue = Promise.resolve();
+let sweepTimer = null;
+let sweeping = null;
+let closed = false;
 
 function enqueueStateWork(work) {
   const next = notificationQueue.then(work);
@@ -48,6 +68,7 @@ function register(threadId, workspacePath, feature, handoffPending = null) {
     if (registration.workspacePath === workspacePath && registration.feature === feature) registrations.delete(registeredThreadId);
   }
   registrations.set(threadId, { workspacePath, feature, handoffPending });
+  scheduleSweep();
 }
 
 function textInput(text) {
@@ -164,6 +185,7 @@ async function onNotification({ method, params }) {
       completedTurns.add(completionKey);
       if (completedTurns.size > 256) completedTurns.delete(completedTurns.values().next().value);
     }
+    scheduleSweep(0);
   }
 }
 
@@ -203,10 +225,17 @@ function harnessParams(runtime) {
   return { harness: runtime.harness, profile: runtime.profile, model: runtime.workerModel, harnessOptions: runtime.harnessOptions };
 }
 
-// Callers validate the instruction before any native session or lane state changes.
-function runPrompt(runtime, instruction) {
-  const direction = instruction || runtime.feature.next_action || 'Choose and complete the highest-priority ready work.';
-  return `Continue the ${runtime.feature.slug} feature lane.\n\nUser/coordinator direction:\n${direction}\n\nFirst load the feature context and spec named in your developer instructions, then inspect current Git state. Reconcile the request with the durable work graph. Work toward the smallest coherent verified result; do not silently broaden scope. Keep visible progress updates safe and concise. End with a handoff containing the exact resulting revision or dirty-state description, checks actually run and their outcomes, unresolved issues, and the next useful action. Do not include private chain-of-thought.`;
+// Callers validate the instruction before any native session or lane state changes. Without an
+// instruction or messages, the lane's next action directs the turn.
+function runPrompt(runtime, instruction, messages) {
+  const { slug } = runtime.feature;
+  const direction = instruction || (messages.length ? null : runtime.feature.next_action || 'Choose and complete the highest-priority ready work.');
+  return [
+    runtime.profile === 'qa' ? `Continue as the ${slug} QA agent.` : `Continue the ${slug} feature lane.`,
+    messages.length ? `Messages for you:\n\n${messageBlock(messages)}` : null,
+    direction ? `User/coordinator direction:\n${direction}` : null,
+    'First load the context and spec named in your developer instructions, then inspect current Git state.',
+  ].filter(Boolean).join('\n\n');
 }
 
 // featureRuntime names the harness that owns the saved session; without one, the session
@@ -363,6 +392,8 @@ async function assertWorkersSettled(runtime, attestation) {
   throw new OverdriveError(`No turn was started for ${runtime.feature.slug}: ${reason} Wait for them to stop, or pause the lane, which stops a process tree this controller holds. ${ATTEST_NEXT}`, 'WORKERS_UNCONFIRMED', { workerGuards: guards.length, descendantsUnconfirmed: Boolean(marker) });
 }
 
+// Messages waiting for the agent open the turn's prompt and are marked delivered once it started;
+// otherwise they stay pending. Callers hold the agent's control lock.
 async function dispatchTurn(runtime, threadId, instruction, effort, created = false) {
   const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: threadId, owner_token: ownerToken };
   const guardId = runtime.harness === 'claude' ? randomUUID() : null;
@@ -370,12 +401,16 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   await enqueueStateWork(() => created
     ? bindAgentSession({ ...base, harness: runtime.harness, expected_thread_id: previous.thread_id ?? null })
     : saveAgentSession({ ...base, status: 'starting' }));
+  const inbox = { workspace_path: runtime.root, feature: runtime.feature.slug };
   try {
     if (guardId && (await registerWorkerGuard({ ...base, guard_id: guardId })).ignored) throw new OverdriveError('The Claude worker guard could not be recorded for this session.', 'AGENT_OWNED');
+    // Nothing has reached the backend yet, so a failed read leaves no turn to reconcile.
+    const messages = await agentInbox(inbox).catch(error => { throw refusedRequest(error); });
     const result = await bridge.request('turn/start', {
-      harness: runtime.harness, profile: runtime.profile, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.cwd,
+      harness: runtime.harness, profile: runtime.profile, threadId, input: textInput(runPrompt(runtime, instruction, messages)), cwd: runtime.cwd,
       runtimeWorkspaceRoots: runtime.roots, model: runtime.workerModel, effort, summary: 'concise', guardId,
     });
+    await markDelivered({ ...inbox, messages, how: 'prompt' }).catch(reportDeliveryFailure);
     if (result.treeStoppedGuardId) await clearWorkerGuards({ ...base, guard_id: result.treeStoppedGuardId });
     await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_status: 'starting' }));
     return result;
@@ -405,9 +440,10 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   }
 }
 
-async function startOwned({ workspace_path, feature, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }, direction) {
+// prepared is a runtime the caller already built and reconciled under the same control lock.
+async function startOwned({ workspace_path, feature, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }, direction, prepared = null) {
   const attestation = priorTurnAttestation(prior_turn_attestation);
-  const runtime = await featureRuntime({ workspace_path, feature, force_new_session });
+  const runtime = prepared ?? await featureRuntime({ workspace_path, feature, force_new_session });
   if (!runtime.feature.spec_revision) throw new OverdriveError('Save a concrete feature specification before starting its agent.', 'SPEC_REQUIRED');
   await reconcileDispatch(runtime, attestation);
   if (runtime.feature.active_turn_id) throw new OverdriveError(`Feature already has active turn ${runtime.feature.active_turn_id}; steer it instead.`, 'TURN_ACTIVE');
@@ -439,30 +475,71 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
   };
 }
 
-async function steerOwned({ workspace_path, feature, effort = 'high' }, direction) {
-  const runtime = await featureRuntime({ workspace_path, feature });
-  if (!runtime.feature.thread_id) throw new OverdriveError('This feature has no agent session. Start it first.', 'AGENT_NOT_STARTED');
-  await bridge.ensureStarted();
-  await resume(runtime);
-  await reconcileDispatch(runtime);
-  let result;
-  let mode;
-  if (runtime.feature.active_turn_id) {
-    result = await bridge.request('turn/steer', {
-      harness: runtime.harness,
-      profile: runtime.profile,
-      threadId: runtime.feature.thread_id,
-      expectedTurnId: runtime.feature.active_turn_id,
-      input: textInput(direction),
-    });
-    mode = 'mid_turn';
-  } else {
-    await assertWorkersSettled(runtime, null);
-    result = await dispatchTurn(runtime, runtime.feature.thread_id, direction, effort);
-    mode = 'new_turn';
+// Steers the agent's live turn with its waiting messages and the direction, or starts a turn with
+// them the way agent_start does. Without a direction (a delivery sweep) it starts a turn only for an
+// active or planned agent, and does nothing once no message waits.
+async function deliverOwned(args, direction) {
+  const runtime = await featureRuntime({ workspace_path: args.workspace_path, feature: args.feature });
+  if (runtime.feature.thread_id) {
+    await bridge.ensureStarted();
+    await resume(runtime);
+    await reconcileDispatch(runtime);
   }
-  await recordAgentEvent({ workspace_path: runtime.root, feature: runtime.feature.slug, kind: 'coordinator.steered', summary: `Coordinator ${mode === 'mid_turn' ? 'steered the active turn' : 'started a follow-up turn'}: ${redactString(clip(direction, 2_000))}`, details: { mode } });
-  return { feature: runtime.feature.slug, threadId: runtime.feature.thread_id, turnId: result.turnId || result.turn?.id || runtime.feature.active_turn_id, harness: runtime.harness, mode };
+  const turnId = runtime.feature.active_turn_id;
+  const inbox = { workspace_path: runtime.root, feature: runtime.feature.slug };
+  const messages = await agentInbox(inbox);
+  if (!direction && (!messages.length || (!turnId && !['active', 'planned'].includes(runtime.feature.status)))) return null;
+  if (!turnId) return { ...(await startOwned(args, direction, runtime)), mode: 'new_turn' };
+  const result = await bridge.request('turn/steer', {
+    harness: runtime.harness,
+    profile: runtime.profile,
+    threadId: runtime.feature.thread_id,
+    expectedTurnId: turnId,
+    input: textInput([messageBlock(messages), direction].filter(Boolean).join('\n\n')),
+  }).catch(error => {
+    // A refused steer reached no turn, because the turn ended first.
+    throw error.refused ? new OverdriveError(`Turn ${turnId} ended before the steer reached it.`, 'TURN_MISMATCH') : error;
+  });
+  await markDelivered({ ...inbox, messages, how: 'steer' }).catch(reportDeliveryFailure);
+  return { feature: runtime.feature.slug, threadId: runtime.feature.thread_id, turnId: result.turnId || turnId, harness: runtime.harness, mode: 'mid_turn' };
+}
+
+// Pending messages are delivered on a timer while this controller runs agents, and right after a
+// turn ends. The timer stops once no agent is registered.
+function scheduleSweep(delayMs = deliveryIntervalMs) {
+  if (closed || !registrations.size || (sweepTimer && delayMs)) return;
+  clearTimeout(sweepTimer);
+  sweepTimer = setTimeout(() => {
+    sweepTimer = null;
+    sweeping ??= deliverPendingMessages().catch(reportDeliveryFailure).finally(() => {
+      sweeping = null;
+      scheduleSweep();
+    });
+  }, delayMs);
+  sweepTimer.unref();
+}
+
+async function deliverPendingMessages() {
+  for (const [key, retryAt] of deliveryRetry) if (retryAt <= Date.now()) deliveryRetry.delete(key);
+  for (const [root, entries] of Map.groupBy(registrations, ([, registration]) => registration.workspacePath)) {
+    const skip = [...deliveryRetry.keys()].filter(key => key.startsWith(`${root}\n`)).map(key => key.slice(root.length + 1));
+    const agents = await deliverableAgents({ workspace_path: root, threads: entries.map(([threadId]) => threadId), skip });
+    await Promise.all(agents.map(feature => deliverMessages(root, feature)));
+  }
+}
+
+// An agent another live controller owns is left to it. After a failed delivery the agent's
+// messages stay pending and it is retried later.
+async function deliverMessages(root, feature) {
+  const args = { workspace_path: root, feature };
+  const key = `${root}\n${feature}`;
+  try {
+    await withAgentControl(args, ownerToken, () => deliverOwned(args, null), { yieldToLiveOwner: true });
+    deliveryRetry.delete(key);
+  } catch (error) {
+    deliveryRetry.set(key, Date.now() + DELIVERY_RETRY_MS);
+    process.stderr.write(`[overdrive] messages for ${feature} stay pending: ${redactString(error.message)}\n`);
+  }
 }
 
 function safeThreadView(thread) {
@@ -533,11 +610,17 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
   const registered = lanes();
   let runtimes = await Promise.all((features ?? [...registered.keys()]).map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true })));
   if (!features) runtimes = runtimes.filter(runtime => registered.get(runtime.feature.slug).handoffPending || agentBusy(runtime.feature));
-  if (!runtimes.length) return { timedOut: false, handoffs: [], nextAction: 'No lane in this controller is running or awaiting handoff. Use feature_list for the latest lane state.' };
+  if (!runtimes.length) {
+    const messages = await takeCoordinatorMessages({ workspace_path: root });
+    return { timedOut: false, handoffs: [], messages, nextAction: `${messages.length ? 'Act on these coordinator messages. ' : ''}No lane in this controller is running or awaiting handoff. Use feature_list for the latest lane state.` };
+  }
   const signalled = new Set();
   let timer;
   let finish;
   const changed = new Promise(resolve => { finish = resolve; });
+  // Messages to the coordinator are only in the database, so the wait polls for them.
+  const inbox = await openCoordinatorInbox({ workspace_path: root });
+  const poll = setInterval(() => { if (inbox.waiting()) finish(true); }, 1_000);
   const signalThread = threadId => {
     const runtime = runtimes.find(runtime => runtime.feature.thread_id && runtime.feature.thread_id === threadId);
     if (runtime) { signalled.add(runtime.feature.slug); finish(true); }
@@ -563,7 +646,7 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
     for (const state of initial) {
       if (!state.feature.agent.activeTurnId || state.pendingAgentRequests.length) signalled.add(state.feature.slug);
     }
-    const signal = signalled.size ? true : await changed;
+    const signal = signalled.size || inbox.waiting() ? true : await changed;
     await notificationQueue;
     const selected = signal ? [...signalled] : runtimes.map(runtime => runtime.feature.slug);
     const handoffs = await Promise.all(selected.map(async feature => {
@@ -576,8 +659,11 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
       const lane = current.get(slug);
       if (lane && lane.handoffPending === pending.get(slug) && !agentBusy({ active_turn_id: agent.activeTurnId, agent_status: agent.status })) lane.handoffPending = null;
     }
-    return { timedOut: !signal, handoffs, nextAction: 'Reconcile completed or decision-ready handoffs now, advance authorized next actions, and wait only on remaining unreconciled work. This wait does not wake an ended coordinator turn.' };
+    const messages = await takeCoordinatorMessages({ workspace_path: root });
+    return { timedOut: !signal, handoffs, messages, nextAction: 'Reconcile completed or decision-ready handoffs and coordinator messages now, advance authorized next actions, and wait only on remaining unreconciled work. This wait does not wake an ended coordinator turn.' };
   } finally {
+    clearInterval(poll);
+    inbox.close();
     clearTimeout(timer);
     bridge.off('notification', notification);
     bridge.off('serverRequest', request);
@@ -761,6 +847,9 @@ async function resolveRequestOwned({ workspace_path, feature, request_id, action
 
 // Resolves after the bridge has shut down, with the worker processes it could not stop.
 async function shutdownAgentRuntime() {
+  closed = true;
+  clearTimeout(sweepTimer);
+  await sweeping;
   await notificationQueue;
   const stopped = await bridge.shutdown();
   await notificationQueue;
@@ -779,10 +868,20 @@ const startFeatureAgent = async args => {
   const direction = args.instruction === undefined || args.instruction === null ? undefined : requiredText(args.instruction, 'instruction', { max: 100_000 });
   return await withAgentControl(args, ownerToken, () => startOwned(args, direction));
 };
+// A steer is durable: a message the agent cannot take now waits in its inbox.
 const steerFeatureAgent = async args => {
   assertEffort(args);
-  const direction = requiredText(args.instruction, 'instruction', { max: 100_000 });
-  return await withAgentControl(args, ownerToken, () => steerOwned(args, direction));
+  const message = requiredText(args.message, 'message', { max: 20_000 });
+  let result;
+  try {
+    result = await withAgentControl(args, ownerToken, () => deliverOwned(args, message));
+  } catch (error) {
+    if (!QUEUED_WHEN.has(error.code)) throw error;
+    const queued = await sendAgentMessage({ workspace_path: args.workspace_path, from: 'coordinator', to: args.feature, body: message });
+    return { feature: queued.to, mode: 'queued', messageId: queued.id, reason: error.message, next: 'The message waits in the agent\'s inbox. It is delivered once the agent can take it, and at the latest in the prompt of its next turn.' };
+  }
+  await recordAgentEvent({ workspace_path: args.workspace_path, feature: result.feature, kind: 'coordinator.steered', summary: `Coordinator ${result.mode === 'mid_turn' ? 'steered the active turn' : 'started a follow-up turn'}: ${redactString(clip(message, 2_000))}`, details: { mode: result.mode } });
+  return result;
 };
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
 const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));

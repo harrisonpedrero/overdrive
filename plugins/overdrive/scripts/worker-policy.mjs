@@ -15,7 +15,11 @@ export const WORKER_TOOLS = Object.freeze({
 // MCP server names that give browser or computer control; cua_repl is Codex's computer-use engine.
 export const BROWSER_CONTROL = /chrome|browser|computer|playwright|puppeteer|cua_repl/i;
 
-const PUBLISH_COMMAND = /\b(?:git(?:\.exe)?(?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+))?\s+push|gh\s+(?:pr\s+(?:create|merge|edit)|release|repo\s+create)|(?:npm|pnpm|cargo)\s+publish|yarn\s+(?:npm\s+)?publish|dotnet\s+nuget\s+push|twine\s+upload|docker\s+push)\b/i;
+// Deliberately broad: any options between git and push (or subtree push), a quoted git.exe path, and
+// gh api calls with a writing method all count as publishing.
+const GIT_PUSH = String.raw`git(?:\.exe)?["']?(?:\s+-\S*(?:\s+(?:"[^"]*"|'[^']*'|\S+))?)*\s+(?:subtree\s+)?push`;
+const GH_API_WRITE = String.raw`gh\s+api\b[^\n;&|]*\s(?:-X|--method)[\s=]*(?:POST|PATCH|PUT|DELETE)`;
+const PUBLISH_COMMAND = new RegExp(String.raw`\b(?:${GIT_PUSH}|gh\s+(?:pr\s+(?:create|merge|edit)|release|repo\s+create)|${GH_API_WRITE}|(?:npm|pnpm|cargo)\s+publish|yarn\s+(?:npm\s+)?publish|dotnet\s+nuget\s+push|twine\s+upload|docker\s+push)\b`, 'i');
 const ALLOW = Object.freeze({ allow: true });
 const deny = message => ({ allow: false, message });
 
@@ -31,7 +35,7 @@ export function workerServer(root, slug) {
 export function workerToolDecision(profile, toolName, input) {
   const name = String(toolName ?? '');
   const server = /^mcp__(.+?)__/.exec(name)?.[1];
-  if (server && (/^plugin_(?:overdrive|feature-theater)_/.test(server) || (server === 'overdrive' && !Object.hasOwn(WORKER_TOOLS, name.slice('mcp__overdrive__'.length))))) {
+  if (server && (/^plugin_(?:overdrive|feature-theater)_/.test(server) || server === 'feature_theater' || (server === 'overdrive' && !Object.hasOwn(WORKER_TOOLS, name.slice('mcp__overdrive__'.length))))) {
     return deny('OVERDRIVE coordinator tools are not available to workers; reach the coordinator with message_send.');
   }
   if (profile !== 'qa' && server && BROWSER_CONTROL.test(server)) return deny('Browser and computer control belong to QA; ask qa with message_send to verify it.');

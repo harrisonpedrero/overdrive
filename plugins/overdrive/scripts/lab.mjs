@@ -157,12 +157,18 @@ async function integratedLanes(ctx, clone, commit) {
   return lanes;
 }
 
-// A pass resolves a finding only at a revision that contains the one it was found at.
+// A pass resolves a finding only at a revision that contains the one it was found at and is not
+// part of the failing run's revision, such as the HEAD under a snapshot whose uncommitted change failed.
 async function resolvableFindings(ctx, repository, suite, features, commit) {
   if (!features.length) return [];
-  const rows = ctx.db.prepare(`SELECT id, feature, found_revision FROM findings WHERE status = 'open' AND repro_suite = ? AND feature IN (${features.map(() => '?').join(', ')})`).all(suite, ...features);
+  const rows = ctx.db.prepare(`SELECT findings.id, feature, found_revision, lab_runs.revision AS failed_revision FROM findings LEFT JOIN lab_runs ON lab_runs.id = findings.found_run
+    WHERE findings.status = 'open' AND repro_suite = ? AND feature IN (${features.map(() => '?').join(', ')})`).all(suite, ...features);
   const resolved = [];
-  for (const row of rows) if (!row.found_revision || await isGitAncestor(repository, row.found_revision, commit)) resolved.push(row);
+  for (const row of rows) {
+    if (row.found_revision && !await isGitAncestor(repository, row.found_revision, commit)) continue;
+    if (row.failed_revision && await isGitAncestor(repository, commit, row.failed_revision)) continue;
+    resolved.push(row);
+  }
   return resolved;
 }
 
@@ -180,7 +186,8 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
       const commit = requested ? await verifyCheckoutRevision(source, requested)
         : lane ? await snapshotCommit(source) : (await git(source, 'rev-parse', 'HEAD')).stdout;
       const features = lane ? [lane.slug] : (await integratedLanes(ctx, source, commit)).map(entry => entry.slug);
-      const labRevision = await snapshotCommit(lab);
+      // Under this target's lock a run still marked running belongs to a runtime that exited mid-run.
+      ctx.db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(targetSlug);
       // Processes of a run whose termination is uncertain may still use its target directory.
       const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(targetSlug).count);
       const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit);
@@ -193,47 +200,59 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
         OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: lab, OVERDRIVE_SUITE: name,
         OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
       };
+      const row = {
+        id, suite: name, target: targetSlug, revision: commit, lab_revision: await snapshotCommit(lab), argv_json: JSON.stringify(spec.argv), cwd,
+        status: 'running', created_by: creator, created_at: now(),
+      };
+      ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
       const started = Date.now();
       const result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000 });
-      const row = {
-        id, suite: name, target: targetSlug, revision: commit, lab_revision: labRevision, argv_json: JSON.stringify(spec.argv), cwd,
+      Object.assign(row, {
         exit_code: result.exitCode, status: result.status, output: redactString(result.output.filter(Boolean).join('\n')).slice(-24_000),
-        duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)), created_by: creator, created_at: now(),
-      };
+        duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)),
+      });
       const resolved = row.status === 'passed' ? await resolvableFindings(ctx, source, name, features, commit) : [];
+      const stamp = now();
       transaction(ctx.db, () => {
-        ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
+        ctx.db.prepare('UPDATE lab_runs SET exit_code = ?, status = ?, output = ?, duration_ms = ?, artifacts_json = ? WHERE id = ?')
+          .run(row.exit_code, row.status, row.output, row.duration_ms, row.artifacts_json, id);
         const resolve = ctx.db.prepare("UPDATE findings SET status = 'resolved', resolved_revision = ?, resolved_run = ?, updated_at = ? WHERE id = ? AND status = 'open'");
-        for (const finding of resolved) resolve.run(commit, id, row.created_at, finding.id);
+        for (const finding of resolved) resolve.run(commit, id, stamp, finding.id);
       });
       if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
       for (const finding of resolved) {
         await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
       }
-      return { run: presentRun(ctx.root, row), resolvedFindings: resolved.map(finding => finding.id), ...(lane ? {} : { included: features }) };
+      const { argv: _argv, artifacts: { files: _files, ...artifactSummary }, output, ...summary } = presentRun(ctx.root, row);
+      return {
+        run: { ...summary, outputTail: output.slice(-4_000), artifacts: artifactSummary },
+        resolvedFindings: resolved.map(finding => finding.id),
+        ...(lane ? {} : { included: features }),
+        next: `lab_get {"run": "${id}"} returns the full output and artifact list.`,
+      };
     });
   });
 }
 
-export async function getLab({ workspace_path, run: runId, suite, target, findings, limit = 10 }) {
-  if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new OverdriveError('limit must be an integer from 1 to 50.', 'INVALID_INPUT');
+export async function getLab({ workspace_path, run: runId, suite, target, findings }) {
   if (findings !== undefined && findings !== 'open' && findings !== 'all') throw new OverdriveError('findings must be open or all.', 'INVALID_INPUT');
   const suiteFilter = suite === undefined ? null : suiteName(suite);
   const targetFilter = target === undefined ? null : targetName(target);
+  const runKey = runId === undefined ? null : requiredText(runId, 'run', { max: 100 });
   return await withContext(workspace_path, async ctx => {
+    if (runKey) {
+      const row = ctx.db.prepare('SELECT * FROM lab_runs WHERE id = ?').get(runKey);
+      if (!row) throw new OverdriveError(`Unknown lab run: ${runKey}`, 'RUN_NOT_FOUND');
+      return { run: presentRun(ctx.root, row) };
+    }
     const lab = await ensureLab(ctx.root);
     const result = {
       lab,
       suites: await listSuites(ctx.root, lab),
-      runs: ctx.db.prepare('SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) ORDER BY created_at DESC LIMIT ?')
-        .all(suiteFilter, suiteFilter, targetFilter, targetFilter, limit),
+      runs: ctx.db.prepare('SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) ORDER BY created_at DESC LIMIT 10')
+        .all(suiteFilter, suiteFilter, targetFilter, targetFilter),
       integration: parseJson(meta(ctx.db, 'integration'), null),
     };
-    if (runId !== undefined) {
-      const row = ctx.db.prepare('SELECT * FROM lab_runs WHERE id = ?').get(requiredText(runId, 'run', { max: 100 }));
-      if (!row) throw new OverdriveError(`Unknown lab run: ${runId}`, 'RUN_NOT_FOUND');
-      result.run = presentRun(ctx.root, row);
-    }
     if (findings) {
       result.findings = ctx.db.prepare("SELECT * FROM findings WHERE (? = 'all' OR status = 'open') AND (? IS NULL OR feature = ?) ORDER BY created_at DESC LIMIT 200")
         .all(findings, targetFilter, targetFilter);
@@ -254,6 +273,7 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
   const sender = agentName(from);
   if (severity !== undefined && !SEVERITIES.has(severity)) throw new OverdriveError('severity must be blocking or minor.', 'INVALID_INPUT');
   if (status !== undefined && !FINDING_STATUSES.has(status)) throw new OverdriveError('status must be open, resolved or wontfix.', 'INVALID_INPUT');
+  if (status === 'resolved' && sender !== 'coordinator') throw new OverdriveError('A passing lab_run of the repro suite resolves a finding. Use wontfix with a note for a judgment call, or ask the coordinator.', 'INVALID_INPUT');
   const findingId = id === undefined ? undefined : requiredText(id, 'id', { max: 100 });
   const changes = Object.fromEntries(Object.entries({
     title: optionalText(title, 'title', { max: 500 }),
@@ -279,7 +299,7 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
         updated_at: stamp,
       };
       const opened = finding.status === 'open' && existing?.status !== 'open';
-      // A new or reopened finding is judged from the lane's current head, and a manual resolution records where it was judged.
+      // A new or reopened finding is judged from the lane's current head, and a coordinator's resolution records where it was judged.
       if (opened) Object.assign(finding, { found_revision: head, resolved_revision: null, resolved_run: null });
       else if (finding.status !== existing?.status) Object.assign(finding, { resolved_revision: finding.status === 'resolved' ? head : null, resolved_run: null });
       if (!existing && finding.repro_suite) {
@@ -324,13 +344,14 @@ export async function buildIntegration({ workspace_path, features, base }) {
   if (new Set(requested.map(entry => entry.slug)).size !== requested.length) throw new OverdriveError('Each lane can appear once in an integration.', 'INVALID_INPUT');
   const baseRef = optionalText(base, 'base', { max: 200 });
   return await withContext(workspace_path, ctx => withWorkspaceLock(ctx.root, labLock('integration'), async () => {
+    const built = parseJson(meta(ctx.db, 'integration'), null)?.head ?? null;
     const lanes = [];
     for (const { slug, ref } of requested) {
       const lane = laneRow(ctx, slug);
       lanes.push({ slug, checkout: lane.checkout_path, revision: ref ? await verifyCheckoutRevision(lane.checkout_path, ref) : await snapshotCommit(lane.checkout_path) });
     }
     const start = await integrationBase(ctx, baseRef);
-    const clone = await resetIntegration(ctx.root, start.revision, start.source);
+    const clone = await resetIntegration(ctx.root, start.revision, start.source, built);
     // Recorded before merging, so a failed build never leaves an older composition describing this clone.
     const composition = { base: start.revision, features: lanes.map(({ slug, revision }) => ({ slug, revision })), head: null, built_at: now() };
     meta(ctx.db, 'integration', JSON.stringify(composition));
@@ -351,7 +372,6 @@ export async function buildIntegration({ workspace_path, features, base }) {
     return {
       integration: composition,
       path: clone,
-      conflict: composition.conflict,
       next: `The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`,
     };
   }));
@@ -364,7 +384,7 @@ async function assertCommitted(lane, revision) {
   }
 }
 
-async function laneCandidate(ctx, slug, requested) {
+async function laneTarget(ctx, slug, requested) {
   const lane = laneRow(ctx, slug);
   const snapshot = await repositorySnapshot(lane.checkout_path);
   if (!requested && !snapshot.clean) throw new OverdriveError(`${slug} has uncommitted changes. Have its agent commit them, then test and integrate that commit.`, 'INTEGRATE_DIRTY');
@@ -373,11 +393,15 @@ async function laneCandidate(ctx, slug, requested) {
   return { target: slug, commit, source: lane.checkout_path, branch: lane.branch, lanes: [slug] };
 }
 
-async function integrationCandidate(ctx, requested) {
+// The recorded composition describes only the current build, so an older commit is refused.
+async function integrationTarget(ctx, requested) {
   const clone = await integrationClone(ctx.root);
   const snapshot = await repositorySnapshot(clone);
   if (!snapshot.clean) throw new OverdriveError(`The integration clone ${clone} has uncommitted changes; commit or discard them there first.`, 'INTEGRATE_DIRTY');
   const commit = requested ? await verifyCheckoutRevision(clone, requested) : snapshot.head;
+  if (!await isGitAncestor(clone, commit, 'HEAD')) {
+    throw new OverdriveError(`${commit.slice(0, 12)} is not part of the current integration build. Rebuild it with integration_build, test the new head, and integrate that.`, 'INTEGRATE_STALE');
+  }
   const lanes = await integratedLanes(ctx, clone, commit);
   for (const lane of lanes) await assertCommitted(laneRow(ctx, lane.slug), lane.revision);
   return { target: 'integration', commit, source: clone, branch: null, lanes: lanes.map(lane => lane.slug) };
@@ -433,8 +457,8 @@ export async function integrate({ workspace_path, target, revision }) {
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
-      if (targetSlug !== 'integration') return await promote(ctx, await laneCandidate(ctx, targetSlug, requested));
-      return await withWorkspaceLock(root, labLock('integration'), async () => promote(ctx, await integrationCandidate(ctx, requested)));
+      if (targetSlug !== 'integration') return await promote(ctx, await laneTarget(ctx, targetSlug, requested));
+      return await withWorkspaceLock(root, labLock('integration'), async () => promote(ctx, await integrationTarget(ctx, requested)));
     } finally { ctx.db.close(); }
   });
 }

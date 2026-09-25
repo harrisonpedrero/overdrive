@@ -325,7 +325,7 @@ test('a worker given only a running work key finds its saved details while the p
   assert.doesNotMatch(packet, /Preserve API|Existing callers|Draft text|UNRELATED/);
   assert.match(packet, /^- \[ \] other · build · ready: Other work\n/m);
   assert.equal(linkedDetails(packet, 'other'), undefined);
-  assert.deepEqual(markdownSections(packet), ['## Summary', '## Work graph', '## Evidence', '## Live facts']);
+  assert.deepEqual(markdownSections(packet), ['## Summary', '## Work graph', '## Open findings', '## Recent messages', '## Evidence', '## Live facts']);
 
   // Many long running items add one line each to the packet; case-distinct keys and a Windows
   // device name get their own readable files.

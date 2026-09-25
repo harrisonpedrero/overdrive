@@ -12,6 +12,10 @@ const COORDINATOR_PLUGINS = ['overdrive@overdrive-local', 'feature-theater@featu
 const BROWSER_PLUGINS = ['browser@openai-bundled', 'chrome@openai-bundled', 'computer-use@openai-bundled', 'unified-computer-use@openai-bundled'];
 const DISABLED_STDIO = Object.freeze({ enabled: false, command: 'node', args: ['-e', ''] });
 const DISABLED_URL = Object.freeze({ enabled: false, url: 'http://127.0.0.1/' });
+const WORKER_SERVER_ENV = ['PATH', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA', 'CODEX_HOME'];
+// With network access in the sandbox, only 'untrusted' makes a command such as git push ask first,
+// so the worker permission policy sees every command that is not read-only.
+const WORKER_APPROVAL_POLICY = 'untrusted';
 // Escalations a worker may need follow the worker permission policy; questions and MCP
 // elicitations still reach the coordinator as pending requests.
 const POLICY_APPROVALS = {
@@ -21,7 +25,7 @@ const POLICY_APPROVALS = {
 };
 
 // Plugin keys stay unquoted because Codex keeps quotes in a -c key segment literally.
-export function workerConfigOverrides(profile) {
+function workerConfigOverrides(profile) {
   const feature = profile !== 'qa';
   const plugins = [...COORDINATOR_PLUGINS, ...(feature ? BROWSER_PLUGINS : [])];
   return [
@@ -31,13 +35,19 @@ export function workerConfigOverrides(profile) {
   ].flatMap(value => ['-c', value]);
 }
 
+// A server configured with these variables drives a browser or the computer whatever its name, as
+// Codex's node_repl does.
+const BROWSER_ENV = /^(?:BROWSER_USE_|SKY_CUA_|CODEX_BROWSER_USE_)/;
+const serverVariables = server => [...Object.keys(server.transport?.env ?? {}), ...(Array.isArray(server.transport?.env_vars) ? server.transport.env_vars : [])];
+
 // Credential-free stand-ins for the MCP servers a profile denies. They are applied per thread,
 // because a process-wide override does not reach servers that plugins provide.
 export function deniedMcpServers(servers, profile) {
   if (!Array.isArray(servers)) throw new OverdriveError('Codex returned an unexpected MCP inventory.', 'CODEX_CONFIG_INVALID');
-  const denied = name => ['overdrive', 'feature_theater'].includes(name) || (profile !== 'qa' && BROWSER_CONTROL.test(name));
+  const browser = server => BROWSER_CONTROL.test(server.name) || serverVariables(server).some(name => BROWSER_ENV.test(String(name)));
+  const denied = server => ['overdrive', 'feature_theater'].includes(server.name) || (profile !== 'qa' && browser(server));
   return Object.fromEntries(servers
-    .filter(server => server?.enabled && typeof server.name === 'string' && denied(server.name))
+    .filter(server => server?.enabled && typeof server.name === 'string' && denied(server))
     .map(server => [server.name, server.transport?.type === 'stdio' ? DISABLED_STDIO : DISABLED_URL]));
 }
 
@@ -193,10 +203,12 @@ export class CodexAppServer extends EventEmitter {
   }
 
   // The injected worker server gives the thread its OVERDRIVE identity and replaces any server of
-  // that name, including a denied stand-in.
+  // that name, including a denied stand-in. Codex clears a server's environment except for listed
+  // variables, and lab_run may outlast its default tool timeout.
   #threadConfig(workerServer) {
+    const overdrive = workerServer && { ...workerServer, env_vars: WORKER_SERVER_ENV, tool_timeout_sec: 3_700, default_tools_approval_mode: 'approve' };
     return {
-      mcp_servers: { ...this.deniedServers, ...(workerServer ? { overdrive: { ...workerServer, default_tools_approval_mode: 'approve' } } : {}) },
+      mcp_servers: { ...this.deniedServers, ...(overdrive ? { overdrive } : {}) },
       sandbox_workspace_write: { network_access: true },
     };
   }
@@ -248,7 +260,7 @@ export class CodexAppServer extends EventEmitter {
       cwd,
       runtimeWorkspaceRoots,
       model,
-      approvalPolicy: 'on-request',
+      approvalPolicy: WORKER_APPROVAL_POLICY,
       sandbox: 'workspace-write',
       config: this.#threadConfig(workerServer),
       developerInstructions,
@@ -265,7 +277,7 @@ export class CodexAppServer extends EventEmitter {
       cwd,
       runtimeWorkspaceRoots,
       model,
-      approvalPolicy: 'on-request',
+      approvalPolicy: WORKER_APPROVAL_POLICY,
       sandbox: 'workspace-write',
       config: this.#threadConfig(workerServer),
       developerInstructions,

@@ -38,7 +38,7 @@ export async function initializeRepository(root, directory, branch, message) {
   await run(['git', ...runtimeGitConfig(root), 'commit', '-m', message], { cwd: directory, env: automationEnv() });
 }
 
-export async function fetchCommit(repository, source, commit) {
+async function fetchCommit(repository, source, commit) {
   const present = await run(['git', 'cat-file', '-e', `${commit}^{commit}`], { cwd: repository, allowFailure: true });
   if (present.exitCode !== 0) await git(repository, 'fetch', '--no-tags', '--no-write-fetch-head', source, commit);
 }
@@ -67,6 +67,15 @@ export async function snapshotCommit(checkout) {
   }
 }
 
+// Git run in a directory without a valid .git of its own acts on an enclosing repository instead,
+// which a forced checkout or clean there would damage.
+async function assertOwnClone(clone) {
+  const gitDir = await run(['git', 'rev-parse', '--git-dir'], { cwd: clone, allowFailure: true });
+  if (gitDir.exitCode !== 0 || gitDir.stdout !== '.git') {
+    throw new OverdriveError(`${clone} is not a Git clone of its own, such as after an interrupted clone. Move it aside so OVERDRIVE can clone it again; OVERDRIVE never deletes it.`, 'CLONE_INVALID', { path: clone });
+  }
+}
+
 // A target clone is runtime-owned scratch: each sync discards tracked edits and untracked files but
 // keeps ignored dependency directories such as node_modules.
 export async function syncTarget(root, directory, source, commit) {
@@ -74,7 +83,7 @@ export async function syncTarget(root, directory, source, commit) {
   if (!await exists(target)) {
     await fs.mkdir(path.dirname(target), { recursive: true });
     await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', source, target], { cwd: root });
-  }
+  } else await assertOwnClone(target);
   await fetchCommit(target, source, commit);
   await run(['git', ...runtimeGitConfig(root), 'checkout', '--detach', '-f', commit], { cwd: target });
   await git(target, 'clean', '-fd');
@@ -82,15 +91,19 @@ export async function syncTarget(root, directory, source, commit) {
 }
 
 // Moves the integration clone to base. Its uncommitted changes, such as a conflict resolution in
-// progress, belong to an agent and are never discarded.
-export async function resetIntegration(root, base, baseSource) {
+// progress, belong to an agent and are never discarded; a HEAD other than the last build's
+// (builtHead), such as a committed resolution, stays reachable under refs/overdrive/integration/.
+export async function resetIntegration(root, base, baseSource, builtHead = null) {
   const clone = await ensureManagedPath(root, integrationPath(root));
   const fresh = !await exists(clone);
   if (fresh) {
     await fs.mkdir(path.dirname(clone), { recursive: true });
     await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', mirrorPath(root), clone], { cwd: root });
-  } else if (!(await repositorySnapshot(clone)).clean) {
-    throw new OverdriveError(`The integration clone ${clone} has uncommitted changes, such as an unfinished conflict resolution. Commit them there, or discard them yourself (git merge --abort ends a pending merge); OVERDRIVE never discards them.`, 'INTEGRATION_DIRTY', { path: clone });
+  } else {
+    await assertOwnClone(clone);
+    const { clean, head } = await repositorySnapshot(clone);
+    if (!clean) throw new OverdriveError(`The integration clone ${clone} has uncommitted changes, such as an unfinished conflict resolution. Commit them there, or discard them yourself (git merge --abort ends a pending merge); OVERDRIVE never discards them.`, 'INTEGRATION_DIRTY', { path: clone });
+    if (head !== builtHead && head !== base) await git(clone, 'update-ref', `refs/overdrive/integration/${head}`, head);
   }
   await fetchCommit(clone, baseSource, base);
   // A fresh --no-checkout clone has an empty index, which only a forced checkout populates.
@@ -269,6 +282,14 @@ async function effectiveIdent(repository, variable) {
   const result = await run(['git', '-C', repository, 'var', variable], { allowFailure: true });
   const match = result.exitCode === 0 ? result.stdout.match(/^(.*) <([^<>]*)> \d+ [+-]\d{4}$/) : null;
   return match ? { name: match[1], email: match[2] } : null;
+}
+
+// Where Git has no usable identity at all, commits in this repository are attributed to OVERDRIVE
+// automation through its local config, as in feature clones.
+export async function ensureCommitIdentity(repository) {
+  if (await effectiveIdent(repository, 'GIT_COMMITTER_IDENT')) return;
+  await git(repository, 'config', '--local', 'user.name', AUTOMATION_IDENTITY.name);
+  await git(repository, 'config', '--local', 'user.email', AUTOMATION_IDENTITY.email);
 }
 
 async function recordProvenance(destination, name, email, origin, source = null) {

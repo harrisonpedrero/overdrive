@@ -57,9 +57,10 @@ export function agentBusy(row) {
   return Boolean(row.active_turn_id) || BUSY_STATUSES.includes(row.agent_status);
 }
 
-function claimAgentControl(ctx, row, token) {
+// A busy lane stays with its live owner; yieldToLiveOwner leaves an idle one with it too.
+function claimAgentControl(ctx, row, token, yieldToLiveOwner = false) {
   const previous = agentOwner(ctx.db, row.id);
-  if (previous?.token !== token && agentBusy(row) && ownerAlive(previous)) {
+  if (previous?.token !== token && (yieldToLiveOwner || agentBusy(row)) && ownerAlive(previous)) {
     throw new OverdriveError('This feature is running in another coordinator session. Inspect it there or wait for its current turn to finish.', 'AGENT_OWNED');
   }
   if (previous?.token !== token && !ownerAlive(previous)) {
@@ -69,12 +70,12 @@ function claimAgentControl(ctx, row, token) {
   meta(ctx.db, `agent-owner:${row.id}`, JSON.stringify({ token, pid: process.pid }));
 }
 
-export async function withAgentControl(args, token, fn) {
+export async function withAgentControl(args, token, fn, { yieldToLiveOwner = false } = {}) {
   const root = await resolveWorkspace(args.workspace_path);
   const slug = safeSlug(args.feature);
   return withWorkspaceLock(root, `control-${slug}`, async () => {
     const ctx = await loadWorkspace(root);
-    try { claimAgentControl(ctx, featureBySlug(ctx.db, slug), token); }
+    try { claimAgentControl(ctx, featureBySlug(ctx.db, slug), token, yieldToLiveOwner); }
     finally { ctx.db.close(); }
     return fn(root, slug);
   });

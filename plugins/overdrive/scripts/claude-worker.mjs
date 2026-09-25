@@ -16,7 +16,8 @@ const NESTED_SESSION_ENV = /^(?:CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(?:CHILD_SESSI
 const EDITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell']);
 const EFFORTS = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'max' };
 const PERMISSION_MODES = new Set(['acceptEdits', 'auto', 'bypassPermissions', 'dontAsk']);
-const DEFAULT_OPTIONS = Object.freeze({ permissionMode: 'acceptEdits', allowedTools: [], disallowedTools: [] });
+// Deny rules hold even where a user allow rule or the permission mode skips the policy's prompt.
+const DEFAULT_OPTIONS = Object.freeze({ permissionMode: 'acceptEdits', allowedTools: [], disallowedTools: ['Bash(git push:*)', 'Bash(gh pr:*)'] });
 const RETAINED_TURNS = 4;
 const DIFF_DEBOUNCE_MS = 4_000;
 const RESULT_GRACE_MS = 15_000;

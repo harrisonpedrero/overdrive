@@ -3,7 +3,7 @@ import { lstatSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { checkoutPath } from './git.mjs';
+import { checkoutPath, labPath } from './git.mjs';
 import { OverdriveError, contained, ensureManagedPath, now, readJson, STATE_DIR, CONFIG_FILE } from './util.mjs';
 
 const SCHEMA_VERSION = 8;
@@ -377,8 +377,9 @@ function linkedComponent(root, target) {
 }
 
 // A copied or moved workspace keeps its predecessor's absolute checkout paths; report them instead of following them.
+// A QA agent works in the lab rather than in a clone of its own.
 function checkoutLocation(root, row) {
-  const expected = checkoutPath(root, row.slug);
+  const expected = row.kind === 'qa' ? labPath(root) : checkoutPath(root, row.slug);
   if (!samePath(row.checkout_path, expected)) return { expected, recorded: row.checkout_path, bound: false, reason: 'recorded_elsewhere' };
   const link = linkedComponent(root, expected);
   if (link) return { expected, recorded: row.checkout_path, bound: false, reason: 'linked_path', link };

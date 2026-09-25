@@ -1,6 +1,7 @@
 import {
   agentProfile,
   createFeature,
+  createQaAgent,
   doctorWorkspace,
   getFeatureContext,
   initializeManagedProject,
@@ -51,21 +52,12 @@ const priorTurnAttestation = consequence => ({
 });
 
 const workspace = { workspace_path: string('Absolute path to the OVERDRIVE control workspace.') };
-const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
+const SLUG = '^[a-z][a-z0-9-]{0,62}$';
+const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: SLUG }) };
+const agent = { agent: string('Lane slug or QA agent name, such as search-redesign or qa.', { pattern: SLUG }) };
 const suite = description => string(description, { pattern: '^[a-z0-9][a-z0-9_-]{0,62}$' });
-const target = string('A feature lane slug, or integration for the integration build.', { pattern: '^[a-z][a-z0-9-]{0,62}$' });
+const target = string('A feature lane slug, or integration for the integration build.', { pattern: SLUG });
 export const TOOLS = [
-  tool('agents_wait', 'Receive the next feature handoff', 'Wait for a completion or input request from feature workers. Without features, waits on every lane this controller has running or has not yet handed off. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
-    ...workspace,
-    features: { type: 'array', minItems: 1, uniqueItems: true, items: string('Feature slug still awaiting reconciliation; omit already handled idle lanes.') },
-    timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
-  }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
-  tool('view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
-    ...workspace, ...feature,
-    work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
-    page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
-  }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
-
   tool('workspace_init', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
@@ -88,12 +80,18 @@ export const TOOLS = [
     title: string('Human-readable feature title.'),
     outcome: string('Concrete outcome this lane must enable.'),
     base_revision: string('Optional branch, tag, or commit. Required full commit ID when base_feature is supplied; otherwise defaults to the refreshed canonical revision.'),
-    base_feature: string('Optional existing lane supplying the explicitly selected base_revision. Reads committed objects from that clone without publishing them to canonical source or selecting its current HEAD. Seeds from the cached canonical mirror without refreshing it, so canonical source may be unavailable.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }),
+    base_feature: string('Optional existing lane supplying the explicitly selected base_revision. Reads committed objects from that clone without publishing them to canonical source or selecting its current HEAD. Seeds from the cached canonical mirror without refreshing it, so canonical source may be unavailable.', { pattern: SLUG }),
     priority: integer('Relative feature priority.', -100, 100),
     spec: string('Optional complete initial Markdown specification.'),
   }, ['workspace_path', 'feature', 'title', 'outcome']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('feature_list', 'List feature lanes', 'Return a compact cross-feature progress view without loading every feature specification.', object({
+  tool('qa_create', 'Create QA agent', 'Create a QA agent that works in the workspace lab (lab/): it builds reusable suites, tests lanes and integrations with lab_run, records findings and messages them to the lanes. The brief is its durable spec; revise it with feature_update. Start it with agent_start.', object({
+    ...workspace,
+    name: string('Agent name; defaults to qa. Give a second QA agent another name, such as qa-ui.', { pattern: SLUG }),
+    brief: string('What to test: the user journeys, interfaces, environments and priorities this agent covers.'),
+  }, ['workspace_path', 'brief']), { destructiveHint: false }),
+
+  tool('feature_list', 'List feature lanes', 'Return a compact progress view of every lane and QA agent without loading their specifications, plus the messages agents sent the coordinator since they were last returned.', object({
     ...workspace,
     include_archived: boolean('Include archived lanes.'),
     refresh_git: boolean('Refresh Git status for each clone; slower on many features.'),
@@ -138,38 +136,50 @@ export const TOOLS = [
     remove: { type: 'array', items: string('Key of a work item to remove.'), maxItems: 200 },
   }, ['workspace_path', 'feature']), { destructiveHint: false }),
 
-  tool('agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only that feature context and the repository instructions. For a bounded work item, include its key and outcome in instruction.', object({
+  tool('view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
+    ...workspace, ...feature,
+    work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
+    page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
+  }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
+
+  tool('agent_start', 'Start agent', 'Start or resume a lane or QA agent’s worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only its own context and the repository instructions. Messages waiting for the agent are included in the turn. For a bounded work item, include its key and outcome in instruction.', object({
     ...workspace,
-    ...feature,
+    ...agent,
     instruction: string('Optional immediate direction; otherwise the lane’s next action is used.'),
     effort: string('Worker reasoning effort.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
     force_new_session: boolean('Create a replacement task on the currently configured harness instead of resuming the recorded one. A recorded task otherwise always resumes on the harness that created it.'),
     prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot dispatch.'),
-  }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
+  }, ['workspace_path', 'agent']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
+  tool('agent_steer', 'Steer agent', 'Send the agent a message: it steers the running turn, starts a turn when the agent is idle, and otherwise (paused, archived, unsettled, or run by another coordinator session) waits in the agent’s inbox until it can be delivered. For a bounded work item, include its key and outcome.', object({
     ...workspace,
-    ...feature,
+    ...agent,
+    message: string('Clear replacement, correction, constraint, or follow-up direction.', { maxLength: 20000 }),
+    effort: string('Reasoning effort for a new turn.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
+  }, ['workspace_path', 'agent', 'message']), { destructiveHint: false, openWorldHint: true }),
+
+  tool('agent_inspect', 'Inspect agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
+    ...workspace,
+    ...agent,
     include_thread: boolean('Read the persisted native worker task as well as local OVERDRIVE state.'),
-  }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
+  }, ['workspace_path', 'agent']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
 
-  tool('agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. For a bounded work item, include its key and outcome in instruction.', object({
+  tool('agent_interrupt', 'Interrupt agent', 'Interrupt an active turn while preserving the task and checkout.', object({ ...workspace, ...agent }, ['workspace_path', 'agent']), { destructiveHint: true, openWorldHint: true }),
+
+  tool('agent_request_resolve', 'Resolve agent request', 'Relay the user-approved answer to a pending command, permission, elicitation, or input request from an agent’s task.', object({
     ...workspace,
-    ...feature,
-    instruction: string('Clear replacement, correction, constraint, or follow-up direction.'),
-    effort: string('Reasoning effort for a new follow-up turn.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
-  }, ['workspace_path', 'feature', 'instruction']), { destructiveHint: false, openWorldHint: true }),
-
-  tool('agent_interrupt', 'Interrupt feature agent', 'Interrupt an active feature turn while preserving the task and checkout.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: true, openWorldHint: true }),
-
-  tool('agent_request_resolve', 'Resolve feature agent request', 'Relay the user-approved answer to a pending command, permission, elicitation, or input request from the feature task.', object({
-    ...workspace,
-    ...feature,
+    ...agent,
     request_id: string('Opaque pending request identifier returned by inspection.'),
     action: string('Resolution action.', { enum: ['accept', 'accept_session', 'decline', 'cancel', 'respond'] }),
     response: { type: 'object', description: 'Structured response for a question or elicitation.', additionalProperties: true },
     scope: string('Permission grant scope.', { enum: ['turn', 'session'] }),
-  }, ['workspace_path', 'feature', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
+  }, ['workspace_path', 'agent', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
+
+  tool('agents_wait', 'Receive the next handoff', 'Wait for a turn completion or input request from agents, or a message to the coordinator. Without agents, waits on every agent this controller has running or has not yet handed off. Completion or input on any agent returns promptly for coordinator review, together with any coordinator messages; an unrelated running agent does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
+    ...workspace,
+    agents: { type: 'array', minItems: 1, uniqueItems: true, items: string('Lane slug or QA agent name still awaiting reconciliation; omit already handled idle agents.') },
+    timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
+  }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
   tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane or of the integration build, in a clean runtime-owned clone, and record its verdict, output tail and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
     ...workspace,
@@ -178,13 +188,12 @@ export const TOOLS = [
     revision: string('Optional branch, tag or commit in the target checkout.'),
   }, ['workspace_path', 'suite', 'target']), { destructiveHint: false }),
 
-  tool('lab_get', 'Inspect the lab', 'List the lab suites, recent runs and the current integration build; return one run in full with its output and artifacts; and list findings.', object({
+  tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return only one run, in full with its output and artifacts.', object({
     ...workspace,
     run: string('Run id to return in full.'),
     suite: suite('Only list runs of this suite.'),
     target: { ...target, description: 'Only list runs and findings for this lane, or integration.' },
     findings: string('Include findings: open, or all.', { enum: ['open', 'all'] }),
-    limit: integer('Recent runs to list; defaults to 10.', 1, 50),
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
   tool('finding_record', 'Record a finding', 'Create a finding on a lane, or update one by id; omitted fields keep their saved values. A new or reopened finding is sent to the lane agent as a message saying how to reproduce it.', object({
@@ -195,7 +204,7 @@ export const TOOLS = [
     body: string('Observed versus expected behavior and the evidence; required for a new finding.'),
     severity: string('blocking (the default) prevents integrating the lane; minor does not.', { enum: ['blocking', 'minor'] }),
     repro_suite: suite('Lab suite that reproduces the finding; a passing lab_run of it on this lane resolves it.'),
-    status: string('Finding state.', { enum: ['open', 'resolved', 'wontfix'] }),
+    status: string('Finding state. A passing lab_run of its repro suite resolves a finding; only the coordinator marks one resolved by hand. Use wontfix with a note for a judgment call.', { enum: ['open', 'resolved', 'wontfix'] }),
     note: string('Why the finding changed.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false }),
 
@@ -224,24 +233,28 @@ const WORKER_ONLY_TOOLS = [
 
 const workerHandlers = { message_send: sendAgentMessage, lanes: listLanes };
 
+// The runtime addresses lanes and QA agents alike as features.
+const byAgent = handler => ({ agent, ...args }) => handler({ ...args, feature: agent });
+
 const handlers = {
-  view: composeView,
-  agents_wait: waitFeatureAgents,
   workspace_init: initializeWorkspace,
   project_create: initializeManagedProject,
   doctor: doctorWorkspace,
   feature_create: createFeature,
+  qa_create: createQaAgent,
   feature_list: listFeatures,
   feature_get: getFeatureContext,
   async feature_update(args) {
     return await (['paused', 'archived'].includes(args.status) ? stopFeatureLane(args) : updateFeature(args));
   },
   work_update: updateWork,
-  agent_start: startFeatureAgent,
-  agent_inspect: inspectFeatureAgent,
-  agent_steer: steerFeatureAgent,
-  agent_interrupt: interruptFeatureAgent,
-  agent_request_resolve: resolveFeatureAgentRequest,
+  view: composeView,
+  agent_start: byAgent(startFeatureAgent),
+  agent_steer: byAgent(steerFeatureAgent),
+  agent_inspect: byAgent(inspectFeatureAgent),
+  agent_interrupt: byAgent(interruptFeatureAgent),
+  agent_request_resolve: byAgent(resolveFeatureAgentRequest),
+  agents_wait: ({ agents, ...args }) => waitFeatureAgents({ ...args, features: agents }),
   lab_run: runLabSuite,
   lab_get: getLab,
   finding_record: recordFinding,
@@ -249,41 +262,27 @@ const handlers = {
   integrate,
 };
 
-// A worker's copy of the server: OVERDRIVE_AGENT binds it to one agent (or to the from argument
-// when it is *); OVERDRIVE_WORKER alone is an inert copy of the plugin with no tools.
+// A worker's copy of the server: OVERDRIVE_AGENT and OVERDRIVE_WORKSPACE bind it to one agent;
+// OVERDRIVE_WORKER alone is an inert copy of the plugin with no tools.
 const workerAgent = () => process.env.OVERDRIVE_AGENT || null;
 const inertWorker = () => !workerAgent() && Boolean(process.env.OVERDRIVE_WORKER);
 const forbidden = message => new OverdriveError(message, 'WORKER_TOOL_FORBIDDEN');
 
-// A worker-mode schema drops workspace_path unless the server has no workspace, and asks for
-// from only when the server has no fixed identity.
 function workerSchema(tool) {
-  const { workspace_path, ...properties } = tool.inputSchema.properties;
-  const required = tool.inputSchema.required.filter(key => key !== 'workspace_path');
-  const identity = {
-    ...(workerAgent() === '*' ? { from: string('Your own agent name, as given in your instructions.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) } : {}),
-    ...(process.env.OVERDRIVE_WORKSPACE ? {} : { workspace_path }),
-  };
-  return { ...tool, inputSchema: { ...tool.inputSchema, properties: { ...properties, ...identity }, required: [...required, ...Object.keys(identity)] } };
+  const { workspace_path: _workspace, ...properties } = tool.inputSchema.properties;
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties, required: tool.inputSchema.required.filter(key => key !== 'workspace_path') } };
 }
 
-async function callerProfile(caller) {
-  return await agentProfile({ workspace_path: caller.workspace_path, agent: caller.from });
-}
+const workerCaller = () => ({ from: safeSlug(workerAgent(), 'from'), workspace_path: process.env.OVERDRIVE_WORKSPACE });
+const callerProfile = caller => agentProfile({ workspace_path: caller.workspace_path, agent: caller.from });
 
-function workerCaller(args) {
-  const from = workerAgent() === '*' ? args.from : workerAgent();
-  return { from: safeSlug(from, 'from'), workspace_path: process.env.OVERDRIVE_WORKSPACE || args.workspace_path };
-}
-
+// A worker lists the tools its kind may call, or every worker tool when its row cannot be read now;
+// calls are checked either way.
 export async function listTools() {
   if (inertWorker()) return [];
   if (!workerAgent()) return TOOLS;
-  // A fixed identity lists only the tools its kind may call; otherwise every worker tool is listed.
-  const profile = workerAgent() === '*' ? null : await callerProfile(workerCaller({})).catch(() => null);
-  return [...WORKER_ONLY_TOOLS, ...TOOLS]
-    .filter(tool => WORKER_TOOLS[tool.name] && (!profile || WORKER_TOOLS[tool.name].includes(profile)))
-    .map(workerSchema);
+  const profile = await callerProfile(workerCaller()).catch(() => null);
+  return [...WORKER_ONLY_TOOLS, ...TOOLS].filter(tool => WORKER_TOOLS[tool.name] && (!profile || WORKER_TOOLS[tool.name].includes(profile))).map(workerSchema);
 }
 
 // The caller's kind comes from its recorded row, never from an argument. A feature agent's lab
@@ -292,7 +291,7 @@ async function callWorkerTool(name, args) {
   const access = WORKER_TOOLS[name];
   const handler = access && (workerHandlers[name] ?? handlers[name]);
   if (!handler) throw forbidden(`${name} is not available to OVERDRIVE workers.`);
-  const caller = workerCaller(args);
+  const caller = workerCaller();
   const profile = await callerProfile(caller);
   if (!access.includes(profile)) throw forbidden(`${name} is available to QA agents only.`);
   const call = { ...args, ...caller };

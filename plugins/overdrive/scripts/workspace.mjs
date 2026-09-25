@@ -12,6 +12,7 @@ import {
   ensureManagedPath,
   exists,
   lineDiff,
+  newAgentSlug,
   normalizeRepositorySource,
   now,
   optionalText,
@@ -25,6 +26,7 @@ import {
 } from './util.mjs';
 import {
   createFeatureCheckout,
+  ensureCommitIdentity,
   initializeMirror,
   initializeRepository,
   inspectMirror,
@@ -145,14 +147,14 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - Commit your work on the lane branch with clear messages.
 - ${LOCAL_SERVERS}
 - No browser or computer use. When a change is ready to test, or you need a behavior verified, send \`qa\` a message saying what changed and what to test.
-- Fix findings minimally at their root cause.
+- Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
 - Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
 - Your \`overdrive\` tools: message_send reaches \`qa\`, another lane or \`coordinator\`; lanes shows every lane and QA agent; lab_get and lab_run read and run lab suites against your own lane.
 - End each turn with a short handoff: the resulting commit or uncommitted state, what you ran and observed, and anything unresolved. Never include private reasoning.
 `;
 }
 
-export function qaAgentInstructions(root, agent) {
+function qaAgentInstructions(root, agent) {
   return `# OVERDRIVE QA agent: ${agent.slug}
 
 You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
@@ -171,7 +173,9 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 
 const agentInstructions = (root, row) => (workerProfile(row) === 'qa' ? qaAgentInstructions : featureAgentInstructions)(root, row);
 
+// A QA agent works in the lab, so no harness would read a file here; its instructions reach it directly.
 async function writeFeatureAgentFile(ctx, feature) {
+  if (workerProfile(feature) === 'qa') return;
   const file = contained(ctx.root, 'features', feature.slug, 'AGENTS.md');
   await atomicWrite(ctx.root, file, agentInstructions(ctx.root, feature));
 }
@@ -292,18 +296,58 @@ async function writeWorkDetails(ctx, feature, work) {
   return files;
 }
 
+// A QA agent sees every lane's findings and runs; a lane sees its own. lab_get returns finding bodies.
+function openFindingRows(db, row) {
+  return db.prepare("SELECT id, feature, title, severity, repro_suite, found_revision, created_by, created_at FROM findings WHERE status = 'open' AND (? OR feature = ?) ORDER BY created_at")
+    .all(row.kind === 'qa' ? 1 : 0, row.slug);
+}
+
+const OPEN_FINDING_COUNT = "SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'";
+
+function recentRuns(db, row, limit) {
+  return db.prepare('SELECT id, suite, target, status, exit_code, revision, created_by, created_at FROM lab_runs WHERE ? OR target = ? ORDER BY created_at DESC LIMIT ?')
+    .all(row.kind === 'qa' ? 1 : 0, row.slug, limit);
+}
+
+function recentMessages(db, slug, limit = 10) {
+  return db.prepare('SELECT id, from_agent, to_agent, body, status, created_at, delivered_how FROM messages WHERE to_agent = ? OR from_agent = ? ORDER BY id DESC LIMIT ?')
+    .all(slug, slug, limit).reverse();
+}
+
+function oneLine(text, max = 300) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+const findingLines = (rows, withLane) => (rows.length
+  ? rows.map(row => `- ${row.id}${withLane ? ` on ${row.feature}` : ''} (${row.severity}): ${row.title}${row.repro_suite ? ` · repro suite ${row.repro_suite}` : ''}`).join('\n')
+  : '- None open.');
+const messageLines = rows => (rows.length
+  ? rows.map(row => `- ${row.created_at} ${row.from_agent} → ${row.to_agent} (${row.status}): ${oneLine(row.body)}`).join('\n')
+  : '- None.');
+const runLines = rows => (rows.length
+  ? rows.map(row => `- ${row.id} · ${row.suite} on ${row.target}: ${row.status} at ${row.revision?.slice(0, 12) ?? 'unknown'} (${row.created_at})`).join('\n')
+  : '- None yet.');
+
+function qaPacket(db, feature, { agentLine, notes, workLines, findings, messages, facts }) {
+  return `# ${feature.title}\n\nQA agent: ${feature.slug}\nStatus: ${feature.status}\nBrief revision: ${feature.spec_revision}\n${agentLine}\nLab: ${feature.checkout_path}; its README.md holds the suite format, environment and rules.\n${notes}\n## Open findings\n\n${findingLines(findings, true)}\n\n## Recent lab runs\n\n${runLines(recentRuns(db, feature, 10))}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Work graph\n\n${workLines}\n\n## Live facts\n\n${facts}\nRead spec.md beside this file for your complete brief. Treat this packet as navigation, not a substitute for Git and executed runs.\n`;
+}
+
 export async function writeFeatureContext(ctx, featureOrSlug) {
   const feature = typeof featureOrSlug === 'string' ? featureBySlug(ctx.db, safeSlug(featureOrSlug)) : featureOrSlug;
+  const qa = workerProfile(feature) === 'qa';
   const work = workItems(ctx.db, feature.id);
   const evidence = evidenceRows(ctx.db, feature.id, 10);
   const pending = pendingRows(ctx.db, feature.id);
+  const findings = openFindingRows(ctx.db, feature);
+  const messages = recentMessages(ctx.db, feature.slug);
   const canonicalSpec = latestSpec(ctx.db, feature.id);
   if (canonicalSpec) await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'spec.md'), `${canonicalSpec.content.trim()}\n`);
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
   catch (error) { snapshot = { unavailable: error.message }; }
   let identity = null;
-  if (!snapshot.unavailable) {
+  if (!snapshot.unavailable && !qa) {
     try { identity = await readCommitIdentity(feature.checkout_path); } catch { identity = null; }
   }
   const identityLine = identity
@@ -316,9 +360,14 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
-  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+  const agentLine = `Agent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}`;
+  const notes = `\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}`;
+  const facts = `- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n`;
+  const packet = qa
+    ? qaPacket(ctx.db, feature, { agentLine, notes, workLines, findings, messages, facts })
+    : `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\n${agentLine}\n${notes}\n## Work graph\n\n${workLines}\n\n## Open findings\n\n${findingLines(findings, false)}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n${facts}\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'context.md'), packet);
-  return { feature, work, evidence, pending, snapshot, commitIdentity: identity };
+  return { feature, work, evidence, pending, findings, messages, snapshot, commitIdentity: identity };
 }
 
 async function existingInitialization(root, normalized) {
@@ -530,6 +579,7 @@ export async function ensureLab(root) {
     await atomicWrite(root, contained(lab, 'README.md'), LAB_README);
     await atomicWrite(root, contained(lab, '.gitignore'), 'node_modules/\n');
     await initializeRepository(root, lab, 'main', 'Initialize the OVERDRIVE lab');
+    await ensureCommitIdentity(lab);
     return lab;
   });
 }
@@ -637,7 +687,7 @@ export async function doctorWorkspace({ workspace_path }) {
 
 export async function createFeature({ workspace_path, feature, title, outcome, base_revision, base_feature, priority = 0, spec }) {
   const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
+  const slug = newAgentSlug(feature);
   const cleanTitle = requiredText(title || slug.replaceAll('-', ' '), 'title', { max: 200 });
   const cleanOutcome = requiredText(outcome, 'outcome', { max: 10_000 });
   const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
@@ -705,9 +755,46 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
   });
 }
 
+// A QA agent is a lane row of kind qa that works in the shared lab; its brief is its spec.
+export async function createQaAgent({ workspace_path, name = 'qa', brief }) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = newAgentSlug(name, 'name');
+  const cleanBrief = requiredText(brief, 'brief', { max: 500_000 });
+  return await withWorkspaceLock(root, 'features', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      if (ctx.db.prepare('SELECT 1 FROM features WHERE slug = ?').get(slug)) throw new OverdriveError(`A lane or QA agent named ${slug} already exists.`, 'FEATURE_EXISTS');
+      const lab = await ensureLab(root);
+      const { head, branch } = await repositorySnapshot(lab);
+      const id = newId('feature');
+      const created = now();
+      transaction(ctx.db, () => {
+        ctx.db.prepare(`
+          INSERT INTO features(id, slug, kind, title, outcome, status, base_revision, branch, checkout_path, spec_revision, summary, created_at, updated_at)
+          VALUES (?, ?, 'qa', ?, ?, 'active', ?, ?, ?, 1, 'QA agent created.', ?, ?)
+        `).run(id, slug, `QA: ${slug}`, 'Test the lanes and their integration in the lab, and report findings.', head, branch || 'main', lab, created, created);
+        ctx.db.prepare('INSERT INTO spec_revisions(id, feature_id, revision, content, rationale, created_at) VALUES (?, ?, 1, ?, ?, ?)')
+          .run(newId('spec'), id, cleanBrief, 'QA brief.', created);
+      });
+      const row = featureBySlug(ctx.db, slug);
+      await addEvent(ctx, { featureId: id, kind: 'qa.created', summary: `Created QA agent ${slug} in the lab.`, details: { lab } });
+      await writeFeatureContext(ctx, row);
+      await writeIndex(ctx);
+      return {
+        agent: summarizeFeature(ctx, row),
+        lab,
+        contextPath: contained(root, STATE_DIR, 'features', slug, 'context.md'),
+        specPath: contained(root, STATE_DIR, 'features', slug, 'spec.md'),
+        next: `Start it with agent_start {"agent": "${slug}"}. Change its brief with feature_update {"feature": "${slug}", "spec": ...}.`,
+      };
+    } finally { ctx.db.close(); }
+  });
+}
+
 function summarizeFeature(ctx, feature) {
   return {
     slug: feature.slug,
+    kind: feature.kind,
     title: feature.title,
     outcome: feature.outcome,
     status: feature.status,
@@ -733,7 +820,7 @@ function summarizeFeature(ctx, feature) {
 export async function listFeatures({ workspace_path, include_archived = false, refresh_git = false }) {
   return await withContext(workspace_path, async ctx => {
     const features = [];
-    const openFindings = ctx.db.prepare("SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'");
+    const openFindings = ctx.db.prepare(OPEN_FINDING_COUNT);
     const latestRun = ctx.db.prepare('SELECT id, suite, status, revision, created_at FROM lab_runs WHERE target = ? ORDER BY created_at DESC LIMIT 1');
     for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived) })) {
       const result = {
@@ -747,7 +834,7 @@ export async function listFeatures({ workspace_path, include_archived = false, r
       }
       features.push(result);
     }
-    return { workspace: overview(ctx), features };
+    return { workspace: overview(ctx), features, coordinatorMessages: takeCoordinatorRows(ctx.db, 'list') };
   });
 }
 
@@ -756,9 +843,11 @@ export async function agentProfile({ workspace_path, agent }) {
   return await withContext(workspace_path, ctx => workerProfile(readFeatureRow(ctx.db, safeSlug(agent, 'agent'))));
 }
 
+// The coordinator is only ever a sender through the runtime; worker identities are slugs.
 export async function sendAgentMessage({ workspace_path, from, to, body }) {
-  const sender = safeSlug(from, 'from');
+  const sender = from === 'coordinator' ? from : safeSlug(from, 'from');
   const recipient = to === 'coordinator' ? to : safeSlug(to, 'to');
+  if (sender === recipient) throw new OverdriveError('An agent cannot message itself.', 'INVALID_INPUT');
   const text = redactString(requiredText(body, 'body', { max: 20_000 }));
   return await withContext(workspace_path, ctx => {
     if (recipient !== 'coordinator') readFeatureRow(ctx.db, recipient);
@@ -768,10 +857,60 @@ export async function sendAgentMessage({ workspace_path, from, to, body }) {
   });
 }
 
+// Agents with pending messages that this controller can deliver now: those whose turn runs in one
+// of its sessions (threads), and idle active or planned agents with a spec. Others' messages wait.
+export async function deliverableAgents({ workspace_path, threads, skip = [] }) {
+  return await withContext(workspace_path, ctx => ctx.db.prepare(`SELECT DISTINCT to_agent FROM messages WHERE status = 'pending'
+    AND to_agent NOT IN (SELECT value FROM json_each(?)) AND to_agent IN (
+      SELECT slug FROM features WHERE spec_revision > 0 AND (
+        (agent_status = 'running' AND status NOT IN ('paused', 'done', 'archived') AND thread_id IN (SELECT value FROM json_each(?)))
+        OR (status IN ('active', 'planned') AND NOT ${AGENT_BUSY_SQL})))`).all(JSON.stringify(skip), JSON.stringify(threads)).map(row => row.to_agent));
+}
+
+// The messages waiting for one agent, oldest first. Only a holder of the agent's control lock
+// delivers them, so no other controller can deliver the same messages meanwhile.
+export async function agentInbox({ workspace_path, feature }) {
+  return await withContext(workspace_path, ctx => ctx.db.prepare("SELECT id, from_agent, body, created_at FROM messages WHERE to_agent = ? AND status = 'pending' ORDER BY id").all(safeSlug(feature)));
+}
+
+// Marks inbox messages delivered by how: 'steer' into a running turn, or 'prompt' of a new one.
+export async function markDelivered({ workspace_path, feature, messages, how }) {
+  if (!messages.length) return;
+  await withContext(workspace_path, async ctx => {
+    const ids = messages.map(message => message.id);
+    const senders = ctx.db.prepare("UPDATE messages SET status = 'delivered', delivered_at = ?, delivered_how = ? WHERE status = 'pending' AND id IN (SELECT value FROM json_each(?)) RETURNING from_agent").all(now(), how, JSON.stringify(ids));
+    if (!senders.length) return;
+    const featureId = ctx.db.prepare('SELECT id FROM features WHERE slug = ?').get(feature)?.id ?? null;
+    await addEvent(ctx, { featureId, kind: 'message.delivered', summary: `Delivered ${senders.length} message(s) from ${[...new Set(senders.map(row => row.from_agent))].join(', ')} by ${how}.`, details: { messages: ids, how } });
+  });
+}
+
+// Returns the coordinator's pending messages, oldest first, and marks them delivered by how.
+function takeCoordinatorRows(db, how) {
+  return db.prepare("UPDATE messages SET status = 'delivered', delivered_at = ?, delivered_how = ? WHERE to_agent = 'coordinator' AND status = 'pending' RETURNING id, from_agent, body, created_at")
+    .all(now(), how).sort((a, b) => a.id - b.id).map(row => ({ id: row.id, from: row.from_agent, body: row.body, createdAt: row.created_at }));
+}
+
+export async function takeCoordinatorMessages({ workspace_path }) {
+  return await withContext(workspace_path, ctx => takeCoordinatorRows(ctx.db, 'wait'));
+}
+
+// One database handle for a wait that polls the coordinator's inbox; a failed read counts as empty.
+export async function openCoordinatorInbox({ workspace_path }) {
+  const ctx = await loadWorkspace(await resolveWorkspace(workspace_path));
+  const pending = ctx.db.prepare("SELECT 1 FROM messages WHERE to_agent = 'coordinator' AND status = 'pending' LIMIT 1");
+  return {
+    waiting() {
+      try { return Boolean(pending.get()); } catch { return false; }
+    },
+    close: () => closeContext(ctx),
+  };
+}
+
 // Every lane and QA agent as other agents need to see it; archived rows are left out.
 export async function listLanes({ workspace_path }) {
   return await withContext(workspace_path, async ctx => {
-    const openFindings = ctx.db.prepare("SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'");
+    const openFindings = ctx.db.prepare(OPEN_FINDING_COUNT);
     const lanes = [];
     for (const row of listFeatureRows(ctx.db)) {
       const git = await repositorySnapshot(row.checkout_path).catch(() => null);
@@ -796,8 +935,9 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), 'utf8') },
       workItems: projection.work,
       evidence: projection.evidence,
-      findings: ctx.db.prepare("SELECT id, title, body, severity, repro_suite, found_revision, created_by, created_at FROM findings WHERE feature = ? AND status = 'open' ORDER BY created_at").all(row.slug),
-      labRuns: ctx.db.prepare('SELECT id, suite, status, exit_code, revision, created_at FROM lab_runs WHERE target = ? ORDER BY created_at DESC LIMIT 5').all(row.slug),
+      findings: projection.findings,
+      labRuns: recentRuns(ctx.db, row, 5),
+      messages: projection.messages.map(message => ({ ...message, body: oneLine(message.body) })),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
       commitIdentity: projection.commitIdentity,
@@ -1004,6 +1144,14 @@ function timelineRows(db, featureId, limit = 30) {
     .map(row => ({ id: Number(row.id), kind: row.kind, summary: row.summary, details: parseJson(row.details_json, {}), createdAt: row.created_at }));
 }
 
+// A QA agent also reaches every lane checkout and the runtime's lab clones, runs and artifacts.
+async function qaRoots(ctx) {
+  const labState = await ensureManagedPath(ctx.root, contained(ctx.root, STATE_DIR, 'lab'));
+  await fs.mkdir(labState, { recursive: true });
+  const lanes = listFeatureRows(ctx.db).filter(lane => lane.kind !== 'qa' && lane.checkout_location?.bound);
+  return [...lanes.map(lane => lane.checkout_path), labState];
+}
+
 export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
@@ -1011,12 +1159,13 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
     const packet = await writeFeatureContext(ctx, row);
     await writeFeatureAgentFile(ctx, row);
     const contextPath = contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md');
+    const profile = workerProfile(row);
     return {
       root: ctx.root,
       feature: row,
-      profile: workerProfile(row),
+      profile,
       cwd: row.checkout_path,
-      roots: [row.checkout_path, path.dirname(contextPath)],
+      roots: [row.checkout_path, ...(profile === 'qa' ? await qaRoots(ctx) : []), path.dirname(contextPath)],
       contextPath,
       specPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'),
       agentFile: contained(ctx.root, 'features', row.slug, 'AGENTS.md'),

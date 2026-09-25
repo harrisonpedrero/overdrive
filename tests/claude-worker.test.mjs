@@ -59,7 +59,8 @@ test('claude worker launch follows its capability profile, resumes and is free o
   assert.ok(first.includes('--permission-mode') && first.includes('acceptEdits'));
   assert.ok(first.includes('--add-dir') && first.includes('--append-system-prompt') && first.includes('--name'));
   const qa = workerLaunchArgs({ ...meta, profile: 'qa' }, 'high');
-  assert.ok(qa.includes('--chrome') && !qa.includes('--no-chrome') && !qa.includes('--disallowedTools') && qa.includes('--mcp-config'));
+  assert.ok(qa.includes('--chrome') && !qa.includes('--no-chrome') && qa.includes('--mcp-config'));
+  assert.deepEqual(qa.slice(qa.indexOf('--disallowedTools') + 1, qa.indexOf('--mcp-config')), ['Bash(git push:*)', 'Bash(gh pr:*)']);
   const resumed = workerLaunchArgs({ ...meta, persisted: true }, 'high');
   assert.ok(resumed.includes('--resume') && !resumed.includes('--session-id') && !resumed.includes('--name'));
   const env = workerEnvironment({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_PID: '1', PATH: 'p', ANTHROPIC_BASE_URL: 'u' });
@@ -104,7 +105,7 @@ test('claude harness turn records only visible handoff and working diff, accepts
   assert.ok(!launch.claudeEnv.includes('CLAUDECODE') && !launch.claudeEnv.includes('CLAUDE_CODE_SESSION_ID'));
   assert.ok(launch.claudeEnv.includes('CLAUDE_CODE_DISABLE_AUTO_MEMORY'));
   assert.equal(path.resolve(launch.cwd), path.resolve(started.checkoutPath));
-  const steered = await runtime.steerFeatureAgent({ ...args, instruction: 'Also write the second file.' });
+  const steered = await runtime.steerFeatureAgent({ ...args, message: 'Also write the second file.' });
   assert.equal(steered.mode, 'mid_turn');
   await eventually(async () => (await agentStatus(args)) === 'idle');
   const state = await runtime.inspectFeatureAgent(args);
@@ -610,7 +611,7 @@ test('an uncontained Claude worker leaves every turn unconfirmed until the coord
   assert.equal((await readWorkerGuards(args)).length, 1);
   assert.match((await getFeatureContext(args)).feature.summary, /without process-tree containment \(no process-tree containment is available on this platform\)/);
   await assert.rejects(runtime.startFeatureAgent(args), error => error.code === 'WORKERS_UNCONFIRMED' && error.details?.workerGuards === 1);
-  await assert.rejects(runtime.steerFeatureAgent({ ...args, instruction: 'Continue.' }), error => error.code === 'WORKERS_UNCONFIRMED');
+  await assert.rejects(runtime.steerFeatureAgent({ ...args, message: 'Continue.' }), error => error.code === 'WORKERS_UNCONFIRMED');
   // The coordinator's attestation clears only the guard it was given for; the new turn is guarded again.
   assert.ok((await runtime.startFeatureAgent({ ...args, prior_turn_attestation: { evidence: 'Verified the fixture worker spawned nothing and exited.' } })).turnId);
   await eventually(async () => (await agentStatus(args)) === 'idle');
