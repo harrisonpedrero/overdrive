@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -13,6 +14,99 @@ import {
 export const mirrorPath = root => contained(root, STATE_DIR, 'cache', 'repository.git');
 export const featureRoot = (root, slug) => contained(root, 'features', safeSlug(slug));
 export const checkoutPath = (root, slug) => contained(featureRoot(root, slug), 'repo');
+export const labPath = root => contained(root, 'lab');
+export const integrationPath = root => contained(root, STATE_DIR, 'lab', 'integration');
+
+// Deep paths fail with "Filename too long" on Windows unless each working tree opts in; clone -c keeps it in the clone's config.
+const LONG_PATHS = process.platform === 'win32' ? ['-c', 'core.longpaths=true'] : [];
+
+// Runtime-made commits and checkouts never run repository hooks or prompt for a signing key.
+export const runtimeGitConfig = root => ['-c', `core.hooksPath=${contained(root, STATE_DIR, 'disabled-hooks')}`, '-c', 'commit.gpgSign=false'];
+
+const automationEnv = (extra = {}) => ({
+  ...process.env,
+  GIT_AUTHOR_NAME: AUTOMATION_IDENTITY.name, GIT_AUTHOR_EMAIL: AUTOMATION_IDENTITY.email,
+  GIT_COMMITTER_NAME: AUTOMATION_IDENTITY.name, GIT_COMMITTER_EMAIL: AUTOMATION_IDENTITY.email,
+  ...extra,
+});
+
+// Creates a repository whose first commit holds the directory's files, attributed to OVERDRIVE automation.
+export async function initializeRepository(root, directory, branch, message) {
+  await git(directory, 'init', '-b', branch);
+  if (LONG_PATHS.length) await git(directory, 'config', 'core.longpaths', 'true');
+  await git(directory, 'add', '-A');
+  await run(['git', ...runtimeGitConfig(root), 'commit', '-m', message], { cwd: directory, env: automationEnv() });
+}
+
+export async function fetchCommit(repository, source, commit) {
+  const present = await run(['git', 'cat-file', '-e', `${commit}^{commit}`], { cwd: repository, allowFailure: true });
+  if (present.exitCode !== 0) await git(repository, 'fetch', '--no-tags', '--no-write-fetch-head', source, commit);
+}
+
+// Commits the working tree (tracked and unignored files) through a temporary index, so the checkout's
+// own index, branch and files are untouched. A snapshot carries HEAD's date, so an unchanged tree always
+// yields the same commit, and a ref keeps it reachable in the checkout.
+export async function snapshotCommit(checkout) {
+  const [head, headTree, headTime] = (await git(checkout, 'show', '-s', '--format=%H%n%T%n%ct', 'HEAD')).stdout.split(/\r?\n/);
+  const gitDir = (await git(checkout, 'rev-parse', '--absolute-git-dir')).stdout;
+  const index = path.join(gitDir, `overdrive-snapshot-${randomUUID()}.index`);
+  const date = `${headTime} +0000`;
+  const env = automationEnv({ GIT_INDEX_FILE: index, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
+  const inSnapshot = args => run(['git', ...args], { cwd: checkout, env });
+  try {
+    // A copy of the real index only saves rehashing unchanged files; add -A then matches the working tree.
+    try { await fs.copyFile(path.join(gitDir, 'index'), index); } catch { await inSnapshot(['read-tree', 'HEAD']); }
+    await inSnapshot(['add', '-A']);
+    const tree = (await inSnapshot(['write-tree'])).stdout;
+    if (tree === headTree) return head;
+    const commit = (await inSnapshot(['commit-tree', '--no-gpg-sign', tree, '-p', head, '-m', 'OVERDRIVE snapshot of uncommitted changes'])).stdout;
+    await git(checkout, 'update-ref', `refs/overdrive/snapshots/${commit}`, commit);
+    return commit;
+  } finally {
+    await fs.rm(index, { force: true });
+  }
+}
+
+// A target clone is runtime-owned scratch: each sync discards tracked edits and untracked files but
+// keeps ignored dependency directories such as node_modules.
+export async function syncTarget(root, directory, source, commit) {
+  const target = await ensureManagedPath(root, contained(root, STATE_DIR, 'lab', 'targets', directory));
+  if (!await exists(target)) {
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', source, target], { cwd: root });
+  }
+  await fetchCommit(target, source, commit);
+  await run(['git', ...runtimeGitConfig(root), 'checkout', '--detach', '-f', commit], { cwd: target });
+  await git(target, 'clean', '-fd');
+  return target;
+}
+
+// Moves the integration clone to base. Its uncommitted changes, such as a conflict resolution in
+// progress, belong to an agent and are never discarded.
+export async function resetIntegration(root, base, baseSource) {
+  const clone = await ensureManagedPath(root, integrationPath(root));
+  const fresh = !await exists(clone);
+  if (fresh) {
+    await fs.mkdir(path.dirname(clone), { recursive: true });
+    await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', mirrorPath(root), clone], { cwd: root });
+  } else if (!(await repositorySnapshot(clone)).clean) {
+    throw new OverdriveError(`The integration clone ${clone} has uncommitted changes, such as an unfinished conflict resolution. Commit them there, or discard them yourself (git merge --abort ends a pending merge); OVERDRIVE never discards them.`, 'INTEGRATION_DIRTY', { path: clone });
+  }
+  await fetchCommit(clone, baseSource, base);
+  // A fresh --no-checkout clone has an empty index, which only a forced checkout populates.
+  await run(['git', ...runtimeGitConfig(root), 'checkout', '--detach', ...(fresh ? ['-f'] : []), base], { cwd: clone });
+  return clone;
+}
+
+// Returns the conflicted paths; a conflicted merge stays in place for an agent to resolve.
+export async function mergeIntoIntegration(root, clone, source, commit, message) {
+  await fetchCommit(clone, source, commit);
+  const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--no-ff', '--no-edit', '-m', message, commit], { cwd: clone, env: automationEnv(), allowFailure: true });
+  if (merged.exitCode === 0) return [];
+  const conflicts = (await run(['git', 'diff', '--name-only', '-z', '--diff-filter=U'], { cwd: clone })).stdout.split('\0').filter(Boolean);
+  if (!conflicts.length) throw new OverdriveError(`Merging ${commit} into the integration clone failed: ${(merged.stderr || merged.stdout).slice(-4_000)}`, 'INTEGRATION_FAILED');
+  return conflicts;
+}
 
 async function assertFullRepository(repository) {
   for (const [target, label] of [[repository, 'repository'], [path.join(repository, '.git'), '.git directory']]) {
@@ -253,7 +347,7 @@ export async function createFeatureCheckout(root, config, slug, baseRevision, ba
   await fs.mkdir(destinationRoot, { recursive: true });
   try {
     // --no-local makes every feature self-contained instead of depending on the cache's object store.
-    await run(['git', 'clone', '--no-local', '--no-checkout', '--', mirrorPath(root), destination], { cwd: root });
+    await run(['git', 'clone', '--no-local', '--no-checkout', ...LONG_PATHS, '--', mirrorPath(root), destination], { cwd: root });
     // The selected commit may exist only in a sibling clone or outside the cache's advertised refs.
     await git(destination, 'fetch', '--no-tags', '--no-write-fetch-head', baseRepository, baseRevision);
     const branch = `feature/${slug}`;

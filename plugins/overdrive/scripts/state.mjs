@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { checkoutPath } from './git.mjs';
 import { OverdriveError, contained, ensureManagedPath, now, readJson, STATE_DIR, CONFIG_FILE } from './util.mjs';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
 
@@ -43,6 +43,7 @@ function schema(db) {
       agent_status TEXT NOT NULL DEFAULT 'not_started',
       compaction_pending INTEGER NOT NULL DEFAULT 0,
       semantic_generation INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL DEFAULT 'feature',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -145,8 +146,57 @@ function schema(db) {
       PRIMARY KEY(feature_id, request_id)
     );
 
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_agent TEXT NOT NULL,
+      to_agent TEXT NOT NULL,
+      body TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      delivered_at TEXT,
+      delivered_how TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS lab_runs (
+      id TEXT PRIMARY KEY,
+      suite TEXT,
+      target TEXT,
+      revision TEXT,
+      lab_revision TEXT,
+      argv_json TEXT,
+      cwd TEXT,
+      exit_code INTEGER,
+      status TEXT,
+      output TEXT,
+      duration_ms INTEGER,
+      artifacts_json TEXT,
+      created_by TEXT,
+      created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS findings (
+      id TEXT PRIMARY KEY,
+      feature TEXT,
+      title TEXT,
+      body TEXT,
+      severity TEXT,
+      status TEXT,
+      repro_suite TEXT,
+      found_revision TEXT,
+      found_run TEXT,
+      resolved_revision TEXT,
+      resolved_run TEXT,
+      note TEXT,
+      created_by TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS events_feature_created ON events(feature_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS work_items_feature_status ON work_items(feature_id, status);
+    CREATE INDEX IF NOT EXISTS messages_to_status ON messages(to_agent, status);
+    CREATE INDEX IF NOT EXISTS lab_runs_target_created ON lab_runs(target, created_at);
+    CREATE INDEX IF NOT EXISTS findings_feature_status ON findings(feature, status);
   `);
 }
 
@@ -175,7 +225,7 @@ function migrate(db, currentVersion) {
       DROP TABLE pending_agent_requests_v1;
     `);
     const additions = {
-      features: { thread_harness: 'TEXT', semantic_generation: 'INTEGER NOT NULL DEFAULT 0' },
+      features: { thread_harness: 'TEXT', semantic_generation: 'INTEGER NOT NULL DEFAULT 0', kind: "TEXT NOT NULL DEFAULT 'feature'" },
       checkpoints: { semantic_generation: 'INTEGER', checkout_fingerprint_json: 'TEXT' },
       evidence: {
         source: "TEXT NOT NULL DEFAULT 'reported'", spec_revision: 'INTEGER NOT NULL DEFAULT -1',

@@ -26,7 +26,9 @@ import {
 import {
   createFeatureCheckout,
   initializeMirror,
+  initializeRepository,
   inspectMirror,
+  labPath,
   mirrorPath,
   profileRepository,
   readCommitIdentity,
@@ -59,7 +61,7 @@ function closeContext(ctx) {
   try { ctx.db.close(); } catch { /* already closed */ }
 }
 
-async function withContext(workspacePath, fn) {
+export async function withContext(workspacePath, fn) {
   const root = await resolveWorkspace(workspacePath);
   const ctx = await loadWorkspace(root);
   try { return await fn(ctx); } finally { closeContext(ctx); }
@@ -110,6 +112,7 @@ async function ensureWorkspaceFiles(root, config) {
     '.overdrive/state.sqlite3*',
     '.overdrive/events.ndjson',
     'overdrive.json',
+    'lab/',
     ...(config?.managedProject ? ['project/'] : []),
   ];
   let ignore = '';
@@ -182,7 +185,7 @@ async function writeEventLog(ctx, event) {
   });
 }
 
-async function addEvent(ctx, event) {
+export async function addEvent(ctx, event) {
   const stored = recordEvent(ctx.db, event);
   await writeEventLog(ctx, {
     id: stored.id,
@@ -354,6 +357,7 @@ async function initializeSource(root, normalized, additions = {}) {
     });
     await writeJson(root, existingConfig, config);
     await ensureWorkspaceFiles(root, config);
+    await ensureLab(root);
     await writeIndex(ctx);
     return {
       initialized: true,
@@ -459,22 +463,74 @@ export async function initializeManagedProject({ workspace_path, project_name, d
     await fs.mkdir(project);
     await atomicWrite(root, contained(project, 'README.md'), `# ${name}\n\n${brief}\n`);
     await atomicWrite(root, contained(project, 'AGENTS.md'), `# Project instructions\n\nThis is the canonical source repository for ${name}. Implement only the currently selected OVERDRIVE specification, preserve unrelated work, and report exact checks and revisions. Do not add orchestration state to application commits.\n`);
-    await run(['git', 'init', '-b', branch], { cwd: project });
-    await run(['git', 'add', '--', 'README.md', 'AGENTS.md'], { cwd: project });
-    await run([
-      'git',
-      '-c', `core.hooksPath=${contained(root, STATE_DIR, 'disabled-hooks')}`,
-      '-c', 'commit.gpgSign=false',
-      '-c', 'user.name=OVERDRIVE',
-      '-c', 'user.email=overdrive@local.invalid',
-      'commit', '-m', `Initialize ${name}`,
-    ], { cwd: project });
+    await initializeRepository(root, project, branch, `Initialize ${name}`);
     const normalized = await normalizeRepositorySource(project);
     const result = await initializeSource(root, normalized, {
       ...additions,
       managedProject: { name, description: brief, path: project, defaultBranch: branch },
     });
     return result;
+  });
+}
+
+const LAB_README = `# OVERDRIVE lab
+
+Reusable QA and integration harnesses, fixtures and suites for this workspace. The lab is a local Git repository, decoupled from the product repository and never pushed. Commit your changes here.
+
+## Layout
+
+- suites/<name>/suite.json: one runnable suite per directory. Names use lowercase letters, digits, - and _.
+- harness/: shared drivers (browser, API, CLI) that suites call.
+- fixtures/: shared test data.
+
+## suite.json
+
+    {
+      "description": "What this suite proves",
+      "argv": ["node", "run.mjs"],
+      "cwd": "suite",
+      "timeout_seconds": 600,
+      "features": ["lane-slug"]
+    }
+
+- argv: the command as 1-200 argument strings, run without a shell.
+- cwd: "suite" (this suite's directory, the default) or "target" (the checkout under test).
+- timeout_seconds: 1-3600, default 600.
+- features: optional lane slugs the suite covers.
+
+## Environment
+
+- OVERDRIVE_TARGET: the checkout under test, a clean clone at the exact revision.
+- OVERDRIVE_REVISION: the commit under test.
+- OVERDRIVE_LAB: this repository.
+- OVERDRIVE_SUITE: the suite name.
+- OVERDRIVE_ARTIFACTS: an empty directory for this run's screenshots, logs and traces.
+- OVERDRIVE_PORT: a free TCP port on 127.0.0.1.
+
+## Rules
+
+- Only lab_run produces evidence: the runtime runs the suite itself at an exact target revision and lab snapshot, and records the verdict, output and artifacts. A passing run resolves the open findings it is the repro suite for.
+- Keep suites deterministic: the same revision gives the same verdict.
+- Set up dependencies in the target idempotently, for example install only when the lockfile hash changed. Ignored directories such as node_modules survive between runs against the same target.
+- Start every service a suite needs within the run, and stop it before the run ends.
+- Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. Use OVERDRIVE_PORT.
+- Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
+- Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
+- Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
+`;
+
+// Workspaces initialized before the lab existed get it on first lab use.
+export async function ensureLab(root) {
+  const lab = await ensureManagedPath(root, labPath(root));
+  if (await exists(contained(lab, '.git'))) return lab;
+  return await withWorkspaceLock(root, 'lab', async () => {
+    if (await exists(contained(lab, '.git'))) return lab;
+    if (await exists(lab)) throw new OverdriveError(`${lab} exists but is not a Git repository. Move it aside so OVERDRIVE can create the lab there.`, 'LAB_PATH_OCCUPIED');
+    await fs.mkdir(lab);
+    await atomicWrite(root, contained(lab, 'README.md'), LAB_README);
+    await atomicWrite(root, contained(lab, '.gitignore'), 'node_modules/\n');
+    await initializeRepository(root, lab, 'main', 'Initialize the OVERDRIVE lab');
+    return lab;
   });
 }
 
@@ -677,8 +733,14 @@ function summarizeFeature(ctx, feature) {
 export async function listFeatures({ workspace_path, include_archived = false, refresh_git = false }) {
   return await withContext(workspace_path, async ctx => {
     const features = [];
+    const openFindings = ctx.db.prepare("SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'");
+    const latestRun = ctx.db.prepare('SELECT id, suite, status, revision, created_at FROM lab_runs WHERE target = ? ORDER BY created_at DESC LIMIT 1');
     for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived) })) {
-      const result = summarizeFeature(ctx, recoverAgentState(ctx, feature));
+      const result = {
+        ...summarizeFeature(ctx, recoverAgentState(ctx, feature)),
+        openFindings: Number(openFindings.get(feature.slug).count),
+        latestLabRun: latestRun.get(feature.slug) ?? null,
+      };
       if (refresh_git) {
         try { result.git = await repositorySnapshot(assertBoundCheckout(feature).checkout_path, feature.base_revision); }
         catch (error) { result.git = { error: error.message }; }
@@ -737,6 +799,8 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), 'utf8') },
       workItems: projection.work,
       evidence: projection.evidence,
+      findings: ctx.db.prepare("SELECT id, title, body, severity, repro_suite, found_revision, created_by, created_at FROM findings WHERE feature = ? AND status = 'open' ORDER BY created_at").all(row.slug),
+      labRuns: ctx.db.prepare('SELECT id, suite, status, exit_code, revision, created_at FROM lab_runs WHERE target = ? ORDER BY created_at DESC LIMIT 5').all(row.slug),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
       commitIdentity: projection.commitIdentity,

@@ -1,0 +1,440 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import fs from 'node:fs/promises';
+import net from 'node:net';
+import path from 'node:path';
+import {
+  integrationPath,
+  isGitAncestor,
+  mergeIntoIntegration,
+  mirrorPath,
+  refreshMirror,
+  repositorySnapshot,
+  resetIntegration,
+  resolveMirrorRevision,
+  runtimeGitConfig,
+  snapshotCommit,
+  syncTarget,
+  verifyCheckoutRevision,
+} from './git.mjs';
+import { featureBySlug, loadWorkspace, meta, parseJson, transaction } from './state.mjs';
+import {
+  OverdriveError,
+  contained,
+  ensureManagedPath,
+  exists,
+  git,
+  now,
+  optionalText,
+  redactString,
+  requiredText,
+  resolveWorkspace,
+  run,
+  safeSlug,
+  withWorkspaceLock, STATE_DIR,
+} from './util.mjs';
+import { addEvent, ensureLab, withContext, writeFeatureContext, writeIndex } from './workspace.mjs';
+
+const SUITE_NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+const SEVERITIES = new Set(['blocking', 'minor']);
+const FINDING_STATUSES = new Set(['open', 'resolved', 'wontfix']);
+
+function suiteName(value, name = 'suite') {
+  const suite = requiredText(value, name, { max: 63 });
+  if (!SUITE_NAME.test(suite)) throw new OverdriveError(`${name} must name a lab/suites directory: lowercase letters, digits, - and _.`, 'INVALID_SUITE');
+  return suite;
+}
+
+const targetName = value => (value === 'integration' ? value : safeSlug(value, 'target'));
+const agentName = value => (value === undefined || value === 'coordinator' ? 'coordinator' : safeSlug(value, 'from'));
+const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
+const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
+
+// Lock names allow 63 characters after the optional control- prefix, so a long lane slug is hashed.
+function labLock(target) {
+  const name = `lab-${target}`;
+  return name.length <= 63 ? name : `lab-${createHash('sha256').update(target).digest('hex').slice(0, 16)}`;
+}
+
+// Lab targets and findings belong to feature lanes, never to QA agents.
+function laneRow(ctx, slug) {
+  const lane = featureBySlug(ctx.db, slug);
+  if (lane.kind === 'qa') throw new OverdriveError(`${slug} is a QA agent, not a feature lane.`, 'INVALID_TARGET');
+  return lane;
+}
+
+async function integrationClone(root) {
+  const clone = await ensureManagedPath(root, integrationPath(root));
+  if (!await exists(clone)) throw new OverdriveError('No integration has been built yet; run integration_build first.', 'INTEGRATION_NOT_BUILT');
+  return clone;
+}
+
+async function readSuite(root, lab, name) {
+  const directory = await ensureManagedPath(root, contained(lab, 'suites', name));
+  let text;
+  try { text = await fs.readFile(contained(directory, 'suite.json'), 'utf8'); } catch (error) {
+    if (error?.code === 'ENOENT') throw new OverdriveError(`No suite ${name}: lab/suites/${name}/suite.json does not exist.`, 'SUITE_NOT_FOUND');
+    throw error;
+  }
+  const invalid = detail => new OverdriveError(`lab/suites/${name}/suite.json is invalid: ${detail}.`, 'INVALID_SUITE');
+  let suite;
+  try { suite = JSON.parse(text.replace(/^﻿/, '')); } catch { throw invalid('it is not JSON'); }
+  const { argv, cwd = 'suite', timeout_seconds: timeout = 600, description } = suite ?? {};
+  if (!Array.isArray(argv) || argv.length < 1 || argv.length > 200 || argv.some(part => typeof part !== 'string' || !part || part.includes('\0'))) throw invalid('argv must hold 1-200 non-empty strings');
+  if (cwd !== 'suite' && cwd !== 'target') throw invalid('cwd must be "suite" or "target"');
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) throw invalid('timeout_seconds must be an integer from 1 to 3600');
+  return { directory, argv, cwd, timeout, description: typeof description === 'string' ? description : '' };
+}
+
+async function listSuites(root, lab) {
+  let entries = [];
+  try { entries = await fs.readdir(contained(lab, 'suites'), { withFileTypes: true }); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  const suites = [];
+  for (const entry of entries.filter(item => item.isDirectory() && SUITE_NAME.test(item.name)).sort((a, b) => a.name.localeCompare(b.name))) {
+    try { suites.push({ name: entry.name, description: (await readSuite(root, lab, entry.name)).description }); }
+    catch (error) { if (error?.code !== 'SUITE_NOT_FOUND') suites.push({ name: entry.name, error: error.message }); }
+  }
+  return suites;
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+async function artifactManifest(directory) {
+  const names = (await fs.readdir(directory, { recursive: true, withFileTypes: true }))
+    .filter(entry => entry.isFile())
+    .map(entry => path.relative(directory, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
+    .sort();
+  const files = [];
+  for (const name of names.slice(0, 1_000)) {
+    const hash = createHash('sha256');
+    let size = 0;
+    try {
+      for await (const chunk of createReadStream(path.join(directory, name))) { hash.update(chunk); size += chunk.length; }
+      files.push({ path: name, size, sha256: hash.digest('hex') });
+    } catch (error) {
+      // A process left running by an uncertain run may still hold the file.
+      files.push({ path: name, error: error.code ?? error.message });
+    }
+  }
+  return files;
+}
+
+async function execute(argv, options) {
+  try {
+    const result = await run(argv, { ...options, maxOutput: 500_000, allowFailure: true, confirmTermination: true });
+    return {
+      status: result.exitCode === 0 && !result.timedOut ? 'passed' : 'failed',
+      exitCode: result.exitCode,
+      output: [result.timedOut ? `[timed out after ${options.timeoutMs / 1000}s]` : '', result.stdout, result.stderr],
+    };
+  } catch (error) {
+    // A command that could not start failed; one whose processes may still be running is uncertain.
+    return { status: error?.code === 'COMMAND_TERMINATION_UNCERTAIN' ? 'uncertain' : 'failed', exitCode: null, output: [error.message, error.details?.output ?? ''] };
+  }
+}
+
+function presentRun(root, row) {
+  const { argv_json: argv, artifacts_json: artifacts, ...rest } = row;
+  const files = parseJson(artifacts, []);
+  return { ...rest, argv: parseJson(argv, []), artifacts: { directory: runDirectory(root, row.id), count: files.length, files: files.slice(0, 50) } };
+}
+
+// The lanes an integration commit contains, judged by Git ancestry rather than by the recorded build.
+async function integratedLanes(ctx, clone, commit) {
+  const lanes = [];
+  for (const lane of parseJson(meta(ctx.db, 'integration'), null)?.features ?? []) {
+    if (await isGitAncestor(clone, lane.revision, commit)) lanes.push(lane);
+  }
+  return lanes;
+}
+
+// A pass resolves a finding only at a revision that contains the one it was found at.
+async function resolvableFindings(ctx, repository, suite, features, commit) {
+  if (!features.length) return [];
+  const rows = ctx.db.prepare(`SELECT id, feature, found_revision FROM findings WHERE status = 'open' AND repro_suite = ? AND feature IN (${features.map(() => '?').join(', ')})`).all(suite, ...features);
+  const resolved = [];
+  for (const row of rows) if (!row.found_revision || await isGitAncestor(repository, row.found_revision, commit)) resolved.push(row);
+  return resolved;
+}
+
+export async function runLabSuite({ workspace_path, suite, target, revision, from }) {
+  const name = suiteName(suite);
+  const targetSlug = targetName(target);
+  const requested = optionalText(revision, 'revision', { max: 200 });
+  const creator = agentName(from);
+  return await withContext(workspace_path, async ctx => {
+    const lab = await ensureLab(ctx.root);
+    const spec = await readSuite(ctx.root, lab, name);
+    const lane = targetSlug === 'integration' ? null : laneRow(ctx, targetSlug);
+    return await withWorkspaceLock(ctx.root, labLock(targetSlug), async () => {
+      const source = lane ? lane.checkout_path : await integrationClone(ctx.root);
+      const commit = requested ? await verifyCheckoutRevision(source, requested)
+        : lane ? await snapshotCommit(source) : (await git(source, 'rev-parse', 'HEAD')).stdout;
+      const features = lane ? [lane.slug] : (await integratedLanes(ctx, source, commit)).map(entry => entry.slug);
+      const labRevision = await snapshotCommit(lab);
+      // Processes of a run whose termination is uncertain may still use its target directory.
+      const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(targetSlug).count);
+      const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit);
+      const id = `run-${randomUUID().slice(0, 13)}`;
+      const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
+      await fs.mkdir(artifacts, { recursive: true });
+      const cwd = spec.cwd === 'target' ? checkout : spec.directory;
+      const env = {
+        ...process.env,
+        OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: lab, OVERDRIVE_SUITE: name,
+        OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
+      };
+      const started = Date.now();
+      const result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000 });
+      const row = {
+        id, suite: name, target: targetSlug, revision: commit, lab_revision: labRevision, argv_json: JSON.stringify(spec.argv), cwd,
+        exit_code: result.exitCode, status: result.status, output: redactString(result.output.filter(Boolean).join('\n')).slice(-24_000),
+        duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)), created_by: creator, created_at: now(),
+      };
+      const resolved = row.status === 'passed' ? await resolvableFindings(ctx, source, name, features, commit) : [];
+      transaction(ctx.db, () => {
+        ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
+        const resolve = ctx.db.prepare("UPDATE findings SET status = 'resolved', resolved_revision = ?, resolved_run = ?, updated_at = ? WHERE id = ? AND status = 'open'");
+        for (const finding of resolved) resolve.run(commit, id, row.created_at, finding.id);
+      });
+      if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
+      for (const finding of resolved) {
+        await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
+      }
+      return { run: presentRun(ctx.root, row), resolvedFindings: resolved.map(finding => finding.id), ...(lane ? {} : { included: features }) };
+    });
+  });
+}
+
+export async function getLab({ workspace_path, run: runId, suite, target, findings, limit = 10 }) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new OverdriveError('limit must be an integer from 1 to 50.', 'INVALID_INPUT');
+  if (findings !== undefined && findings !== 'open' && findings !== 'all') throw new OverdriveError('findings must be open or all.', 'INVALID_INPUT');
+  const suiteFilter = suite === undefined ? null : suiteName(suite);
+  const targetFilter = target === undefined ? null : targetName(target);
+  return await withContext(workspace_path, async ctx => {
+    const lab = await ensureLab(ctx.root);
+    const result = {
+      lab,
+      suites: await listSuites(ctx.root, lab),
+      runs: ctx.db.prepare('SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) ORDER BY created_at DESC LIMIT ?')
+        .all(suiteFilter, suiteFilter, targetFilter, targetFilter, limit),
+      integration: parseJson(meta(ctx.db, 'integration'), null),
+    };
+    if (runId !== undefined) {
+      const row = ctx.db.prepare('SELECT * FROM lab_runs WHERE id = ?').get(requiredText(runId, 'run', { max: 100 }));
+      if (!row) throw new OverdriveError(`Unknown lab run: ${runId}`, 'RUN_NOT_FOUND');
+      result.run = presentRun(ctx.root, row);
+    }
+    if (findings) {
+      result.findings = ctx.db.prepare("SELECT * FROM findings WHERE (? = 'all' OR status = 'open') AND (? IS NULL OR feature = ?) ORDER BY created_at DESC LIMIT 200")
+        .all(findings, targetFilter, targetFilter);
+    }
+    return result;
+  });
+}
+
+function findingMessage(finding, sender) {
+  const reproduce = finding.repro_suite
+    ? `Reproduce it with lab_run {"suite": "${finding.repro_suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`
+    : `There is no repro suite yet; ask ${sender} how to reproduce it.`;
+  return `Finding ${finding.id} (${finding.severity}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
+}
+
+export async function recordFinding({ workspace_path, id, feature, title, body, severity, repro_suite, status, note, from }) {
+  const slug = safeSlug(feature);
+  const sender = agentName(from);
+  if (severity !== undefined && !SEVERITIES.has(severity)) throw new OverdriveError('severity must be blocking or minor.', 'INVALID_INPUT');
+  if (status !== undefined && !FINDING_STATUSES.has(status)) throw new OverdriveError('status must be open, resolved or wontfix.', 'INVALID_INPUT');
+  const findingId = id === undefined ? undefined : requiredText(id, 'id', { max: 100 });
+  const changes = Object.fromEntries(Object.entries({
+    title: optionalText(title, 'title', { max: 500 }),
+    body: optionalText(body, 'body', { max: 50_000 }),
+    severity,
+    status,
+    repro_suite: repro_suite === undefined ? undefined : suiteName(repro_suite, 'repro_suite'),
+    note: optionalText(note, 'note', { max: 20_000 }),
+  }).filter(([, value]) => value !== undefined));
+  return await withContext(workspace_path, async ctx => {
+    const lane = laneRow(ctx, slug);
+    if (changes.repro_suite) await readSuite(ctx.root, await ensureLab(ctx.root), changes.repro_suite);
+    const head = (await git(lane.checkout_path, 'rev-parse', 'HEAD')).stdout;
+    const stamp = now();
+    const { finding, existing, opened } = transaction(ctx.db, () => {
+      const existing = findingId === undefined ? null : ctx.db.prepare('SELECT * FROM findings WHERE id = ?').get(findingId);
+      if (findingId !== undefined && !existing) throw new OverdriveError(`Unknown finding: ${findingId}`, 'FINDING_NOT_FOUND');
+      if (existing && existing.feature !== slug) throw new OverdriveError(`Finding ${findingId} belongs to ${existing.feature}, not ${slug}.`, 'INVALID_INPUT');
+      if (!existing && (!changes.title || !changes.body)) throw new OverdriveError('A new finding needs a title and body.', 'INVALID_INPUT');
+      const finding = {
+        ...(existing ?? { id: `finding-${randomUUID().slice(0, 8)}`, feature: slug, severity: 'blocking', status: 'open', found_revision: head, created_by: sender, created_at: stamp }),
+        ...changes,
+        updated_at: stamp,
+      };
+      const opened = finding.status === 'open' && existing?.status !== 'open';
+      // A new or reopened finding is judged from the lane's current head, and a manual resolution records where it was judged.
+      if (opened) Object.assign(finding, { found_revision: head, resolved_revision: null, resolved_run: null });
+      else if (finding.status !== existing?.status) Object.assign(finding, { resolved_revision: finding.status === 'resolved' ? head : null, resolved_run: null });
+      if (!existing && finding.repro_suite) {
+        finding.found_run = ctx.db.prepare("SELECT id FROM lab_runs WHERE target = ? AND suite = ? AND status = 'failed' ORDER BY created_at DESC LIMIT 1").get(slug, finding.repro_suite)?.id ?? null;
+      }
+      const columns = ['id', 'feature', 'title', 'body', 'severity', 'status', 'repro_suite', 'found_revision', 'found_run', 'resolved_revision', 'resolved_run', 'note', 'created_by', 'created_at', 'updated_at'];
+      ctx.db.prepare(`INSERT OR REPLACE INTO findings(${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`).run(...columns.map(column => finding[column] ?? null));
+      if (opened) ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, findingMessage(finding, sender), stamp);
+      return { finding, existing, opened };
+    });
+    await addEvent(ctx, {
+      featureId: lane.id,
+      kind: existing ? 'finding.updated' : 'finding.recorded',
+      summary: `Finding ${finding.id} ${finding.status} (${finding.severity}): ${finding.title}`,
+      details: { finding: finding.id, status: finding.status, severity: finding.severity, reproSuite: finding.repro_suite ?? null, from: sender, messaged: opened },
+    });
+    return { finding, messagedLane: opened };
+  });
+}
+
+function laneReference(value, index) {
+  const text = requiredText(value, `features[${index}]`, { max: 300 });
+  const at = text.indexOf('@');
+  return {
+    slug: safeSlug(at < 0 ? text : text.slice(0, at), `features[${index}]`),
+    ref: at < 0 ? undefined : requiredText(text.slice(at + 1), `features[${index}] revision`, { max: 200 }),
+  };
+}
+
+async function integrationBase(ctx, ref) {
+  if (ctx.config.managedProject) {
+    const project = await ensureManagedPath(ctx.root, contained(ctx.root, 'project'));
+    return { source: project, revision: await verifyCheckoutRevision(project, ref ?? 'HEAD') };
+  }
+  const refreshed = await refreshMirror(ctx.root);
+  return { source: mirrorPath(ctx.root), revision: ref ? await resolveMirrorRevision(ctx.root, ref) : refreshed.defaultRevision };
+}
+
+export async function buildIntegration({ workspace_path, features, base }) {
+  if (!Array.isArray(features) || features.length < 1 || features.length > 50) throw new OverdriveError('features must list 1-50 lanes.', 'INVALID_INPUT');
+  const requested = features.map(laneReference);
+  if (new Set(requested.map(entry => entry.slug)).size !== requested.length) throw new OverdriveError('Each lane can appear once in an integration.', 'INVALID_INPUT');
+  const baseRef = optionalText(base, 'base', { max: 200 });
+  return await withContext(workspace_path, ctx => withWorkspaceLock(ctx.root, labLock('integration'), async () => {
+    const lanes = [];
+    for (const { slug, ref } of requested) {
+      const lane = laneRow(ctx, slug);
+      lanes.push({ slug, checkout: lane.checkout_path, revision: ref ? await verifyCheckoutRevision(lane.checkout_path, ref) : await snapshotCommit(lane.checkout_path) });
+    }
+    const start = await integrationBase(ctx, baseRef);
+    const clone = await resetIntegration(ctx.root, start.revision, start.source);
+    // Recorded before merging, so a failed build never leaves an older composition describing this clone.
+    const composition = { base: start.revision, features: lanes.map(({ slug, revision }) => ({ slug, revision })), head: null, built_at: now() };
+    meta(ctx.db, 'integration', JSON.stringify(composition));
+    for (const lane of lanes) {
+      const files = await mergeIntoIntegration(ctx.root, clone, lane.checkout, lane.revision, `Integrate ${lane.slug} ${lane.revision.slice(0, 12)}`);
+      if (files.length) { composition.conflict = { feature: lane.slug, files: files.slice(0, 200) }; break; }
+    }
+    if (!composition.conflict) composition.head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
+    meta(ctx.db, 'integration', JSON.stringify(composition));
+    await addEvent(ctx, {
+      kind: composition.conflict ? 'integration.conflict' : 'integration.built',
+      summary: composition.conflict
+        ? `Integration stopped at a conflict merging ${composition.conflict.feature}.`
+        : `Built integration ${composition.head.slice(0, 12)} of ${lanes.map(lane => lane.slug).join(', ')}.`,
+      details: composition,
+    });
+    if (!composition.conflict) return { integration: composition, path: clone };
+    return {
+      integration: composition,
+      path: clone,
+      conflict: composition.conflict,
+      next: `The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`,
+    };
+  }));
+}
+
+// Only committed lane work is integrated, never a snapshot of a working tree.
+async function assertCommitted(lane, revision) {
+  if (!await isGitAncestor(lane.checkout_path, revision, 'HEAD')) {
+    throw new OverdriveError(`${revision.slice(0, 12)} is not committed on ${lane.branch}. Have the ${lane.slug} agent commit its work, then test and integrate that commit.`, 'INTEGRATE_DIRTY');
+  }
+}
+
+async function laneCandidate(ctx, slug, requested) {
+  const lane = laneRow(ctx, slug);
+  const snapshot = await repositorySnapshot(lane.checkout_path);
+  if (!requested && !snapshot.clean) throw new OverdriveError(`${slug} has uncommitted changes. Have its agent commit them, then test and integrate that commit.`, 'INTEGRATE_DIRTY');
+  const commit = requested ? await verifyCheckoutRevision(lane.checkout_path, requested) : snapshot.head;
+  await assertCommitted(lane, commit);
+  return { target: slug, commit, source: lane.checkout_path, branch: lane.branch, lanes: [slug] };
+}
+
+async function integrationCandidate(ctx, requested) {
+  const clone = await integrationClone(ctx.root);
+  const snapshot = await repositorySnapshot(clone);
+  if (!snapshot.clean) throw new OverdriveError(`The integration clone ${clone} has uncommitted changes; commit or discard them there first.`, 'INTEGRATE_DIRTY');
+  const commit = requested ? await verifyCheckoutRevision(clone, requested) : snapshot.head;
+  const lanes = await integratedLanes(ctx, clone, commit);
+  for (const lane of lanes) await assertCommitted(laneRow(ctx, lane.slug), lane.revision);
+  return { target: 'integration', commit, source: clone, branch: null, lanes: lanes.map(lane => lane.slug) };
+}
+
+async function promote(ctx, { target, commit, source, branch, lanes }) {
+  const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
+  const blocking = lanes.length
+    ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
+    : [];
+  const managed = ctx.config.managedProject;
+  if (!managed) {
+    return {
+      published: false, target, commit, branch, lanes, passingRun: passing?.id ?? null, openBlockingFindings: blocking.map(finding => finding.id),
+      next: 'OVERDRIVE never publishes to an adopted repository. With the user\'s authority, push this commit or branch and merge it through the repository\'s normal review.',
+    };
+  }
+  if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
+  if (blocking.length) {
+    throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
+  }
+  const project = await ensureManagedPath(ctx.root, contained(ctx.root, 'project'));
+  const before = await repositorySnapshot(project);
+  if (!before.clean) throw new OverdriveError('The managed project has uncommitted changes; preserve or resolve them before integrating.', 'DIRTY_MANAGED_PROJECT');
+  if (before.branch !== managed.defaultBranch) throw new OverdriveError(`The managed project must be on ${managed.defaultBranch}, not ${before.branch || 'a detached HEAD'}.`, 'WRONG_MANAGED_BRANCH');
+  await git(project, 'fetch', '--no-tags', source, `${commit}:refs/overdrive/integrate/${commit}`);
+  const alreadyIncluded = await isGitAncestor(project, commit, before.head);
+  if (!alreadyIncluded && !await isGitAncestor(project, before.head, commit)) {
+    throw new OverdriveError(`${commit.slice(0, 12)} does not contain the project HEAD ${before.head.slice(0, 12)}, so integrating it would not be a fast-forward. Build the integration on the current project HEAD (integration_build does by default) or have the lane merge it, then test the new commit.`, 'PROMOTION_NOT_FAST_FORWARD');
+  }
+  if (!alreadyIncluded) await run(['git', ...runtimeGitConfig(ctx.root), 'merge', '--ff-only', commit], { cwd: project });
+  const refreshed = await refreshMirror(ctx.root);
+  const stamp = now();
+  transaction(ctx.db, () => {
+    meta(ctx.db, 'default_revision', refreshed.defaultRevision);
+    meta(ctx.db, 'default_branch', refreshed.defaultBranch);
+    const done = ctx.db.prepare("UPDATE features SET status = 'done', updated_at = ? WHERE slug = ? AND status <> 'archived'");
+    for (const slug of lanes) done.run(stamp, slug);
+  });
+  for (const slug of lanes) {
+    await addEvent(ctx, { featureId: featureId(ctx.db, slug), kind: 'lab.integrated', summary: `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, details: { target, commit, run: passing.id } });
+    await writeFeatureContext(ctx, laneRow(ctx, slug));
+  }
+  await writeIndex(ctx);
+  return { integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, run: passing.id, project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit } };
+}
+
+export async function integrate({ workspace_path, target, revision }) {
+  const targetSlug = targetName(target);
+  const requested = optionalText(revision, 'revision', { max: 200 });
+  const root = await resolveWorkspace(workspace_path);
+  // Integration moves the revision new lanes start from, so it shares the lane-creation lock.
+  return await withWorkspaceLock(root, 'features', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      if (targetSlug !== 'integration') return await promote(ctx, await laneCandidate(ctx, targetSlug, requested));
+      return await withWorkspaceLock(root, labLock('integration'), async () => promote(ctx, await integrationCandidate(ctx, requested)));
+    } finally { ctx.db.close(); }
+  });
+}
