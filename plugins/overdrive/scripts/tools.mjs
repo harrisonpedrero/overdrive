@@ -178,7 +178,7 @@ export const TOOLS = [
   tool('agents_wait', 'Receive the next handoff', 'Wait for a turn completion or input request from agents, or a message to the coordinator. Without agents, waits on every agent this controller has running or has not yet handed off. Completion or input on any agent returns promptly for coordinator review, together with any coordinator messages; an unrelated running agent does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
     ...workspace,
     agents: { type: 'array', minItems: 1, uniqueItems: true, items: string('Lane slug or QA agent name still awaiting reconciliation; omit already handled idle agents.') },
-    timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
+    timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
   }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
   tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane or of the integration build, in a clean runtime-owned clone, and record its verdict, output tail and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
@@ -214,7 +214,7 @@ export const TOOLS = [
     base: string('Optional base ref. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
   }, ['workspace_path', 'features']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains, then mark those lanes done. Never pushes. For an adopted repository it changes nothing and returns the commit to publish with the user’s authority.', object({
+  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains, then mark those lanes done. Never pushes. For an adopted repository it publishes nothing: it returns the commit, its checkout path and a push command to run with the user’s authority, and marks the included lanes done when the commit has a passing lab run and no open blocking findings.', object({
     ...workspace,
     target: target,
     revision: string('Optional exact revision. Defaults to the HEAD of a clean lane, or of the integration clone.'),

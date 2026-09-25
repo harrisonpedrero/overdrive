@@ -35,7 +35,7 @@ Workers are configured separately in the workspace's `overdrive.json`:
 
 ## The lab
 
-`lab/` in the workspace is a local Git repository that belongs to the QA agents: harnesses, fixtures and suites at `lab/suites/<name>/suite.json`. It is decoupled from the product repository and never pushed, so tests can span several lanes and their integration without landing in product commits. Feature agents do not add tests to the product repository unless the spec asks for them.
+`lab/` in the workspace is a local Git repository that belongs to the QA agents: harnesses, fixtures and suites at `lab/suites/<name>/suite.json`. It is decoupled from the product repository and never pushed, so tests can span several lanes and their integration without landing in product commits. Feature agents do not add tests to the product repository unless you ask for them.
 
 Only runs the runtime executes count as evidence. `lab_run` runs a suite in a clean clone at an exact revision of a lane (by default a snapshot of its working tree, uncommitted changes included) or of the integration build, with the lab itself pinned to a snapshot, and records the verdict, output and artifacts. An agent's report of a passing test is never recorded as a run. A passing run of a finding's repro suite resolves that finding, and integrating into a managed project requires a passing run at that exact commit with no open blocking findings.
 
@@ -67,6 +67,19 @@ claude plugin install overdrive@overdrive-local
 ```
 
 Start a new task or session afterward so it loads the plugin. For a single Claude Code session without installing, run `claude --plugin-dir C:\path\to\overdrive\plugins\overdrive`.
+
+Claude Code asks before every OVERDRIVE call. To be asked only where Codex asks (adopting a repository, integrating, and answering an agent's request), add this to your user or project settings:
+
+```json
+"permissions": {
+  "allow": ["mcp__plugin_overdrive_overdrive"],
+  "ask": [
+    "mcp__plugin_overdrive_overdrive__workspace_init",
+    "mcp__plugin_overdrive_overdrive__integrate",
+    "mcp__plugin_overdrive_overdrive__agent_request_resolve"
+  ]
+}
+```
 
 Keep only one copy of the coordinator plugin enabled. If another copy is installed under a different name, disable it with `claude plugin disable <plugin>@<marketplace>` in Claude Code, or with `enabled = false` under its `[plugins."<plugin>@<marketplace>"]` entry in `~/.codex/config.toml`.
 

@@ -144,7 +144,7 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 
 - Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions.
 - Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
-- Do not add or expand test suites in the product repository unless the spec asks for it: QA owns testing in a decoupled lab. You may run existing repository checks for quick feedback.
+- Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. You may run existing repository checks for quick feedback.
 - Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
 - ${MESSAGES}
@@ -165,6 +165,7 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 - Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
 - Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible; it notifies the owning lane. Retest fixes.
 - Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send. A conflict you resolve and commit in the integration clone is replayed on later builds.
+- Test a lane when it reports ready. Once one commit combines every lane you are verifying (an integration build, or a lane that merged the others), run your suites on that commit instead of on each lane again; go back to a lane head only to localize a failure.
 - ${LOCAL_SERVERS}
 - ${MESSAGES}
 - Never edit product code in lane checkouts; resolving a conflict in the integration clone is allowed.
@@ -360,15 +361,16 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const workLines = work.length
     ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}${detailFiles.has(item.item_key) ? `\n  - ${item.item_key} description and acceptance: ${detailFiles.get(item.item_key)}` : ''}`).join('\n')
     : '- No work items yet.';
-  const evidenceLines = evidence.length
-    ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
-    : '- No evidence recorded yet.';
+  // Only workspaces from before the lab have evidence rows; lab runs replaced them.
+  const legacyEvidence = evidence.length
+    ? `## Evidence\n\n${evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')}\n\n`
+    : '';
   const agentLine = `Agent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}`;
   const notes = `\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}`;
   const facts = `- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n`;
   const packet = qa
     ? qaPacket(ctx.db, feature, { agentLine, notes, workLines, findings, messages, facts })
-    : `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\n${agentLine}\n${notes}\n## Work graph\n\n${workLines}\n\n## Open findings\n\n${findingLines(findings, false)}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n${facts}\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+    : `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\n${agentLine}\n${notes}\n## Work graph\n\n${workLines}\n\n## Open findings\n\n${findingLines(findings, false)}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Recent lab runs\n\n${runLines(recentRuns(ctx.db, feature, 10))}\n\n${legacyEvidence}## Live facts\n\n${facts}\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'context.md'), packet);
   return { feature, work, evidence, pending, findings, messages, snapshot, commitIdentity: identity };
 }
@@ -519,8 +521,8 @@ export async function initializeManagedProject({ workspace_path, project_name, d
   return await withWorkspaceLock(root, 'initialize', async () => {
     if (await exists(project)) throw new OverdriveError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
     await fs.mkdir(project);
-    await atomicWrite(root, contained(project, 'README.md'), `# ${name}\n\n${brief}\n`);
-    await atomicWrite(root, contained(project, 'AGENTS.md'), `# Project instructions\n\nThis is the canonical source repository for ${name}. Implement only the currently selected OVERDRIVE specification, preserve unrelated work, and report exact checks and revisions. Do not add orchestration state to application commits.\n`);
+    // The product holds no orchestration text; the brief stays in overdrive.json.
+    await atomicWrite(root, contained(project, 'README.md'), `# ${name}\n`);
     await initializeRepository(root, project, branch, `Initialize ${name}`);
     const normalized = await normalizeRepositorySource(project);
     const result = await initializeSource(root, normalized, {
@@ -608,6 +610,7 @@ export function overview(ctx) {
           defaultBranch: ctx.config.managedProject.defaultBranch,
         }
       : null,
+    sourceCache: ctx.config.managedProject ? null : mirrorPath(ctx.root),
     featureCount: Number(ctx.db.prepare('SELECT COUNT(*) AS count FROM features').get().count),
   };
 }
@@ -867,13 +870,14 @@ export async function sendAgentMessage({ workspace_path, from, to, body }) {
 }
 
 // Agents with pending messages that this controller can deliver now: those whose turn runs in one
-// of its sessions (threads), and idle active or planned agents with a spec. Others' messages wait.
+// of its sessions (threads), and idle agents with a spec that are not paused, done or archived.
+// Others' messages wait.
 export async function deliverableAgents({ workspace_path, threads, skip = [] }) {
   return await withContext(workspace_path, ctx => ctx.db.prepare(`SELECT DISTINCT to_agent FROM messages WHERE status = 'pending'
     AND to_agent NOT IN (SELECT value FROM json_each(?)) AND to_agent IN (
-      SELECT slug FROM features WHERE spec_revision > 0 AND (
-        (agent_status = 'running' AND status NOT IN ('paused', 'done', 'archived') AND thread_id IN (SELECT value FROM json_each(?)))
-        OR (status IN ('active', 'planned') AND NOT ${AGENT_BUSY_SQL})))`).all(JSON.stringify(skip), JSON.stringify(threads)).map(row => row.to_agent));
+      SELECT slug FROM features WHERE spec_revision > 0 AND status NOT IN ('paused', 'done', 'archived') AND (
+        (agent_status = 'running' AND thread_id IN (SELECT value FROM json_each(?)))
+        OR NOT ${AGENT_BUSY_SQL}))`).all(JSON.stringify(skip), JSON.stringify(threads)).map(row => row.to_agent));
 }
 
 // The messages waiting for one agent, oldest first. Only a holder of the agent's control lock

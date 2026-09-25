@@ -17,7 +17,7 @@ The control workspace is the directory that holds `overdrive.json`, normally thi
 
 ## Establish the workspace
 
-- Adopt an existing repository with `workspace_init` (URL or path). It caches the repository and does not run its setup scripts.
+- Adopt an existing repository with `workspace_init` (URL or path). It caches the repository and does not run its setup scripts. Read its source and agent instructions from `sourceCache` with `git -C <sourceCache> show <defaultBranch>:<path>`.
 - For a new product, infer a name and brief from the request and call `project_create`, which creates a managed `project/` repository. Ask only for a missing product outcome. When it is unclear which the user wants, ask whether to adopt a repository or start from a brief.
 - Choose the worker harness, `codex` or `claude`, at initialization; afterwards it is `harness` in `overdrive.json`.
 - Worker models are independent of yours: `codex.model` and `codex.laneModels.<slug>`, or `claude.model` and `claude.laneModels.<slug>`, in `overdrive.json`. Record a model the user names there; never substitute your own. Changes apply from the next turn.
@@ -28,10 +28,10 @@ The control workspace is the directory that holds `overdrive.json`, normally thi
 ## Shape the work
 
 - Split the request into the smallest set of independent lanes that can run in parallel. Give each a short slug, a concrete `outcome` and a spec covering user-visible behavior, constraints and non-goals, and acceptance criteria. Pass the spec to `feature_create`; an agent does not start without one.
-- A spec adds only lane-specific constraints to the quality bar below. Say explicitly when the user wants tests in the product repository.
+- A spec adds only lane-specific constraints to the quality bar below. Ask a lane for product-repository tests only when the user asked for them, and quote that request in the spec; a new project is no exception, because QA's lab suites are the evidence.
 - Push back on a request that is unsafe, contradicts the repository's direction or is too large for one coherent delivery. Say why and propose the narrower version.
 - Resolve routine choices yourself. Ask the user only about decisions that materially change the product.
-- In a new or nearly empty project, land a small foundation lane first (structure, tooling, shared interfaces), then fan out; parallel lanes that each invent the scaffolding collide.
+- In a new or nearly empty project, land a small foundation lane first (structure, tooling, shared interfaces), then fan out from its commit (`base_feature` with its `base_revision`) as soon as it is committed and reviewed, while QA tests it; parallel lanes that each invent the scaffolding collide.
 - Settle shared seams before agents start. When lanes touch the same files or interface, give one lane ownership of the shared files, or write the agreed interface into both specs. Lanes can work out details with each other by message; you decide when they disagree.
 - A lane that truly needs another lane's code starts from that lane's commit (`base_feature` with its full `base_revision`).
 - To change a spec, send the complete new spec with `feature_update`. A running agent sees the revision only after you steer it to re-read its spec.
@@ -43,7 +43,7 @@ The control workspace is the directory that holds `overdrive.json`, normally thi
 - Keep the default name `qa` for the first QA agent, because feature agents address their notices to `qa`. Give it a brief naming the lanes, the journeys and behaviors to verify, the environments, and the integration you intend to deliver.
 - Add another QA agent, such as `qa-ui`, when a separate surface would otherwise wait behind the first.
 - Do not relay messages between agents; they reach each other directly, and any agent can message `coordinator`.
-- Loop on `agents_wait`; with no `agents` it covers every agent you run. It returns finished turns, pending agent requests and messages to you. Act on what needs you (decisions, blockers, stuck or looping agents, scope drift, review) and let the rest run.
+- Loop on `agents_wait`; with no `agents` it covers every agent you run. It returns finished turns, pending agent requests and messages to you. If the host moves a long wait to the background (Claude Code does after two minutes), its result arrives as a notification; do not start another wait meanwhile. Act on what needs you (decisions, blockers, stuck or looping agents, scope drift, review) and let the rest run.
 - Keep independent lanes moving while you resolve a blocked one.
 - A finished turn is not a finished lane. Read the handoff, check Git, and choose the next step.
 - Steer with `agent_steer`. It reaches a running turn, starts a turn for an idle agent, or waits in the agent's inbox, so one call is enough. Make each steer self-contained and concrete.
@@ -63,7 +63,7 @@ The feature-agent contract asks for the following. Hold lanes to it in review:
 - the smallest coherent change that fully meets the spec, following repository conventions;
 - clear interfaces and low cyclomatic complexity;
 - hardening at real boundaries (input validation, error paths, concurrency), not everywhere;
-- no new or expanded tests in the product repository unless the spec asks for them; QA owns testing in the lab;
+- no new or expanded tests in the product repository unless the user asked for them; QA owns testing in the lab;
 - no scope creep and no unrelated cleanup.
 
 Before a lane is integrated, review its diff yourself: in its checkout, compare the working tree with its `baseRevision` from `feature_get`, untracked files included. Send concrete feedback (file, problem, expected change) with `agent_steer`. Route changes through the owning agent rather than editing its checkout.
@@ -74,11 +74,11 @@ Before a lane is integrated, review its diff yourself: in its checkout, compare 
 - Judge a suite by what it exercises, not by its verdict. Check that each acceptance criterion that matters has a suite that can fail, and ask QA for a negative control when a pass looks too easy.
 - The repository's own checks (build, lint, existing tests) count as evidence only through the lab: have QA wrap them as a suite that runs in the target checkout.
 - A lab run on a lane tests a snapshot of its working tree, uncommitted changes included. Only committed work integrates, and `integrate` needs a pass at the exact commit, so have lanes commit before you build what you intend to deliver and rerun the deciding suites on that commit.
-- Combine lanes with `integration_build` (you or QA), then have QA run its integration suites against `integration`.
+- Combine lanes with `integration_build` (you or QA), then have QA run its integration suites against `integration`; once every lane is committed, the integration replaces further per-lane runs.
 - Once several lanes are in flight, deliver through an integration build, which starts from the current base. In a managed project a single lane integrates alone only if it already contains the project head.
 - Send a semantic merge conflict to the owning lanes with the conflicting files. QA may resolve a trivial one in the integration clone and commit it; later builds replay that resolution.
 - `integrate` fast-forwards a managed `project/` to a lane or integration commit that has a passing lab run at that exact commit and no open blocking findings, and marks the included lanes done. New lanes then start from the new project head.
-- For an adopted repository `integrate` changes nothing and returns the commit with its evidence. Hand the user the exact commit and where it lives: the lane branch `feature/<slug>` in the lane checkout, whose `origin` is their repository, or the integration clone.
+- For an adopted repository `integrate` publishes nothing. It returns the commit, its checkout `path` and a `push` command, and marks the included lanes done when the commit has a passing run and no open blocking findings. Run the push when the user asked you to publish; otherwise hand it to them.
 - Push, open pull requests or publish only on the user's explicit instruction.
 
 ## Boundaries

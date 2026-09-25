@@ -422,18 +422,38 @@ async function integrationTarget(ctx, requested) {
   return { target: 'integration', commit, source: clone, branch: null, lanes: lanes.map(lane => lane.slug) };
 }
 
+async function markLanesDone(ctx, lanes, summary, details) {
+  const stamp = now();
+  transaction(ctx.db, () => {
+    const done = ctx.db.prepare("UPDATE features SET status = 'done', updated_at = ? WHERE slug = ? AND status <> 'archived'");
+    for (const slug of lanes) done.run(stamp, slug);
+  });
+  for (const slug of lanes) {
+    await addEvent(ctx, { featureId: featureId(ctx.db, slug), kind: 'lab.integrated', summary, details });
+    await writeFeatureContext(ctx, laneRow(ctx, slug));
+  }
+  await writeIndex(ctx);
+}
+
+// An adopted repository is never published to; a tested commit with no open blocking findings is
+// delivered, and the user publishes it with the returned push command.
+async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking) {
+  const delivered = Boolean(passing) && !blocking.length;
+  if (delivered) await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, run: passing.id });
+  const push = `git -C "${source}" push "${ctx.config.repository}" ${commit}:refs/heads/${branch ?? '<branch>'}`;
+  return {
+    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, passingRun: passing?.id ?? null, openBlockingFindings: blocking.map(finding => finding.id), push,
+    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command${branch ? '' : ' after replacing <branch> with a new branch name'}, then merge the branch through the repository's normal review.`,
+  };
+}
+
 async function promote(ctx, { target, commit, source, branch, lanes }) {
   const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
   const managed = ctx.config.managedProject;
-  if (!managed) {
-    return {
-      published: false, target, commit, branch, lanes, passingRun: passing?.id ?? null, openBlockingFindings: blocking.map(finding => finding.id),
-      next: 'OVERDRIVE never publishes to an adopted repository. With the user\'s authority, push this commit or branch and merge it through the repository\'s normal review.',
-    };
-  }
+  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking);
   if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
   if (blocking.length) {
     throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
@@ -449,18 +469,11 @@ async function promote(ctx, { target, commit, source, branch, lanes }) {
   }
   if (!alreadyIncluded) await run(['git', ...runtimeGitConfig(ctx.root), 'merge', '--ff-only', commit], { cwd: project });
   const refreshed = await refreshMirror(ctx.root);
-  const stamp = now();
   transaction(ctx.db, () => {
     meta(ctx.db, 'default_revision', refreshed.defaultRevision);
     meta(ctx.db, 'default_branch', refreshed.defaultBranch);
-    const done = ctx.db.prepare("UPDATE features SET status = 'done', updated_at = ? WHERE slug = ? AND status <> 'archived'");
-    for (const slug of lanes) done.run(stamp, slug);
   });
-  for (const slug of lanes) {
-    await addEvent(ctx, { featureId: featureId(ctx.db, slug), kind: 'lab.integrated', summary: `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, details: { target, commit, run: passing.id } });
-    await writeFeatureContext(ctx, laneRow(ctx, slug));
-  }
-  await writeIndex(ctx);
+  await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, run: passing.id });
   return { integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, run: passing.id, project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit } };
 }
 

@@ -80,6 +80,12 @@ function clip(value, max = 100_000) {
   return text.length <= max ? text : `${text.slice(0, max)}\n[truncated]`;
 }
 
+// Keeps the newest text of a message that is still being written.
+function clipTail(value, max) {
+  const text = String(value ?? '');
+  return text.length <= max ? text : `[earlier output omitted]\n${text.slice(-max)}`;
+}
+
 function safePayload(value, key = '') {
   if (/reasoning|chain.?of.?thought|encrypted|credential|cookie/i.test(key)) return '[omitted]';
   if (/^(?:token|password|passwd|secret|api[_-]?key|authorization)$/i.test(key)) return '[redacted]';
@@ -147,7 +153,8 @@ async function onNotification({ method, params }) {
   }
   if (method === 'item/agentMessage/delta') {
     const key = params.turnId;
-    turnMessages.set(key, redactString(clip((turnMessages.get(key) || '') + (params.delta || ''))));
+    // Redacted before clipping, so a cut can never split a secret out of its pattern.
+    turnMessages.set(key, clipTail(redactString((turnMessages.get(key) || '') + (params.delta || '')), 20_000));
     return;
   }
   if (method === 'turn/diff/updated') {
@@ -476,8 +483,8 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
 }
 
 // Steers the agent's live turn with its waiting messages and the direction, or starts a turn with
-// them the way agent_start does. Without a direction (a delivery sweep) it starts a turn only for an
-// active or planned agent, and does nothing once no message waits.
+// them the way agent_start does. Without a direction (a delivery sweep) it does nothing once no
+// message waits; featureRuntime refuses paused, done and archived agents either way.
 async function deliverOwned(args, direction) {
   const runtime = await featureRuntime({ workspace_path: args.workspace_path, feature: args.feature });
   if (runtime.feature.thread_id) {
@@ -488,7 +495,7 @@ async function deliverOwned(args, direction) {
   const turnId = runtime.feature.active_turn_id;
   const inbox = { workspace_path: runtime.root, feature: runtime.feature.slug };
   const messages = await agentInbox(inbox);
-  if (!direction && (!messages.length || (!turnId && !['active', 'planned'].includes(runtime.feature.status)))) return null;
+  if (!direction && !messages.length) return null;
   if (!turnId) return { ...(await startOwned(args, direction, runtime)), mode: 'new_turn' };
   const result = await bridge.request('turn/steer', {
     harness: runtime.harness,
@@ -597,13 +604,13 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   }
   const context = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 30 });
   const turnId = context.feature.agent.activeTurnId;
-  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clip(turnMessages.get(turnId), 6_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
+  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clipTail(turnMessages.get(turnId), 3_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
 }
 
 // Without features, waits on this controller's registered lanes that are busy or whose turn it
 // started or adopted has not yet been handed off, so a lane that finished between waits is still returned.
-async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 30 }) {
-  if (!Number.isInteger(timeout_seconds) || timeout_seconds < 1 || timeout_seconds > 60) throw new OverdriveError('Wait duration must be 1–60 seconds.', 'INVALID_INPUT');
+async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 300 }) {
+  if (!Number.isInteger(timeout_seconds) || timeout_seconds < 1 || timeout_seconds > 600) throw new OverdriveError('Wait duration must be 1–600 seconds.', 'INVALID_INPUT');
   if (features !== undefined && (!Array.isArray(features) || !features.length || features.some(feature => typeof feature !== 'string') || new Set(features).size !== features.length)) throw new OverdriveError('features must be a nonempty list of unique feature slugs.', 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const lanes = () => new Map([...registrations.values()].filter(registration => registration.workspacePath === root).map(registration => [registration.feature, registration]));

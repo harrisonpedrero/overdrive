@@ -74,8 +74,8 @@ Messages are rows in `messages`, addressed to a lane, a QA agent or `coordinator
 The coordinator's server sweeps pending messages about every 2 seconds while it runs agents, and again as soon as a turn completes. For each recipient that has a spec:
 
 - With a live turn in this controller, the messages steer it (for Claude, as a stdin user message).
-- When it is idle with status `active` or `planned`, a new turn starts with the batched messages as its prompt.
-- Otherwise the messages stay pending: for an idle agent that is paused, blocked, in review, done or archived, for an `uncertain` agent, and for one another live controller owns. The next turn to start for that agent opens its prompt with every pending message.
+- When it is idle and not paused, done or archived (a `blocked` or `review` lane included), a new turn starts with the batched messages as its prompt.
+- Otherwise the messages stay pending: for an agent that is paused, done or archived, for an `uncertain` agent, and for one another live controller owns. The next turn to start for that agent opens its prompt with every pending message.
 
 Delivery holds the agent's control lock, so two controllers never deliver the same message. A failed delivery is retried after 60 seconds. Messages to `coordinator` stay pending until `agents_wait` (which wakes on them) or `feature_list` returns them, once.
 
@@ -95,7 +95,7 @@ The output tail is redacted, and artifacts are listed with their path, size and 
 
 **Integration.** `integration_build` resets `.overdrive/lab/integration` to its base: the managed `project/` HEAD, or else the refreshed default revision. It then merges each lane's snapshot or `slug@ref` with `--no-ff`, hooks disabled, under the OVERDRIVE identity. It stops at the first conflict and leaves it in place. Which lanes a commit contains is judged by Git ancestry, so a resolution an agent commits there is honored. rerere replays recorded resolutions on later builds, and a HEAD committed there after its build, such as a resolution, stays reachable under `refs/overdrive/integration/`. Uncommitted changes in the integration clone block a rebuild rather than being discarded.
 
-**Integrate.** `integrate {target, revision?}` accepts only committed lane work, and for the integration target only a commit in the current build. For a managed project, it requires a clean `project/` on its default branch, a passing lab run at that exact commit, and no open blocking findings on the included lanes. It then fast-forwards `project/` with hooks disabled, refreshes the mirror, and marks the lanes `done`; new lanes start from the new HEAD. For an adopted repository it changes nothing and returns what the coordinator needs to publish with the user's authority.
+**Integrate.** `integrate {target, revision?}` accepts only committed lane work, and for the integration target only a commit in the current build. For a managed project, it requires a clean `project/` on its default branch, a passing lab run at that exact commit, and no open blocking findings on the included lanes. It then fast-forwards `project/` with hooks disabled, refreshes the mirror, and marks the lanes `done`; new lanes start from the new HEAD. For an adopted repository it publishes nothing: it returns the commit, its checkout and a push command for the coordinator to run with the user's authority, and marks the included lanes `done` when the commit has a passing lab run and no open blocking findings.
 
 ## Essential invariants
 

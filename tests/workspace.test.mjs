@@ -196,7 +196,7 @@ test('starts a managed project from scratch and bases lanes on its head', async 
   assert.equal(initialized.workspace.managedProject.name, 'Atlas');
   const project = path.join(workspace, 'project');
   assert.equal((await git(project, 'branch', '--show-current')).stdout, 'main');
-  assert.match(await fs.readFile(path.join(project, 'README.md'), 'utf8'), /triage incidents/);
+  assert.equal(await fs.readFile(path.join(project, 'README.md'), 'utf8'), '# Atlas\n');
 
   const foundation = await createFeature({
     workspace_path: workspace,
@@ -325,7 +325,7 @@ test('a worker given only a running work key finds its saved details while the p
   assert.doesNotMatch(packet, /Preserve API|Existing callers|Draft text|UNRELATED/);
   assert.match(packet, /^- \[ \] other · build · ready: Other work\n/m);
   assert.equal(linkedDetails(packet, 'other'), undefined);
-  assert.deepEqual(markdownSections(packet), ['## Summary', '## Work graph', '## Open findings', '## Recent messages', '## Evidence', '## Live facts']);
+  assert.deepEqual(markdownSections(packet), ['## Summary', '## Work graph', '## Open findings', '## Recent messages', '## Recent lab runs', '## Live facts']);
 
   // Many long running items add one line each to the packet; case-distinct keys and a Windows
   // device name get their own readable files.
