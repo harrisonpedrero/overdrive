@@ -43,7 +43,7 @@ export function optionalText(value, name, options) {
 
 const RESERVED_NAMES = new Set([
   'archive', 'aux', 'cache', 'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
-  'con', 'features', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9', 'nul',
+  'con', 'coordinator', 'features', 'integration', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9', 'nul',
   'paused', 'prn', 'runtime', 'overdrive', 'tmp',
 ]);
 

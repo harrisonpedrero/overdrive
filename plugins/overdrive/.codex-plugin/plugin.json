@@ -43,6 +43,9 @@
         "workspace_init": {
           "approval_mode": "prompt"
         },
+        "integrate": {
+          "approval_mode": "prompt"
+        },
         "agent_request_resolve": {
           "approval_mode": "prompt"
         }

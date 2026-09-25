@@ -18,6 +18,7 @@ import {
   waitFeatureAgents,
 } from './agent-runtime.mjs';
 import { composeView } from './presentation.mjs';
+import { buildIntegration, getLab, integrate, recordFinding, runLabSuite } from './lab.mjs';
 
 const string = (description, extra = {}) => ({ type: 'string', description, ...extra });
 const boolean = description => ({ type: 'boolean', description });
@@ -46,6 +47,8 @@ const priorTurnAttestation = consequence => ({
 
 const workspace = { workspace_path: string('Absolute path to the OVERDRIVE control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
+const suite = description => string(description, { pattern: '^[a-z0-9][a-z0-9_-]{0,62}$' });
+const target = string('A feature lane slug, or integration for the integration build.', { pattern: '^[a-z][a-z0-9-]{0,62}$' });
 export const TOOLS = [
   tool('agents_wait', 'Receive the next feature handoff', 'Wait for a completion or input request from feature workers. Without features, waits on every lane this controller has running or has not yet handed off. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
     ...workspace,
@@ -162,6 +165,46 @@ export const TOOLS = [
     response: { type: 'object', description: 'Structured response for a question or elicitation.', additionalProperties: true },
     scope: string('Permission grant scope.', { enum: ['turn', 'session'] }),
   }, ['workspace_path', 'feature', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
+
+  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane or of the integration build, in a clean runtime-owned clone, and record its verdict, output tail and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
+    ...workspace,
+    suite: suite('Suite to run.'),
+    target: target,
+    revision: string('Optional branch, tag or commit in the target checkout.'),
+  }, ['workspace_path', 'suite', 'target']), { destructiveHint: false }),
+
+  tool('lab_get', 'Inspect the lab', 'List the lab suites, recent runs and the current integration build; return one run in full with its output and artifacts; and list findings.', object({
+    ...workspace,
+    run: string('Run id to return in full.'),
+    suite: suite('Only list runs of this suite.'),
+    target: { ...target, description: 'Only list runs and findings for this lane, or integration.' },
+    findings: string('Include findings: open, or all.', { enum: ['open', 'all'] }),
+    limit: integer('Recent runs to list; defaults to 10.', 1, 50),
+  }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+
+  tool('finding_record', 'Record a finding', 'Create a finding on a lane, or update one by id; omitted fields keep their saved values. A new or reopened finding is sent to the lane agent as a message saying how to reproduce it.', object({
+    ...workspace,
+    ...feature,
+    id: string('Existing finding id to update.'),
+    title: string('Short statement of the defect; required for a new finding.'),
+    body: string('Observed versus expected behavior and the evidence; required for a new finding.'),
+    severity: string('blocking (the default) prevents integrating the lane; minor does not.', { enum: ['blocking', 'minor'] }),
+    repro_suite: suite('Lab suite that reproduces the finding; a passing lab_run of it on this lane resolves it.'),
+    status: string('Finding state.', { enum: ['open', 'resolved', 'wontfix'] }),
+    note: string('Why the finding changed.'),
+  }, ['workspace_path', 'feature']), { destructiveHint: false }),
+
+  tool('integration_build', 'Build an integration', 'Reset the runtime-owned integration clone to base and merge the listed lanes in order. A lane contributes a snapshot of its working tree, or slug@ref an exact revision. Stops at the first conflict and leaves it in place for resolution.', object({
+    ...workspace,
+    features: { type: 'array', minItems: 1, maxItems: 50, items: string('Lane slug, or slug@ref.') },
+    base: string('Optional base ref. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
+  }, ['workspace_path', 'features']), { destructiveHint: false, openWorldHint: true }),
+
+  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains, then mark those lanes done. Never pushes. For an adopted repository it changes nothing and returns the commit to publish with the user’s authority.', object({
+    ...workspace,
+    target: target,
+    revision: string('Optional exact revision. Defaults to the HEAD of a clean lane, or of the integration clone.'),
+  }, ['workspace_path', 'target']), { destructiveHint: false }),
 ];
 
 const handlers = {
@@ -182,6 +225,11 @@ const handlers = {
   agent_steer: steerFeatureAgent,
   agent_interrupt: interruptFeatureAgent,
   agent_request_resolve: resolveFeatureAgentRequest,
+  lab_run: runLabSuite,
+  lab_get: getLab,
+  finding_record: recordFinding,
+  integration_build: buildIntegration,
+  integrate,
 };
 
 export async function callTool(name, args) {
