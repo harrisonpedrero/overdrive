@@ -165,6 +165,7 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 - Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
 - Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible; it notifies the owning lane. Retest fixes.
 - Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send. A conflict you resolve and commit in the integration clone is replayed on later builds.
+- Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build to \`qa\` unless the coordinator assigns it to you.
 - Test a lane when it reports ready. Once one commit combines every lane you are verifying (an integration build, or a lane that merged the others), run your suites on that commit instead of on each lane again; go back to a lane head only to localize a failure.
 - ${LOCAL_SERVERS}
 - ${MESSAGES}
@@ -575,6 +576,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Start every service a suite needs within the run, and stop it before the run ends.
 - Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
+- Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
 - Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
 `;

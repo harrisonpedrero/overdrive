@@ -625,9 +625,17 @@ export class ClaudeWorkerBridge extends EventEmitter {
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
           turn.text.push(block.text);
           this.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: meta.id, turnId: turn.id, delta: `${block.text}\n` } });
-        } else if (block?.type === 'tool_use' && EDITING_TOOLS.has(block.name)) {
-          this.#scheduleDiff(meta, turn);
+        } else if (block?.type === 'tool_use') {
+          this.emit('notification', { method: 'item/started', params: { threadId: meta.id, turnId: turn.id, startedAtMs: Date.now(), item: { id: block.id, type: 'toolCall', tool: block.name, summary: block.input?.description ?? block.input?.command } } });
+          if (EDITING_TOOLS.has(block.name)) this.#scheduleDiff(meta, turn);
         }
+      }
+      return;
+    }
+    // Only which call returned is forwarded, never its result.
+    if (message.type === 'user') {
+      for (const block of message.message?.content ?? []) {
+        if (block?.type === 'tool_result') this.emit('notification', { method: 'item/completed', params: { threadId: meta.id, turnId: turn.id, completedAtMs: Date.now(), item: { id: block.tool_use_id, type: 'toolCall' } } });
       }
       return;
     }

@@ -36,6 +36,15 @@ const DELIVERY_RETRY_MS = 60_000;
 // Where a steer cannot reach the agent now, the message waits in its inbox instead.
 const QUEUED_WHEN = new Set(['INVALID_TRANSITION', 'DISPATCH_UNCERTAIN', 'AGENT_OWNED', 'TURN_MISMATCH']);
 
+// Tool items whose running call is shown, with the label each gets; their results are never read.
+const TOOL_LABELS = new Map([
+  ['commandExecution', item => item.command],
+  ['mcpToolCall', item => `${item.server}.${item.tool}`],
+  ['dynamicToolCall', item => item.tool],
+  ['toolCall', item => [item.tool, item.summary].filter(Boolean).join(': ')],
+]);
+const toolLabel = item => redactString(String(TOOL_LABELS.get(item.type)(item) ?? '')).replace(/\s+/g, ' ').slice(0, 120);
+
 const messageText = message => `Message from ${message.from_agent} (${message.created_at}):\n${message.body}`;
 const messageBlock = messages => messages.map(messageText).join('\n\n');
 const reportDeliveryFailure = error => process.stderr.write(`[overdrive] message delivery failed: ${redactString(error.message)}\n`);
@@ -48,6 +57,8 @@ const registrations = new Map();
 const turnMessages = new Map();
 const turnDiffs = new Map();
 const turnPlans = new Map();
+// Per turn, the tool calls started and not yet returned, in memory only.
+const turnTools = new Map();
 const completedTurns = new Set();
 const deliveryRetry = new Map();
 let notificationQueue = Promise.resolve();
@@ -70,6 +81,8 @@ function register(threadId, workspacePath, feature, handoffPending = null) {
   registrations.set(threadId, { workspacePath, feature, handoffPending });
   scheduleSweep();
 }
+
+const runningTools = turnId => [...(turnTools.get(turnId)?.values() ?? [])].map(({ tool, startedAt }) => ({ tool, runningSeconds: Math.round((Date.now() - startedAt) / 1000) }));
 
 function textInput(text) {
   return [{ type: 'text', text, text_elements: [] }];
@@ -165,6 +178,11 @@ async function onNotification({ method, params }) {
     turnPlans.set(params.turnId, safePayload({ explanation: params.explanation, steps: params.plan }));
     return;
   }
+  if ((method === 'item/started' || method === 'item/completed') && TOOL_LABELS.has(params.item?.type)) {
+    if (method === 'item/started') turnTools.set(params.turnId, (turnTools.get(params.turnId) ?? new Map()).set(params.item.id, { tool: toolLabel(params.item), startedAt: params.startedAtMs ?? Date.now() }));
+    else turnTools.get(params.turnId)?.delete(params.item.id);
+    return;
+  }
   if (method === 'turn/started') {
     registration.handoffPending = params.turn?.id ?? true;
     await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: params.turn?.id, status: 'running' });
@@ -188,6 +206,7 @@ async function onNotification({ method, params }) {
     turnMessages.delete(turnId);
     turnDiffs.delete(turnId);
     turnPlans.delete(turnId);
+    turnTools.delete(turnId);
     if (!saved.ignored && turnId) {
       completedTurns.add(completionKey);
       if (completedTurns.size > 256) completedTurns.delete(completedTurns.values().next().value);
@@ -210,6 +229,7 @@ bridge.on('exit', (error, threadIds = null) => {
     const base = { workspace_path: registration.workspacePath, feature: registration.feature, owner_token: ownerToken };
     const runtime = await featureRuntime({ ...base, allow_inactive: true }).catch(() => null);
     const feature = runtime?.feature;
+    turnTools.delete(feature?.active_turn_id);
     // A turn that may outlive its backend connection (a known active turn or a request that may
     // have been delivered) stays uncertain with its turn ID; the native session settles it later.
     const mayBeLive = Boolean(feature?.active_turn_id || ['starting', 'uncertain'].includes(feature?.agent_status));
@@ -223,6 +243,7 @@ bridge.on('exit', (error, threadIds = null) => {
     turnMessages.clear();
     turnPlans.clear();
     turnDiffs.clear();
+    turnTools.clear();
   }
   }).catch(() => {});
 });
@@ -508,7 +529,12 @@ async function deliverOwned(args, direction) {
     throw error.refused ? new OverdriveError(`Turn ${turnId} ended before the steer reached it.`, 'TURN_MISMATCH') : error;
   });
   await markDelivered({ ...inbox, messages, how: 'steer' }).catch(reportDeliveryFailure);
-  return { feature: runtime.feature.slug, threadId: runtime.feature.thread_id, turnId: result.turnId || turnId, harness: runtime.harness, mode: 'mid_turn' };
+  // The agent takes a steer in only once its running tool call returns.
+  const [behindTool] = runningTools(turnId);
+  return {
+    feature: runtime.feature.slug, threadId: runtime.feature.thread_id, turnId: result.turnId || turnId, harness: runtime.harness, mode: 'mid_turn',
+    ...(behindTool ? { behindTool, next: 'The agent reads this when that call returns; use agent_interrupt if it must stop sooner.' } : {}),
+  };
 }
 
 // Pending messages are delivered on a timer while this controller runs agents, and right after a
@@ -604,7 +630,17 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   }
   const context = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 30 });
   const turnId = context.feature.agent.activeTurnId;
-  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clipTail(turnMessages.get(turnId), 3_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
+  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clipTail(turnMessages.get(turnId), 3_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null, running: runningTools(turnId) }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
+}
+
+// On a timeout an agent is reported by where it stands, never by its previous handoff.
+function progressRow({ feature: { slug, status, agent }, git: { head, changedFileCount, unavailable }, liveProgress, warning }) {
+  return {
+    feature: { slug, status, agent: { status: agent.status, activeTurnId: agent.activeTurnId } },
+    git: { head, changedFileCount, unavailable },
+    liveProgress: { message: liveProgress.message && clipTail(liveProgress.message, 800), running: liveProgress.running },
+    ...(warning ? { warning } : {}),
+  };
 }
 
 // Without features, waits on this controller's registered lanes that are busy or whose turn it
@@ -663,16 +699,21 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
     const pending = new Map([...lanes()].map(([slug, lane]) => [slug, lane.handoffPending]));
     const handoffs = await Promise.all(selected.map(async feature => {
       const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true });
+      if (!signal) return progressRow(state);
       return { feature: state.feature, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
     }));
     // A lane handed off at rest is done until its next turn; one started during this wait stays pending.
+    // A timeout hands nothing off, so a turn that ends just after it is returned by the next wait.
     const current = lanes();
     for (const { feature: { slug, agent } } of handoffs) {
       const lane = current.get(slug);
-      if (lane && lane.handoffPending === pending.get(slug) && !agentBusy({ active_turn_id: agent.activeTurnId, agent_status: agent.status })) lane.handoffPending = null;
+      if (signal && lane && lane.handoffPending === pending.get(slug) && !agentBusy({ active_turn_id: agent.activeTurnId, agent_status: agent.status })) lane.handoffPending = null;
     }
     const messages = await takeCoordinatorMessages({ workspace_path: root });
-    return { timedOut: !signal, handoffs, messages, nextAction: 'Reconcile completed or decision-ready handoffs and coordinator messages now, advance authorized next actions, and wait only on remaining unreconciled work. This wait does not wake an ended coordinator turn.' };
+    const nextAction = signal
+      ? 'Reconcile completed or decision-ready handoffs and coordinator messages now, advance authorized next actions, and wait only on remaining unreconciled work.'
+      : 'The wait timed out. Each row shows only where its agent stands; agent_inspect returns an agent\'s full state, and the next wait returns any turn that has since ended.';
+    return { timedOut: !signal, handoffs, messages, nextAction: `${nextAction} This wait does not wake an ended coordinator turn.` };
   } finally {
     clearInterval(poll);
     inbox.close();

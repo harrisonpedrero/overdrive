@@ -114,10 +114,12 @@ export async function resetIntegration(root, base, baseSource, builtHead = null)
   return clone;
 }
 
-// Returns the conflicted paths; a conflicted merge stays in place for an agent to resolve.
+// Returns the conflicted paths; a conflicted merge stays in place for an agent to resolve. A lane
+// that already contains the build so far is fast-forwarded, so its tested commit stays the head;
+// an explicit --ff overrides a user's merge.ff setting.
 export async function mergeIntoIntegration(root, clone, source, commit, message) {
   await fetchCommit(clone, source, commit);
-  const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--no-ff', '--no-edit', '-m', message, commit], { cwd: clone, env: automationEnv(), allowFailure: true });
+  const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--ff', '--no-edit', '-m', message, commit], { cwd: clone, env: automationEnv(), allowFailure: true });
   if (merged.exitCode === 0) return [];
   const conflicts = (await run(['git', 'diff', '--name-only', '-z', '--diff-filter=U'], { cwd: clone })).stdout.split('\0').filter(Boolean);
   if (conflicts.length) return conflicts;

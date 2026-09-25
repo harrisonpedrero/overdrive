@@ -110,8 +110,8 @@ Feature agents may read the lab and run suites against their own lane only. QA a
 
 **Stuck agents.**
 
-- `agent_inspect` shows safe progress, the live diff and pending requests.
-- `agent_steer` redirects the running turn.
+- `agent_inspect` shows safe progress, the tool calls still running, the live diff and pending requests.
+- `agent_steer` redirects the running turn. The agent reads it when its current tool call returns, which `behindTool` names.
 - `agent_interrupt` stops the turn and keeps the session and checkout.
 - `feature_update {status: "paused"}` stops the worker and holds further dispatch.
 - `agent_start` with `force_new_session: true` starts a fresh session, and is required when an old session has no recorded harness (`SESSION_OWNER_UNKNOWN`).

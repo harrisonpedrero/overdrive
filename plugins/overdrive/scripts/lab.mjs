@@ -166,7 +166,7 @@ async function integrationStatus(ctx) {
   const included = (await integratedLanes(ctx, clone, head)).map(lane => lane.slug);
   const conflictFiles = (await git(clone, 'diff', '--name-only', '--diff-filter=U')).stdout.split('\n').filter(Boolean);
   return {
-    base: built.base, head, built_at: built.built_at, included,
+    base: built.base, head, built_at: built.built_at, path: clone, included,
     pending: built.features.map(lane => lane.slug).filter(slug => !included.includes(slug)),
     ...(conflictFiles.length ? { conflictFiles } : {}),
   };
@@ -425,8 +425,9 @@ async function integrationTarget(ctx, requested) {
 async function markLanesDone(ctx, lanes, summary, details) {
   const stamp = now();
   transaction(ctx.db, () => {
-    const done = ctx.db.prepare("UPDATE features SET status = 'done', updated_at = ? WHERE slug = ? AND status <> 'archived'");
-    for (const slug of lanes) done.run(stamp, slug);
+    // The agent's last handoff stays in the timeline; the lane summary says where its work went.
+    const done = ctx.db.prepare("UPDATE features SET status = 'done', summary = ?, next_action = '', updated_at = ? WHERE slug = ? AND status <> 'archived'");
+    for (const slug of lanes) done.run(summary, stamp, slug);
   });
   for (const slug of lanes) {
     await addEvent(ctx, { featureId: featureId(ctx.db, slug), kind: 'lab.integrated', summary, details });

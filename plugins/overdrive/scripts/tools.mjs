@@ -175,7 +175,7 @@ export const TOOLS = [
     scope: string('Permission grant scope.', { enum: ['turn', 'session'] }),
   }, ['workspace_path', 'agent', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('agents_wait', 'Receive the next handoff', 'Wait for a turn completion or input request from agents, or a message to the coordinator. Without agents, waits on every agent this controller has running or has not yet handed off. Completion or input on any agent returns promptly for coordinator review, together with any coordinator messages; an unrelated running agent does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
+  tool('agents_wait', 'Receive the next handoff', 'Wait for a turn completion or input request from agents, or a message to the coordinator. Without agents, waits on every agent this controller has running or has not yet handed off. Completion or input on any agent returns promptly for coordinator review, together with any coordinator messages; an unrelated running agent does not hold the handoff. On a timeout, each agent gets a short progress row; agent_inspect returns the full state. This only drives active coordination, not host wakeups after a turn ends.', object({
     ...workspace,
     agents: { type: 'array', minItems: 1, uniqueItems: true, items: string('Lane slug or QA agent name still awaiting reconciliation; omit already handled idle agents.') },
     timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
