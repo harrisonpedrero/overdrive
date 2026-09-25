@@ -105,6 +105,9 @@ export async function resetIntegration(root, base, baseSource, builtHead = null)
     if (!clean) throw new OverdriveError(`The integration clone ${clone} has uncommitted changes, such as an unfinished conflict resolution. Commit them there, or discard them yourself (git merge --abort ends a pending merge); OVERDRIVE never discards them.`, 'INTEGRATION_DIRTY', { path: clone });
     if (head !== builtHead && head !== base) await git(clone, 'update-ref', `refs/overdrive/integration/${head}`, head);
   }
+  // rerere replays conflict resolutions an agent committed here, so a rebuild does not redo them.
+  await git(clone, 'config', 'rerere.enabled', 'true');
+  await git(clone, 'config', 'rerere.autoupdate', 'true');
   await fetchCommit(clone, baseSource, base);
   // A fresh --no-checkout clone has an empty index, which only a forced checkout populates.
   await run(['git', ...runtimeGitConfig(root), 'checkout', '--detach', ...(fresh ? ['-f'] : []), base], { cwd: clone });
@@ -117,8 +120,13 @@ export async function mergeIntoIntegration(root, clone, source, commit, message)
   const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--no-ff', '--no-edit', '-m', message, commit], { cwd: clone, env: automationEnv(), allowFailure: true });
   if (merged.exitCode === 0) return [];
   const conflicts = (await run(['git', 'diff', '--name-only', '-z', '--diff-filter=U'], { cwd: clone })).stdout.split('\0').filter(Boolean);
-  if (!conflicts.length) throw new OverdriveError(`Merging ${commit} into the integration clone failed: ${(merged.stderr || merged.stdout).slice(-4_000)}`, 'INTEGRATION_FAILED');
-  return conflicts;
+  if (conflicts.length) return conflicts;
+  if (await exists(path.join(clone, '.git', 'MERGE_HEAD'))) {
+    // rerere resolved every conflict from a recorded resolution; conclude the merge it describes.
+    await run(['git', ...runtimeGitConfig(root), 'commit', '--no-edit'], { cwd: clone, env: automationEnv() });
+    return [];
+  }
+  throw new OverdriveError(`Merging ${commit} into the integration clone failed: ${(merged.stderr || merged.stdout).slice(-4_000)}`, 'INTEGRATION_FAILED');
 }
 
 async function assertFullRepository(repository) {

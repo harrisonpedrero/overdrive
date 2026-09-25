@@ -131,6 +131,7 @@ async function ensureWorkspaceFiles(root, config) {
 }
 
 const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only (binding all interfaces triggers firewall prompts on the user\'s machine), and stop it before your turn ends.';
+const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
 
 function agentFiles(root, slug) {
   return `Before each turn, read ${contained(root, STATE_DIR, 'features', slug, 'context.md')} and ${contained(root, STATE_DIR, 'features', slug, 'spec.md')}; treat them as read-only. The context packet holds your work graph. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key.`;
@@ -144,8 +145,9 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions.
 - Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
 - Do not add or expand test suites in the product repository unless the spec asks for it: QA owns testing in a decoupled lab. You may run existing repository checks for quick feedback.
-- Commit your work on the lane branch with clear messages.
+- Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
+- ${MESSAGES}
 - No browser or computer use. When a change is ready to test, or you need a behavior verified, send \`qa\` a message saying what changed and what to test.
 - Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
 - Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
@@ -162,8 +164,9 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 - Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. The lab README describes the suite format.
 - Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
 - Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible, send them to the owning lane with message_send, and retest fixes.
-- Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send.
+- Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - ${LOCAL_SERVERS}
+- ${MESSAGES}
 - Never edit product code in lane checkouts; resolving a conflict in the integration clone is allowed.
 - Commit lab changes to the lab repository. Never publish anything without the user's authority, which comes through the coordinator.
 - lanes shows every lane with its checkout path, head and open findings.

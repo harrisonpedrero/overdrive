@@ -157,6 +157,21 @@ async function integratedLanes(ctx, clone, commit) {
   return lanes;
 }
 
+// The recorded build is where the clone started; an agent may since have resolved and committed a conflict.
+async function integrationStatus(ctx) {
+  const built = parseJson(meta(ctx.db, 'integration'), null);
+  const clone = integrationPath(ctx.root);
+  if (!built || !await exists(path.join(clone, '.git'))) return built;
+  const head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
+  const included = (await integratedLanes(ctx, clone, head)).map(lane => lane.slug);
+  const conflictFiles = (await git(clone, 'diff', '--name-only', '--diff-filter=U')).stdout.split('\n').filter(Boolean);
+  return {
+    base: built.base, head, built_at: built.built_at, included,
+    pending: built.features.map(lane => lane.slug).filter(slug => !included.includes(slug)),
+    ...(conflictFiles.length ? { conflictFiles } : {}),
+  };
+}
+
 // A pass resolves a finding only at a revision that contains the one it was found at and is not
 // part of the failing run's revision, such as the HEAD under a snapshot whose uncommitted change failed.
 async function resolvableFindings(ctx, repository, suite, features, commit) {
@@ -251,7 +266,7 @@ export async function getLab({ workspace_path, run: runId, suite, target, findin
       suites: await listSuites(ctx.root, lab),
       runs: ctx.db.prepare('SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) ORDER BY created_at DESC LIMIT 10')
         .all(suiteFilter, suiteFilter, targetFilter, targetFilter),
-      integration: parseJson(meta(ctx.db, 'integration'), null),
+      integration: await integrationStatus(ctx),
     };
     if (findings) {
       result.findings = ctx.db.prepare("SELECT * FROM findings WHERE (? = 'all' OR status = 'open') AND (? IS NULL OR feature = ?) ORDER BY created_at DESC LIMIT 200")
