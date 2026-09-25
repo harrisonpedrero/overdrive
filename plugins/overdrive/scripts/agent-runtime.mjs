@@ -1,8 +1,8 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
-import { summarizePatch, OverdriveError, parseJsonObject, requiredText, redactString } from './util.mjs';
-import { adoptAgentObservation, withAgentControl, withLaneStop } from './ownership.mjs';
+import { summarizePatch, OverdriveError, parseJsonObject, requiredText, redactString, resolveWorkspace } from './util.mjs';
+import { adoptAgentObservation, agentBusy, withAgentControl, withLaneStop } from './ownership.mjs';
 import { workerJobState } from './process-tree.mjs';
 import {
   attestDescendantsStopped,
@@ -11,7 +11,6 @@ import {
   featureRuntime,
   featureUpdateInput,
   getFeatureContext,
-  markCompacted,
   markDescendantsUnconfirmed,
   pendingAgentRequest,
   readUnconfirmedDescendants,
@@ -24,7 +23,6 @@ import {
   saveAgentSession,
   savePendingAgentRequest,
   updateStoppedFeature,
-  queueCompaction,
 } from './workspace.mjs';
 
 // stopSettleMs bounds how long a pause or archive waits for an interrupted turn to be recorded as ended.
@@ -35,11 +33,7 @@ const turnMessages = new Map();
 const turnDiffs = new Map();
 const turnPlans = new Map();
 const completedTurns = new Set();
-const compactionWaiters = new Map();
-const compactionTurns = new Set();
-const recordedCompactions = new Set();
 let notificationQueue = Promise.resolve();
-let shuttingDown = false;
 
 function enqueueStateWork(work) {
   const next = notificationQueue.then(work);
@@ -49,11 +43,11 @@ function enqueueStateWork(work) {
   return next;
 }
 
-function register(threadId, workspacePath, feature) {
+function register(threadId, workspacePath, feature, handoffPending = null) {
   for (const [registeredThreadId, registration] of registrations) {
     if (registration.workspacePath === workspacePath && registration.feature === feature) registrations.delete(registeredThreadId);
   }
-  registrations.set(threadId, { workspacePath, feature });
+  registrations.set(threadId, { workspacePath, feature, handoffPending });
 }
 
 function textInput(text) {
@@ -74,34 +68,6 @@ function safePayload(value, key = '') {
     return Object.fromEntries(Object.entries(value).slice(0, 100).map(([entryKey, entryValue]) => [entryKey, safePayload(entryValue, entryKey)]));
   }
   return value;
-}
-
-function settleCompaction(threadId) {
-  const waiter = compactionWaiters.get(threadId);
-  if (!waiter?.compacted || !waiter.turnCompleted) return;
-  clearTimeout(waiter.timer);
-  compactionWaiters.delete(threadId);
-  waiter.resolve();
-}
-
-async function recordCompaction(base, threadId, turnId) {
-  const key = `${threadId}:${turnId || 'unknown'}`;
-  const waiter = compactionWaiters.get(threadId);
-  if (!recordedCompactions.has(key)) {
-    recordedCompactions.add(key);
-    if (recordedCompactions.size > 256) recordedCompactions.delete(recordedCompactions.values().next().value);
-    try {
-      await markCompacted({ ...base, thread_id: threadId });
-    } catch (error) {
-      recordedCompactions.delete(key);
-      waiter?.reject(error);
-      throw error;
-    }
-  }
-  if (waiter) {
-    waiter.compacted = true;
-    settleCompaction(threadId);
-  }
 }
 
 function requestSummary(method, params) {
@@ -171,23 +137,9 @@ async function onNotification({ method, params }) {
     turnPlans.set(params.turnId, safePayload({ explanation: params.explanation, steps: params.plan }));
     return;
   }
-  if (method === 'item/started' && params.item?.type === 'contextCompaction') {
-    compactionTurns.add(params.turnId);
-    return;
-  }
-  if (method === 'item/completed' && params.item?.type === 'contextCompaction') {
-    compactionTurns.add(params.turnId);
-    await recordCompaction(base, params.threadId, params.turnId);
-    return;
-  }
   if (method === 'turn/started') {
-    if (compactionWaiters.has(params.threadId)) compactionTurns.add(params.turn?.id);
+    registration.handoffPending = params.turn?.id ?? true;
     await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: params.turn?.id, status: 'running' });
-    return;
-  }
-  if (method === 'thread/compacted') {
-    compactionTurns.add(params.turnId);
-    await recordCompaction(base, params.threadId, params.turnId);
     return;
   }
   if (method === 'turn/completed') {
@@ -197,25 +149,6 @@ async function onNotification({ method, params }) {
     if (turnId && completedTurns.has(completionKey)) return;
     // Recorded before the turn's end, so no reader sees the lane stopped without the marker.
     if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, thread_id: params.threadId, turn_id: turnId ?? null, summary: descendantsSummary(turnId) });
-    if (compactionTurns.has(turnId) && compactionWaiters.has(params.threadId)) {
-      compactionTurns.delete(turnId);
-      await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: null, status: ['failed', 'interrupted'].includes(turn.status) ? turn.status : 'idle' });
-      if (['failed', 'interrupted'].includes(turn.status)) {
-        const waiter = compactionWaiters.get(params.threadId);
-        if (waiter) {
-          clearTimeout(waiter.timer);
-          compactionWaiters.delete(params.threadId);
-          waiter.reject(new OverdriveError(`Thread compaction ${turn.status}: ${params.threadId}`, 'COMPACTION_FAILED'));
-        }
-      } else {
-        const waiter = compactionWaiters.get(params.threadId);
-        if (waiter) {
-          waiter.turnCompleted = true;
-          settleCompaction(params.threadId);
-        }
-      }
-      return;
-    }
     const visible = redactString(clip(finalVisibleMessage(turn) || turnMessages.get(turnId) || `Agent turn ${turn.status || 'completed'}.`));
     const diff = turnDiffs.get(turnId);
     const plan = turnPlans.get(turnId);
@@ -226,15 +159,9 @@ async function onNotification({ method, params }) {
     turnMessages.delete(turnId);
     turnDiffs.delete(turnId);
     turnPlans.delete(turnId);
-    compactionTurns.delete(turnId);
-    if (saved.ignored) return;
-    if (turnId) {
+    if (!saved.ignored && turnId) {
       completedTurns.add(completionKey);
       if (completedTurns.size > 256) completedTurns.delete(completedTurns.values().next().value);
-    }
-    const runtime = await featureRuntime({ ...base, allow_inactive: true });
-    if (!shuttingDown && runtime.feature.compaction_pending && status === 'idle') {
-      setTimeout(() => { if (!shuttingDown) void compactFeatureAgent(base).catch(error => process.stderr.write(`[overdrive] deferred compaction: ${redactString(error.message)}\n`)); }, 0);
     }
   }
 }
@@ -247,12 +174,6 @@ bridge.on('exit', (error, threadIds = null) => {
   notificationQueue = notificationQueue.then(async () => {
   // A backend exit only affects the threads it owned; other harness lanes keep running.
   const affected = threadIds ? threadIds.filter(threadId => registrations.has(threadId)) : [...registrations.keys()];
-  for (const [threadId, waiter] of compactionWaiters) {
-    if (threadIds && !threadIds.includes(threadId)) continue;
-    clearTimeout(waiter.timer);
-    compactionWaiters.delete(threadId);
-    waiter.reject(error);
-  }
   for (const threadId of affected) {
     const registration = registrations.get(threadId);
     registrations.delete(threadId);
@@ -272,7 +193,6 @@ bridge.on('exit', (error, threadIds = null) => {
     turnMessages.clear();
     turnPlans.clear();
     turnDiffs.clear();
-    compactionTurns.clear();
   }
   }).catch(() => {});
 });
@@ -289,26 +209,6 @@ function harnessParams(runtime) {
 function runPrompt(runtime, instruction) {
   const direction = instruction || runtime.feature.next_action || 'Choose and complete the highest-priority ready work.';
   return `Continue the ${runtime.feature.slug} feature lane.\n\nUser/coordinator direction:\n${direction}\n\nFirst load the feature context and spec named in your developer instructions, then inspect current Git state. Reconcile the request with the durable work graph. Work toward the smallest coherent verified result; do not silently broaden scope. Keep visible progress updates safe and concise. End with a handoff containing the exact resulting revision or dirty-state description, checks actually run and their outcomes, unresolved issues, and the next useful action. Do not include private chain-of-thought.`;
-}
-
-async function compactThreadAndWait(runtime) {
-  const threadId = runtime.feature.thread_id;
-  if (compactionWaiters.has(threadId)) throw new OverdriveError(`Compaction is already running for ${threadId}.`, 'COMPACTION_ACTIVE');
-  let resolve;
-  let reject;
-  const completion = new Promise((onResolve, onReject) => {
-    resolve = onResolve;
-    reject = onReject;
-  });
-  const timer = setTimeout(() => reject(new OverdriveError(`Timed out waiting for thread compaction: ${threadId}`, 'CODEX_TIMEOUT')), 180_000);
-  compactionWaiters.set(threadId, { resolve, reject, timer, compacted: false, turnCompleted: false });
-  try {
-    await Promise.all([bridge.request('thread/compact/start', { threadId, harness: runtime.harness }), completion]);
-  } catch (error) {
-    clearTimeout(timer);
-    compactionWaiters.delete(threadId);
-    throw error;
-  }
 }
 
 // featureRuntime names the harness that owns the saved session; without one, the session
@@ -333,7 +233,8 @@ async function resume(runtime) {
   const params = sessionParams(runtime);
   if (registrations.has(runtime.feature.thread_id)) return await bridge.updateThread?.(params);
   const response = await bridge.resumeThread(params);
-  register(runtime.feature.thread_id, runtime.root, runtime.feature.slug);
+  // A turn adopted while it may be running awaits hand-off like one this controller started.
+  register(runtime.feature.thread_id, runtime.root, runtime.feature.slug, agentBusy(runtime.feature) ? runtime.feature.active_turn_id ?? true : null);
   return response;
 }
 
@@ -384,7 +285,7 @@ function priorTurnAttestation(value) {
   return { evidence: redactString(requiredText(value.evidence, 'prior_turn_attestation.evidence', { max: 4_000 })) };
 }
 
-const UNCERTAIN_NEXT = 'Inspect the lane. If you can verify under your existing authority that no worker from that request is still running for this lane (for example by checking the worker processes for its checkout), call agent_start with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline. Until then no turn is dispatched.';
+const ATTEST_NEXT = 'If you verify under your existing authority that no worker or tool process for this lane is running (for example by checking the processes whose working directory is its checkout), pass prior_turn_attestation: { evidence } describing what you checked to agent_start, or to feature_update when pausing or archiving; it is recorded in the timeline.';
 
 // A turn request without a confirmed outcome may have started a turn, so no new work is
 // dispatched until the owning native session shows whether it did. This also holds after the
@@ -409,7 +310,7 @@ async function reconcileDispatch(runtime, attestation = null) {
   await settleUncertain(runtime, thread, attestation);
   if (runtime.feature.agent_status !== 'uncertain') return;
   const reason = unreadable ? `its native session could not be read (${unreadable})` : 'its native history is not available in this controller';
-  throw new OverdriveError(`The last turn request for ${runtime.feature.slug} has no confirmed outcome and ${reason}, so no new turn was started. ${UNCERTAIN_NEXT}`, 'DISPATCH_UNCERTAIN');
+  throw new OverdriveError(`The last turn request for ${runtime.feature.slug} has no confirmed outcome and ${reason}, so no new turn was started. ${ATTEST_NEXT}`, 'DISPATCH_UNCERTAIN');
 }
 
 // Clears durable worker guards whose containment job no longer exists or holds no process: once
@@ -421,7 +322,20 @@ async function recoverWorkerGuards(args) {
   }
 }
 
-const WORKERS_NEXT = 'Wait for them to stop or pause the lane, which stops a process tree this controller holds. If you verify under your existing authority that no process for this lane is running (for example by checking the processes whose working directory is its checkout), retry with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline.';
+// Waits for or stops a worker process that an ended turn of this bridge left running. Tools it may
+// have left behind are recorded as unconfirmed descendants before the error is rethrown.
+async function settleLingeringWorker(base, threadId) {
+  try {
+    const settled = await bridge.settleThread?.({ threadId });
+    if (settled?.treeStoppedGuardId) await clearWorkerGuards({ ...base, guard_id: settled.treeStoppedGuardId });
+  } catch (error) {
+    if (error.code === 'CLAUDE_DESCENDANTS_UNCONFIRMED') {
+      const recorded = await enqueueStateWork(() => markDescendantsUnconfirmed({ ...base, thread_id: threadId, turn_id: error.details?.turnId ?? null, summary: redactString(error.message) }));
+      if (!recorded.ignored) bridge.acknowledgeDescendants?.({ threadId, turnId: error.details?.turnId });
+    }
+    throw error;
+  }
+}
 
 // Before a new turn, settle trees this bridge holds and clear only guards whose jobs ended.
 // An attestation covers only prior records and never a job that still exists.
@@ -429,16 +343,9 @@ async function assertWorkersSettled(runtime, attestation) {
   const args = { workspace_path: runtime.root, feature: runtime.feature.slug };
   const priorGeneration = (await readUnconfirmedDescendants(args))?.generation ?? null;
   const priorGuards = new Set((await readWorkerGuards(args)).map(guard => guard.id));
-  const threadId = runtime.feature.thread_id;
-  if (threadId) {
-    try {
-      const settled = await bridge.settleThread?.({ threadId });
-      if (settled?.treeStoppedGuardId) await clearWorkerGuards({ ...args, guard_id: settled.treeStoppedGuardId });
-    } catch (error) {
-      if (error.code !== 'CLAUDE_DESCENDANTS_UNCONFIRMED') throw error;
-      const recorded = await enqueueStateWork(() => markDescendantsUnconfirmed({ ...args, owner_token: ownerToken, thread_id: threadId, turn_id: error.details?.turnId ?? null, summary: redactString(error.message) }));
-      if (!recorded.ignored) bridge.acknowledgeDescendants?.({ threadId, turnId: error.details?.turnId });
-    }
+  if (runtime.feature.thread_id) {
+    try { await settleLingeringWorker({ ...args, owner_token: ownerToken }, runtime.feature.thread_id); }
+    catch (error) { if (error.code !== 'CLAUDE_DESCENDANTS_UNCONFIRMED') throw error; }
   }
   // Clean-exit reports the settlement produced are applied first.
   await notificationQueue;
@@ -454,7 +361,7 @@ async function assertWorkersSettled(runtime, attestation) {
   }
   if (!marker && !guards.length) return;
   const reason = marker ? marker.summary : `${guards.length} worker process tree(s) from earlier turns of this lane have no confirmed exit, so tools they launched may still be running.`;
-  throw new OverdriveError(`No turn was started for ${runtime.feature.slug}: ${reason} ${WORKERS_NEXT}`, 'WORKERS_UNCONFIRMED', { workerGuards: guards.length, descendantsUnconfirmed: Boolean(marker) });
+  throw new OverdriveError(`No turn was started for ${runtime.feature.slug}: ${reason} Wait for them to stop, or pause the lane, which stops a process tree this controller holds. ${ATTEST_NEXT}`, 'WORKERS_UNCONFIRMED', { workerGuards: guards.length, descendantsUnconfirmed: Boolean(marker) });
 }
 
 async function dispatchTurn(runtime, threadId, instruction, effort, created = false) {
@@ -462,7 +369,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   const guardId = runtime.harness === 'claude' ? randomUUID() : null;
   const previous = runtime.feature;
   await enqueueStateWork(() => created
-    ? bindAgentSession({ ...base, harness: runtime.harness, expected_thread_id: previous.thread_id ?? null, compacted: previous.compaction_pending })
+    ? bindAgentSession({ ...base, harness: runtime.harness, expected_thread_id: previous.thread_id ?? null })
     : saveAgentSession({ ...base, status: 'starting' }));
   try {
     if (guardId && (await registerWorkerGuard({ ...base, guard_id: guardId })).ignored) throw new OverdriveError('The Claude worker guard could not be recorded for this session.', 'AGENT_OWNED');
@@ -490,7 +397,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
     await enqueueStateWork(async () => {
       // A replacement that never ran a turn is abandoned and the previous binding kept.
       if (created && !(await releaseAgentSession({
-        ...base, previous_thread_id: previous.thread_id ?? null, previous_harness: previous.thread_harness ?? null, compaction_pending: previous.compaction_pending,
+        ...base, previous_thread_id: previous.thread_id ?? null, previous_harness: previous.thread_harness ?? null,
         summary: previous.thread_id ? `${summary} Kept native session ${previous.thread_id}.` : summary,
       })).ignored) return;
       await saveAgentSession({ ...base, status: 'failed', summary });
@@ -500,7 +407,6 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
 }
 
 async function startOwned({ workspace_path, feature, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }, direction) {
-  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new OverdriveError('Unsupported reasoning effort.', 'INVALID_INPUT');
   const attestation = priorTurnAttestation(prior_turn_attestation);
   const runtime = await featureRuntime({ workspace_path, feature, force_new_session });
   if (!runtime.feature.spec_revision) throw new OverdriveError('Save a concrete feature specification before starting its agent.', 'SPEC_REQUIRED');
@@ -512,9 +418,6 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
   let created = false;
   if (threadId && !force_new_session) {
     await resume(runtime);
-    if (runtime.feature.compaction_pending) {
-      await compactThreadAndWait(runtime);
-    }
   } else {
     const started = await bridge.startThread({
       ...harnessParams(runtime),
@@ -560,9 +463,6 @@ async function steerOwned({ workspace_path, feature, effort = 'high' }, directio
     mode = 'mid_turn';
   } else {
     await assertWorkersSettled(runtime, null);
-    if (runtime.feature.compaction_pending) {
-      await compactThreadAndWait(runtime);
-    }
     result = await dispatchTurn(runtime, runtime.feature.thread_id, direction, effort);
     mode = 'new_turn';
   }
@@ -608,7 +508,7 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
         await settleUncertain(runtime, response.thread);
         if (runtime.feature.active_turn_id && !registrations.has(runtime.feature.thread_id)) await resume(runtime);
         if (runtime.feature.agent_status === 'uncertain') warning = response.thread.history === 'unavailable'
-          ? `The last turn request has no confirmed outcome and this session's history is not available here. ${UNCERTAIN_NEXT}`
+          ? `The last turn request has no confirmed outcome and this session's history is not available here, so no turn is dispatched. ${ATTEST_NEXT}`
           : 'The last turn request has no confirmed outcome; the next agent command reconciles it from the native session before doing anything else.';
       }
     } catch (error) {
@@ -616,7 +516,7 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
     }
   }
   // A guard whose recorded job proves its tree ended (for example after the controller holding it
-  // exited before recording the exit) is cleared here, so checks can proceed without a new turn.
+  // exited before recording the exit) is cleared here, without a new turn or a lifecycle change.
   // Guards whose tree may still run, or that have no job, stay.
   try {
     await recoverWorkerGuards({ workspace_path: runtime.root, feature: runtime.feature.slug });
@@ -625,18 +525,20 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   }
   const context = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 30 });
   const turnId = context.feature.agent.activeTurnId;
-  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clip(turnMessages.get(turnId), 6_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports; executed receipts remain the proof boundary.' };
+  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clip(turnMessages.get(turnId), 6_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
 }
 
-async function waitFeatureAgent({ workspace_path, feature, timeout_seconds = 30 }) {
-  const result = await waitFeatureAgents({ workspace_path, features: [feature], timeout_seconds });
-  return { timedOut: result.timedOut, ...result.handoffs[0] };
-}
-
+// Without features, waits on this controller's registered lanes that are busy or whose turn it
+// started or adopted has not yet been handed off, so a lane that finished between waits is still returned.
 async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 30 }) {
   if (!Number.isInteger(timeout_seconds) || timeout_seconds < 1 || timeout_seconds > 60) throw new OverdriveError('Wait duration must be 1–60 seconds.', 'INVALID_INPUT');
-  if (!Array.isArray(features) || !features.length || features.length > 8 || features.some(feature => typeof feature !== 'string') || new Set(features).size !== features.length) throw new OverdriveError('Supply 1–8 unique feature slugs.', 'INVALID_INPUT');
-  const runtimes = await Promise.all(features.map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true })));
+  if (features !== undefined && (!Array.isArray(features) || !features.length || features.some(feature => typeof feature !== 'string') || new Set(features).size !== features.length)) throw new OverdriveError('features must be a nonempty list of unique feature slugs.', 'INVALID_INPUT');
+  const root = await resolveWorkspace(workspace_path);
+  const lanes = () => new Map([...registrations.values()].filter(registration => registration.workspacePath === root).map(registration => [registration.feature, registration]));
+  const registered = lanes();
+  let runtimes = await Promise.all((features ?? [...registered.keys()]).map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true })));
+  if (!features) runtimes = runtimes.filter(runtime => registered.get(runtime.feature.slug).handoffPending || agentBusy(runtime.feature));
+  if (!runtimes.length) return { timedOut: false, handoffs: [], nextAction: 'No lane in this controller is running or awaiting handoff. Use feature_list for the latest lane state.' };
   const signalled = new Set();
   let timer;
   let finish;
@@ -660,6 +562,8 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
       }
     }
     await notificationQueue;
+    // Taken after adoption, which registers sessions this controller did not hold before.
+    const pending = new Map([...lanes()].map(([slug, lane]) => [slug, lane.handoffPending]));
     const initial = await Promise.all(runtimes.map(runtime => getFeatureContext({ workspace_path, feature: runtime.feature.slug, timeline_limit: 1 })));
     for (const state of initial) {
       if (!state.feature.agent.activeTurnId || state.pendingAgentRequests.length) signalled.add(state.feature.slug);
@@ -671,38 +575,18 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
       const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true });
       return { feature: state.feature, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
     }));
+    // A lane handed off at rest is done until its next turn; one started during this wait stays pending.
+    const current = lanes();
+    for (const { feature: { slug, agent } } of handoffs) {
+      const lane = current.get(slug);
+      if (lane && lane.handoffPending === pending.get(slug) && !agentBusy({ active_turn_id: agent.activeTurnId, agent_status: agent.status })) lane.handoffPending = null;
+    }
     return { timedOut: !signal, handoffs, nextAction: 'Reconcile completed or decision-ready handoffs now, advance authorized next actions, and wait only on remaining unreconciled work. This wait does not wake an ended coordinator turn.' };
   } finally {
     clearTimeout(timer);
     bridge.off('notification', notification);
     bridge.off('serverRequest', request);
   }
-}
-
-async function compactOwned({ workspace_path, feature }) {
-  const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true });
-  if (!runtime.feature.thread_id) return { compacted: false, reason: 'No feature task exists yet.' };
-  requireSessionOwner(runtime);
-  await reconcileDispatch(runtime);
-  await queueCompaction({ workspace_path, feature, owner_token: ownerToken });
-  if (runtime.feature.active_turn_id) return { compacted: false, queued: true, reason: `Turn ${runtime.feature.active_turn_id} is active; compaction will run when it finishes.` };
-  await bridge.ensureStarted();
-  await resume(runtime);
-  await enqueueStateWork(() => saveAgentSession({ workspace_path, feature, thread_id: runtime.feature.thread_id, owner_token: ownerToken, status: 'compacting' }));
-  try {
-    await compactThreadAndWait(runtime);
-  } catch (error) {
-    await enqueueStateWork(async () => {
-      const current = await featureRuntime({ workspace_path, feature, allow_inactive: true });
-      const base = { workspace_path, feature, thread_id: runtime.feature.thread_id, owner_token: ownerToken };
-      if (!current.feature.active_turn_id && current.feature.agent_status === 'compacting') {
-        await saveAgentSession({ ...base, status: 'failed' });
-      }
-      await recordAgentEvent({ ...base, kind: 'agent.compaction_failed', summary: `Compaction did not complete: ${redactString(error.message)}` });
-    });
-    throw error;
-  }
-  return { compacted: true, threadId: runtime.feature.thread_id, checkpoint: runtime.feature.summary };
 }
 
 async function interruptOwned({ workspace_path, feature }) {
@@ -764,8 +648,6 @@ async function stopUnconfirmed({ workspace_path, feature, lifecycle }, status, r
   await recordAgentEvent({ workspace_path, feature, kind: 'feature.stop_unconfirmed', summary: message, details: { requestedStatus: status, ...details } });
   return new OverdriveError(message, 'STOP_UNCONFIRMED', details);
 }
-
-const ATTEST_NEXT = 'If you can verify under your existing authority that no worker process for this lane is running (for example by checking the processes whose working directory is its checkout), retry with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline.';
 
 // Stops the active turn of a lane that is being paused or archived. Every path that cannot show
 // the turn has ended throws STOP_UNCONFIRMED.
@@ -831,15 +713,8 @@ async function stopForStatus({ prior_turn_attestation = undefined, ...args }, ro
   // A worker process that outlived its turn, such as one an earlier interrupt could not stop, is
   // still running work, so the lane is not stopped until the backend holding it sees it exit.
   if (row.thread_id) {
-    try {
-      const settled = await bridge.settleThread?.({ threadId: row.thread_id });
-      if (settled?.treeStoppedGuardId) await clearWorkerGuards({ ...args, guard_id: settled.treeStoppedGuardId });
-    }
+    try { await settleLingeringWorker({ workspace_path: args.workspace_path, feature: row.slug }, row.thread_id); }
     catch (error) {
-      if (error.code === 'CLAUDE_DESCENDANTS_UNCONFIRMED') {
-        const recorded = await enqueueStateWork(() => markDescendantsUnconfirmed({ workspace_path: args.workspace_path, feature: row.slug, thread_id: row.thread_id, turn_id: error.details?.turnId ?? null, summary: redactString(error.message) }));
-        if (!recorded.ignored) bridge.acknowledgeDescendants?.({ threadId: row.thread_id, turnId: error.details?.turnId });
-      }
       throw await stopUnconfirmed(lane, args.status, `a worker process from an earlier turn ${error.code === 'CLAUDE_DESCENDANTS_UNCONFIRMED' ? 'left tools that may still be running' : 'is still running'} (${redactString(error.message)}).`, { lingeringProcess: true });
     }
   }
@@ -891,28 +766,29 @@ async function resolveRequestOwned({ workspace_path, feature, request_id, action
 
 // Resolves after the bridge has shut down, with the worker processes it could not stop.
 async function shutdownAgentRuntime() {
-  shuttingDown = true;
   await notificationQueue;
   const stopped = await bridge.shutdown();
   await notificationQueue;
   return { unstopped: stopped?.unstopped ?? [] };
 }
 
+// Effort and instruction are validated before the control lock, which may replace a dead owner
+// and mark its running turn uncertain.
+function assertEffort({ effort = 'high' }) {
+  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new OverdriveError('Unsupported reasoning effort.', 'INVALID_INPUT');
+}
 // An omitted instruction falls back to the lane's next action; a supplied one, even an empty
-// string, must be valid before the lane's control lock or native session is touched.
+// string, must be valid.
 const startFeatureAgent = async args => {
+  assertEffort(args);
   const direction = args.instruction === undefined || args.instruction === null ? undefined : requiredText(args.instruction, 'instruction', { max: 100_000 });
   return await withAgentControl(args, ownerToken, () => startOwned(args, direction));
 };
-// A steer's effort and instruction are validated before the control lock, which may replace a
-// dead owner and mark its running turn uncertain.
 const steerFeatureAgent = async args => {
-  const { effort = 'high' } = args;
-  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new OverdriveError('Unsupported reasoning effort.', 'INVALID_INPUT');
+  assertEffort(args);
   const direction = requiredText(args.instruction, 'instruction', { max: 100_000 });
   return await withAgentControl(args, ownerToken, () => steerOwned(args, direction));
 };
-const compactFeatureAgent = args => withAgentControl(args, ownerToken, () => compactOwned(args));
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
 const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));
 // Pausing or archiving holds the lane's control lock from stopping its worker through recording
@@ -921,7 +797,7 @@ const stopFeatureLane = async args => {
   if (!['paused', 'archived'].includes(args.status)) throw new OverdriveError('Only pausing or archiving stops a lane.', 'INVALID_INPUT');
   return await withLaneStop(args, ownerToken, (row, busy, foreignOwner) => stopForStatus(args, row, busy, foreignOwner));
 };
-return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, shutdownAgentRuntime };
+return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgents, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, shutdownAgentRuntime };
 }
 
-export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, shutdownAgentRuntime } = createAgentRuntime();
+export const { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgents, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, shutdownAgentRuntime } = createAgentRuntime();

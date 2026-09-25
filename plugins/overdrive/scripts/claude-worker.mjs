@@ -28,7 +28,7 @@ const STDERR_TAIL_CHARS = 8_000;
 const DIAGNOSTIC_CHARS = 1_200;
 const DIAGNOSTIC_STDERR_LINES = 12;
 const CONTAINMENT_START_MS = 30_000;
-const uncontainedNote = reason => `This worker ran without process-tree containment (${reason}), so tools it launched cannot be confirmed stopped. Checks, candidate recording, completion and the next turn wait until the coordinator verifies no process for this lane is running and records that with prior_turn_attestation.`;
+const uncontainedNote = reason => `This worker ran without process-tree containment (${reason}), so tools it launched cannot be confirmed stopped. The next turn and a pause wait until the coordinator verifies no process for this lane is running and records that with prior_turn_attestation.`;
 
 function toolList(value, name) {
   if (value === undefined) return undefined;
@@ -270,7 +270,6 @@ export class ClaudeWorkerBridge extends EventEmitter {
       case 'turn/steer': return this.#steer(params);
       case 'turn/interrupt': return this.#interrupt(params);
       case 'thread/read': return this.#read(params);
-      case 'thread/compact/start': return this.#compact(params);
       case 'thread/name/set': this.#thread(params.threadId).name = String(params.name ?? '').slice(0, 120); return {};
       default: throw new OverdriveError(`Claude workers do not support ${method}.`, 'UNSUPPORTED');
     }
@@ -591,20 +590,6 @@ export class ClaudeWorkerBridge extends EventEmitter {
         turns: meta.turns.map(turn => ({ id: turn.id, status: turn.status, items: turn.status === 'inProgress' ? turn.text.map(text => ({ type: 'agentMessage', text })) : turn.items, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) })),
       },
     };
-  }
-
-  // Claude Code compacts its own context; the OVERDRIVE checkpoint is the durable boundary,
-  // so a compaction request is acknowledged without a model call.
-  #compact({ threadId }) {
-    const meta = this.#thread(threadId);
-    if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is active; compaction must wait.`, 'TURN_ACTIVE');
-    const turnId = `compact_${randomUUID()}`;
-    setImmediate(() => {
-      this.emit('notification', { method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress' } } });
-      this.emit('notification', { method: 'thread/compacted', params: { threadId, turnId } });
-      this.emit('notification', { method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed', items: [] } } });
-    });
-    return {};
   }
 
   #event(meta, turn, message) {

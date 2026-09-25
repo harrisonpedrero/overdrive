@@ -312,11 +312,21 @@ export async function repositorySnapshot(repository, baseRevision = undefined) {
 
 export async function verifyCheckoutRevision(repository, revision) {
   await assertFullRepository(repository);
-  if (!revision || revision.startsWith('-') || revision.includes('\0')) throw new OverdriveError('Candidate revision is invalid.', 'INVALID_REVISION');
+  if (!revision || revision.startsWith('-') || revision.includes('\0')) throw new OverdriveError('Revision is invalid.', 'INVALID_REVISION');
   let resolved;
   try { resolved = (await git(repository, 'rev-parse', '--verify', `${revision}^{commit}`)).stdout; }
-  catch { throw new OverdriveError(`Candidate revision does not resolve: ${revision}`, 'INVALID_REVISION'); }
+  catch { throw new OverdriveError(`Revision does not resolve: ${revision}`, 'INVALID_REVISION'); }
   return resolved;
+}
+
+export async function isGitAncestor(repository, ancestor, descendant) {
+  try {
+    await run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], { cwd: repository });
+    return true;
+  } catch (error) {
+    if (error?.code === 'COMMAND_FAILED') return false;
+    throw error;
+  }
 }
 
 export async function diffSummary(repository, fromRevision, toRevision = 'HEAD') {

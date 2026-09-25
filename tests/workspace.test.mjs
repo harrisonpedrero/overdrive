@@ -4,8 +4,8 @@ import { test } from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { git } from '../plugins/overdrive/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
 import {
   createFeature,
   doctorWorkspace,
@@ -14,9 +14,6 @@ import {
   initializeManagedProject,
   initializeWorkspace,
   listFeatures,
-  promoteManagedCandidate,
-  recordCandidate,
-  recordEvidence,
   resolveAgentRequestRecord,
   savePendingAgentRequest,
   updateFeature,
@@ -39,12 +36,6 @@ async function fixture(t) {
   await git(source, 'add', '.');
   await git(source, 'commit', '-m', 'base');
   return { parent, source, workspace };
-}
-
-async function verifyFile(workspace, feature, file, expected) {
-  await updateChecks({ workspace_path: workspace, feature, checks: [{ key: 'artifact', purpose: 'Inspect the actual committed artifact', argv: [process.execPath, '-e', `require('node:assert/strict').equal(require('node:fs').readFileSync(${JSON.stringify(file)}, 'utf8').replaceAll('\\r\\n', '\\n'), ${JSON.stringify(expected)})`] }] });
-  const result = await runChecks({ workspace_path: workspace, feature });
-  assert.equal(result.verification.ready, true);
 }
 
 test('initializes a repository and creates independent feature lanes', async t => {
@@ -191,7 +182,7 @@ test('an invalid spec is rejected before any feature clone and a corrected retry
   assert.equal(await fs.readFile(created.specPath, 'utf8'), '# Alpha\n\nAccepted on retry.\n');
 });
 
-test('starts from scratch and promotes an accepted candidate into the next lane base', async t => {
+test('starts a managed project from scratch and bases lanes on its head', async t => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-scratch-'));
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
   const workspace = path.join(parent, 'workspace');
@@ -214,96 +205,10 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     outcome: 'Create the first executable project slice.',
     spec: '# Foundation\n\napp.txt contains the working foundation.\n',
   });
-  const repo = foundation.feature.checkoutPath;
-  await git(repo, 'config', 'user.name', 'OVERDRIVE Test');
-  await git(repo, 'config', 'user.email', 'overdrive@example.invalid');
-  await fs.writeFile(path.join(repo, 'app.txt'), 'atlas foundation\n');
-  await git(repo, 'add', 'app.txt');
-  await git(repo, 'commit', '-m', 'Build foundation');
-  const candidateRevision = (await git(repo, 'rev-parse', 'HEAD')).stdout;
-  await recordEvidence({
-    workspace_path: workspace,
-    feature: 'foundation',
-    kind: 'test',
-    summary: 'Foundation fixture passed.',
-    command: 'fixture assertion',
-    revision: candidateRevision,
-    passed: true,
-  });
-  await assert.rejects(recordCandidate({ workspace_path: workspace, feature: 'foundation', summary: 'Report alone', checks: ['claimed'] }), error => error.code === 'COMPLETION_NOT_PROVEN');
-  await verifyFile(workspace, 'foundation', 'app.txt', 'atlas foundation\n');
-  await recordCandidate({
-    workspace_path: workspace,
-    feature: 'foundation',
-    summary: 'Foundation is ready.',
-    checks: ['fixture assertion: passed'],
-  });
-  await updateFeature({ workspace_path: workspace, feature: 'foundation', status: 'done' });
-
-  const stale = await createFeature({
-    workspace_path: workspace,
-    feature: 'alternate-foundation',
-    title: 'Alternate foundation',
-    outcome: 'Exercise divergent-candidate protection.',
-    spec: '# Alternate\n\nalternate.txt contains the alternate foundation.\n',
-  });
-  await git(stale.feature.checkoutPath, 'config', 'user.name', 'OVERDRIVE Test');
-  await git(stale.feature.checkoutPath, 'config', 'user.email', 'overdrive@example.invalid');
-  await fs.writeFile(path.join(stale.feature.checkoutPath, 'alternate.txt'), 'alternate foundation\n');
-  await git(stale.feature.checkoutPath, 'add', 'alternate.txt');
-  await git(stale.feature.checkoutPath, 'commit', '-m', 'Build alternate foundation');
-  const staleRevision = (await git(stale.feature.checkoutPath, 'rev-parse', 'HEAD')).stdout;
-  await recordEvidence({
-    workspace_path: workspace,
-    feature: 'alternate-foundation',
-    kind: 'test',
-    summary: 'Alternate fixture passed.',
-    command: 'fixture assertion',
-    revision: staleRevision,
-    passed: true,
-  });
-  await verifyFile(workspace, 'alternate-foundation', 'alternate.txt', 'alternate foundation\n');
-  await recordCandidate({
-    workspace_path: workspace,
-    feature: 'alternate-foundation',
-    summary: 'Alternate foundation is ready.',
-    checks: ['fixture assertion: passed'],
-  });
-  await updateFeature({ workspace_path: workspace, feature: 'alternate-foundation', status: 'done' });
-
-  const initialProjectHead = (await git(project, 'rev-parse', 'HEAD')).stdout;
-  const localNote = path.join(project, 'local-note.txt');
-  await fs.writeFile(localNote, 'preserve me\n');
-  await assert.rejects(
-    promoteManagedCandidate({ workspace_path: workspace, feature: 'foundation' }),
-    error => error.code === 'DIRTY_MANAGED_PROJECT',
-  );
-  assert.equal((await git(project, 'rev-parse', 'HEAD')).stdout, initialProjectHead);
-  await fs.rm(localNote);
-
-  const promoted = await promoteManagedCandidate({ workspace_path: workspace, feature: 'foundation' });
-  assert.equal(promoted.promoted, true);
-  assert.equal(promoted.managedProject.head, candidateRevision);
-  assert.equal((await git(project, 'rev-parse', 'HEAD')).stdout, candidateRevision);
-  assert.equal((await fs.readFile(path.join(project, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n'), 'atlas foundation\n');
-  assert.equal((await promoteManagedCandidate({ workspace_path: workspace, feature: 'foundation' })).alreadyIncluded, true);
-  await assert.rejects(
-    promoteManagedCandidate({ workspace_path: workspace, feature: 'alternate-foundation' }),
-    error => error.code === 'PROMOTION_NOT_FAST_FORWARD',
-  );
-  assert.equal((await git(project, 'rev-parse', 'HEAD')).stdout, candidateRevision);
-
-  const next = await createFeature({
-    workspace_path: workspace,
-    feature: 'second-slice',
-    title: 'Second slice',
-    outcome: 'Build on the accepted foundation.',
-  });
-  assert.equal(next.feature.baseRevision, candidateRevision);
-  assert.equal((await fs.readFile(path.join(next.feature.checkoutPath, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n'), 'atlas foundation\n');
+  assert.equal(foundation.feature.baseRevision, (await git(project, 'rev-parse', 'HEAD')).stdout);
 });
 
-test('versions specs, enforces the work DAG and records an exact candidate', async t => {
+test('versions specs and enforces the work DAG', async t => {
   const { source, workspace } = await fixture(t);
   await initializeWorkspace({ workspace_path: workspace, repository: source });
   await createFeature({ workspace_path: workspace, feature: 'alpha', title: 'Alpha', outcome: 'Deliver alpha.' });
@@ -332,34 +237,14 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
   );
 
   await updateWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'build', status: 'running' }] });
-  const repo = path.join(workspace, 'features', 'alpha', 'repo');
-  await git(repo, 'config', 'user.name', 'OVERDRIVE Test');
-  await git(repo, 'config', 'user.email', 'overdrive@example.invalid');
-  await fs.writeFile(path.join(repo, 'app.js'), 'export const value = 2;\n');
-  await git(repo, 'add', 'app.js');
-  await git(repo, 'commit', '-m', 'Implement alpha');
-  const head = (await git(repo, 'rev-parse', 'HEAD')).stdout;
   await updateWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'build', status: 'done', result: 'Changed the exported value.' }] });
   const context = await getFeatureContext({ workspace_path: workspace, feature: 'alpha' });
   assert.equal(context.workItems.find(item => item.item_key === 'validate').status, 'ready');
 
-  await assert.rejects(
-    recordCandidate({ workspace_path: workspace, feature: 'alpha', summary: 'Unproven candidate.', checks: ['claimed check'] }),
-    error => error.code === 'COMPLETION_NOT_PROVEN',
-  );
-
   await updateWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'validate', status: 'running' }] });
-  await recordEvidence({ workspace_path: workspace, feature: 'alpha', work_item: 'validate', kind: 'test', summary: 'Fixture assertion passed.', command: 'node --test', revision: head, passed: true });
   await updateWork({ workspace_path: workspace, feature: 'alpha', items: [{ key: 'validate', status: 'done', result: 'Test passed.' }] });
-  await verifyFile(workspace, 'alpha', 'app.js', 'export const value = 2;\n');
-  const candidate = await recordCandidate({ workspace_path: workspace, feature: 'alpha', summary: 'Alpha is ready.', checks: ['node --test: passed'] });
-  assert.equal(candidate.revision, head);
   const done = await updateFeature({ workspace_path: workspace, feature: 'alpha', status: 'done' });
   assert.equal(done.feature.status, 'done');
-  await assert.rejects(
-    promoteManagedCandidate({ workspace_path: workspace, feature: 'alpha' }),
-    error => error.code === 'NOT_MANAGED_PROJECT',
-  );
 });
 
 async function planBELoop(workspace) {
@@ -522,23 +407,14 @@ test('binds lanes to the current workspace after a copy, rename or linked path',
   await initializeWorkspace({ workspace_path: workspace, repository: source });
   await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Stays inside its own workspace.', spec: '# Lane' });
   await createFeature({ workspace_path: workspace, feature: 'linked', outcome: 'Refuses a linked lane path.' });
-  // The check leaves a marker beside the clone it actually ran in.
-  await updateChecks({ workspace_path: workspace, feature: 'lane', checks: [{ key: 'marker', purpose: 'Show which clone executes', argv: [process.execPath, '-e', "require('node:fs').appendFileSync(require('node:path').join(process.cwd(), '..', 'ran.txt'), 'x')"] }] });
-  const marker = root => path.join(root, 'features', 'lane', 'ran.txt');
   const mismatch = error => error.code === 'CHECKOUT_LOCATION_MISMATCH';
-
-  assert.equal((await runChecks({ workspace_path: workspace, feature: 'lane' })).verification.ready, true);
-  await fs.rm(marker(workspace));
 
   const copy = path.join(parent, 'copy');
   await fs.cp(workspace, copy, { recursive: true, verbatimSymlinks: true });
   await assert.rejects(getFeatureContext({ workspace_path: copy, feature: 'lane' }), mismatch);
-  await assert.rejects(runChecks({ workspace_path: copy, feature: 'lane' }), mismatch);
   await assert.rejects(featureRuntime({ workspace_path: copy, feature: 'lane' }), mismatch);
   await assert.rejects(updateFeature({ workspace_path: copy, feature: 'lane', summary: 'Copied.' }), mismatch);
   await assert.rejects(createFeature({ workspace_path: copy, feature: 'derived', outcome: 'Borrows a base.', base_feature: 'lane', base_revision: (await git(path.join(workspace, 'features', 'lane', 'repo'), 'rev-parse', 'HEAD')).stdout }), mismatch);
-  assert.equal(await fs.stat(marker(workspace)).catch(() => null), null);
-  assert.equal(await fs.stat(marker(copy)).catch(() => null), null);
   const copied = (await listFeatures({ workspace_path: copy, refresh_git: true })).features.find(item => item.slug === 'lane');
   assert.equal(copied.checkoutLocation.bound, false);
   assert.equal(path.relative(await fs.realpath(copy), copied.checkoutPath), path.join('features', 'lane', 'repo'));
@@ -555,10 +431,9 @@ test('binds lanes to the current workspace after a copy, rename or linked path',
   const renamed = path.join(parent, 'renamed');
   await fs.rename(workspace, renamed);
   await assert.rejects(getFeatureContext({ workspace_path: renamed, feature: 'lane' }), mismatch);
-  await assert.rejects(runChecks({ workspace_path: renamed, feature: 'lane' }), mismatch);
+  await assert.rejects(featureRuntime({ workspace_path: renamed, feature: 'lane' }), mismatch);
   await fs.rename(renamed, workspace);
-  assert.equal((await runChecks({ workspace_path: workspace, feature: 'lane' })).verification.ready, true);
-  assert.equal(await fs.readFile(marker(workspace), 'utf8'), 'x');
+  assert.equal((await featureRuntime({ workspace_path: workspace, feature: 'lane' })).feature.slug, 'lane');
 
   const outside = path.join(parent, 'outside-linked');
   await fs.rename(path.join(workspace, 'features', 'linked'), outside);
@@ -566,4 +441,31 @@ test('binds lanes to the current workspace after a copy, rename or linked path',
   await assert.rejects(getFeatureContext({ workspace_path: workspace, feature: 'linked' }), error => mismatch(error) && /symlink or junction/.test(error.message));
   await assert.rejects(featureRuntime({ workspace_path: workspace, feature: 'linked' }), mismatch);
   assert.equal((await getFeatureContext({ workspace_path: workspace, feature: 'lane' })).feature.slug, 'lane');
+});
+
+test('version-2 data migrates without turning historical claims into current proof', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-migration-'));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const args = { workspace_path: workspace, feature: 'legacy' };
+  await initializeManagedProject({ workspace_path: workspace, project_name: 'Legacy', description: 'Preserve history.' });
+  const lane = await createFeature({ ...args, title: 'Legacy', outcome: 'Preserve historical work.', spec: '# Legacy\n\nOriginal intent.' });
+  const statePath = path.join(workspace, '.overdrive', 'state.sqlite3');
+  const db = new DatabaseSync(statePath);
+  const feature = db.prepare('SELECT * FROM features WHERE slug = ?').get('legacy');
+  db.prepare("INSERT INTO evidence(id, feature_id, kind, summary, revision, passed, created_at) VALUES ('old-evidence', ?, 'test', 'Previously reported pass', ?, 1, ?)").run(feature.id, lane.feature.baseRevision, new Date().toISOString());
+  db.prepare("INSERT INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) VALUES ('old-candidate', ?, ?, ?, 'Old accepted candidate', '[]', 'accepted', ?)").run(feature.id, lane.feature.baseRevision, lane.feature.baseRevision, new Date().toISOString());
+  db.prepare("UPDATE features SET status = 'done' WHERE id = ?").run(feature.id);
+  for (const column of ['source', 'spec_revision', 'contract_hash', 'check_key', 'argv_json', 'exit_code', 'output', 'duration_ms']) db.exec(`ALTER TABLE evidence DROP COLUMN ${column}`);
+  for (const column of ['spec_revision', 'contract_hash']) db.exec(`ALTER TABLE candidates DROP COLUMN ${column}`);
+  db.exec("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+  db.close();
+  const context = await getFeatureContext(args);
+  assert.equal(context.feature.status, 'active');
+  assert.equal(context.evidence[0].source, 'reported');
+  const migrated = new DatabaseSync(statePath);
+  try { assert.equal(migrated.prepare("SELECT status FROM candidates WHERE id = 'old-candidate'").get().status, 'superseded'); }
+  finally { migrated.close(); }
+  await fs.writeFile(path.join(workspace, '.overdrive', 'features', 'legacy', 'spec.md'), 'STALE PROJECTION');
+  await getFeatureContext(args);
+  assert.match(await fs.readFile(path.join(workspace, '.overdrive', 'features', 'legacy', 'spec.md'), 'utf8'), /Original intent/);
 });

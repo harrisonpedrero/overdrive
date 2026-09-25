@@ -9,8 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
 import { ClaudeWorkerBridge, ISOLATION_ARGS, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/overdrive/scripts/claude-worker.mjs';
 import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, recordCandidate, updateFeature, workerHarness } from '../plugins/overdrive/scripts/workspace.mjs';
-import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, updateFeature, workerHarness } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeCli = path.join(here, 'fixtures', 'fake-claude-cli.mjs');
@@ -111,9 +110,6 @@ test('claude harness turn records only visible handoff and working diff, accepts
   const serialized = JSON.stringify(state);
   assert.doesNotMatch(serialized, /private-do-not-persist|secret-tool-output/);
   assert.equal(state.git.clean, false);
-  const compacted = await runtime.compactFeatureAgent(args);
-  assert.equal(compacted.compacted, true);
-  assert.equal((await getFeatureContext(args)).feature.compactionPending, false);
   const again = await runtime.startFeatureAgent({ ...args, instruction: 'Continue.' });
   assert.equal(again.threadId, started.threadId);
   assert.equal(again.createdSession, false);
@@ -550,7 +546,7 @@ test('a normally completed Claude turn clears its worker guard before an idle pa
 
 const lingeringTool = path.join(here, 'fixtures', 'lingering-tool.mjs');
 
-test('a tool that outlives its Claude turn keeps checks, candidates and the next turn closed until its tree ends', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
+test('a tool that outlives its Claude turn keeps its guard until its tree ends', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
   // 'tool-tree' is an ordinary shell -> test runner -> test process chain, as npm test run by a
   // Bash tool call; 'spoof' also writes forged containment reports to the stderr it shares.
   for (const [mode, ending] of [['detached', 'exits'], ['tool-tree', 'exits'], ['spoof', 'exits'], ['detached', 'pause'], ['tool-tree', 'next-turn']]) {
@@ -564,7 +560,6 @@ test('a tool that outlives its Claude turn keeps checks, candidates and the next
       if (pid && alive(pid)) process.kill(pid);
       await fs.rm(dir, { recursive: true, force: true, maxRetries: 5 });
     });
-    await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
     await runtime.startFeatureAgent(args);
     await eventually(async () => (await agentStatus(args)) === 'idle' && Number(await fs.readFile(pidFile, 'utf8').catch(() => '0')) > 0);
     pid = Number(await fs.readFile(pidFile, 'utf8'));
@@ -576,18 +571,13 @@ test('a tool that outlives its Claude turn keeps checks, candidates and the next
     // Containment really ran: the guard names its job and the bridge did not fall back.
     assert.match(guard?.job ?? '', /^Global\\overdrive-worker-/, `${mode}: the CLI exit did not clear the guard, and it names its job`);
     assert.equal(bridge.backend('claude').containmentUnavailable, null);
-    const guarded = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1;
-    await assert.rejects(runChecks(args), guarded);
-    await assert.rejects(recordCandidate({ ...args, summary: 'While the tool runs.', checks: ['README receipt'] }), guarded);
     assert.equal((await getFeatureContext(args)).feature.status, 'active');
 
     if (ending === 'exits') {
-      // The tree ends by itself, so the guard clears without any attestation and delivery proceeds.
+      // The tree ends by itself, so the guard clears without any attestation.
       await fs.writeFile(release, '');
       await eventually(async () => (await readWorkerGuards(args)).length === 0);
       assert.ok(!alive(pid));
-      assert.ok((await runChecks(args)).verification.ready);
-      assert.equal((await recordCandidate({ ...args, summary: 'After the tool ended.', checks: ['README receipt'] })).feature.status, 'review');
     } else if (ending === 'pause') {
       // Pausing stops the tree through its job, which confirms it without an attestation.
       assert.equal((await runtime.stopFeatureLane({ ...args, status: 'paused' })).feature.status, 'paused');
@@ -613,7 +603,6 @@ test('an uncontained Claude worker leaves every turn unconfirmed until the coord
   await new Promise(resolve => setTimeout(resolve, 500));
   assert.equal((await readWorkerGuards(args)).length, 1);
   assert.match((await getFeatureContext(args)).feature.summary, /without process-tree containment \(no process-tree containment is available on this platform\)/);
-  await assert.rejects(runChecks(args), error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1);
   await assert.rejects(runtime.startFeatureAgent(args), error => error.code === 'WORKERS_UNCONFIRMED' && error.details?.workerGuards === 1);
   await assert.rejects(runtime.steerFeatureAgent({ ...args, instruction: 'Continue.' }), error => error.code === 'WORKERS_UNCONFIRMED');
   // The coordinator's attestation clears only the guard it was given for; the new turn is guarded again.
@@ -630,7 +619,6 @@ test('after a controller loses a clean exit, inspection alone clears a guard who
   const claude = { launch: { command: process.execPath, args: [lingeringTool, 'cli', 'detached', pidFile, release] }, terminationTimeoutMs: 500 };
   const { args, bridge, runtime } = await fixture(t, claude);
   t.after(async () => { await fs.writeFile(release, '').catch(() => {}); await fs.rm(dir, { recursive: true, force: true, maxRetries: 5 }); });
-  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
   const started = await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle' && Number(await fs.readFile(pidFile, 'utf8').catch(() => '0')) > 0);
   const pid = Number(await fs.readFile(pidFile, 'utf8'));
@@ -639,19 +627,16 @@ test('after a controller loses a clean exit, inspection alone clears a guard who
   expireControllerOwner(args.workspace_path);
   const observer = createAgentRuntime(new WorkerBridge({ claude }));
   t.after(() => observer.shutdownAgentRuntime());
-  const refused = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /agent_inspect/.test(error.message);
 
-  // While the tool runs, inspection keeps the guard and checks stay refused.
+  // While the tool runs, inspection keeps the guard.
   await observer.inspectFeatureAgent(args);
   assert.equal((await readWorkerGuards(args)).length, 1);
-  await assert.rejects(runChecks(args), refused);
 
   await fs.writeFile(release, '');
   await eventually(() => !alive(pid));
   await (bridge.backend('claude').threads.get(started.threadId).turns.at(-1).settled);
-  // The tree has ended but nothing recorded it: direct checks still fail closed.
+  // The tree has ended but nothing recorded it, so the guard stays.
   assert.equal((await readWorkerGuards(args)).length, 1);
-  await assert.rejects(runChecks(args), refused);
   // Inspection proves it from the job alone, without a turn or a lifecycle change.
   const inspected = await observer.inspectFeatureAgent(args);
   assert.equal(inspected.warning, null);
@@ -660,7 +645,6 @@ test('after a controller loses a clean exit, inspection alone clears a guard who
   assert.equal(state.feature.status, 'active');
   assert.equal(state.feature.agent.status, 'idle');
   assert.ok(state.timeline.some(entry => entry.kind === 'agent.worker_stopped' && entry.details?.basis === 'job_gone'));
-  assert.ok((await runChecks(args)).verification.ready);
 });
 
 // A stand-in warden that reports with token 'tok', answers as the CLI, then, with its tools

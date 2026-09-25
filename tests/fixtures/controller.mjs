@@ -32,9 +32,8 @@ const operations = {
   start: runtime.startFeatureAgent,
   steer: runtime.steerFeatureAgent,
   inspect: runtime.inspectFeatureAgent,
-  wait: runtime.waitFeatureAgent,
+  wait: runtime.waitFeatureAgents,
   interrupt: runtime.interruptFeatureAgent,
-  compact: runtime.compactFeatureAgent,
 };
 const reply = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 

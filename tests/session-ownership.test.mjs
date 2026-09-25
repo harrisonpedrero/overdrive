@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
 import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
 import { OverdriveError, refusedRequest } from '../plugins/overdrive/scripts/util.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, updateFeature } from '../plugins/overdrive/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, updateFeature } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -155,11 +155,9 @@ test('unknown legacy ownership fails clearly without contacting a backend and ca
   f.sql("UPDATE features SET thread_id = 'legacy-thread', thread_harness = NULL, agent_status = 'idle'");
   await assert.rejects(f.runtime.startFeatureAgent(f.args), error => error.code === 'SESSION_OWNER_UNKNOWN' && /force_new_session/.test(error.message));
   await assert.rejects(f.runtime.steerFeatureAgent({ ...f.args, instruction: 'Continue.' }), error => error.code === 'SESSION_OWNER_UNKNOWN');
-  await assert.rejects(f.runtime.compactFeatureAgent(f.args), error => error.code === 'SESSION_OWNER_UNKNOWN');
   const inspected = await f.runtime.inspectFeatureAgent(f.args);
   assert.match(inspected.warning, /force_new_session/);
   assert.equal(inspected.feature.agent.harness, 'unknown');
-  assert.equal(inspected.feature.compactionPending, false);
   assert.deepEqual(f.calls, []);
   const replaced = await f.runtime.startFeatureAgent({ ...f.args, force_new_session: true });
   assert.deepEqual({ harness: replaced.harness, created: replaced.createdSession }, { harness: 'claude', created: true });
@@ -213,14 +211,12 @@ test('late events from a replaced session cannot mutate its replacement', async 
 
   const claude = f.bridge.backend('claude');
   claude.emit('notification', { method: 'turn/started', params: { threadId: old.threadId, turn: { id: 'late-turn' } } });
-  claude.emit('notification', { method: 'thread/compacted', params: { threadId: old.threadId, turnId: 'late-turn' } });
   claude.emit('notification', { method: 'turn/completed', params: { threadId: old.threadId, turn: { id: 'late-turn', status: 'failed', items: [{ type: 'agentMessage', text: 'Stale handoff.' }] } } });
   claude.raise(41, 'item/tool/requestUserInput', { threadId: old.threadId, turnId: 'late-turn' });
   claude.emit('exit', new Error('old backend closed'), [old.threadId]);
   // Durable writes are guarded as well, whichever controller delivers them.
   for (const ignored of await Promise.all([
     saveAgentSession({ ...f.args, thread_id: old.threadId, status: 'failed', summary: 'Stale handoff.' }),
-    markCompacted({ ...f.args, thread_id: old.threadId }),
     recordAgentEvent({ ...f.args, thread_id: old.threadId, kind: 'agent.diff', summary: 'Stale diff.' }),
   ])) assert.deepEqual(ignored, { ignored: true });
   await new Promise(resolve => setTimeout(resolve, 100));

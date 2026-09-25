@@ -240,42 +240,6 @@ export class CodexAppServer extends EventEmitter {
     });
   }
 
-  async startTurn({ threadId, instruction, cwd, runtimeWorkspaceRoots, effort = 'high' }) {
-    return await this.request('turn/start', {
-      threadId,
-      input: [{ type: 'text', text: instruction, text_elements: [] }],
-      cwd,
-      runtimeWorkspaceRoots,
-      model: 'gpt-6-sol',
-      effort,
-      summary: 'concise',
-    });
-  }
-
-  async steer({ threadId, turnId, instruction }) {
-    return await this.request('turn/steer', {
-      threadId,
-      expectedTurnId: turnId,
-      input: [{ type: 'text', text: instruction, text_elements: [] }],
-    });
-  }
-
-  async compact(threadId) {
-    return await this.request('thread/compact/start', { threadId });
-  }
-
-  async readThread(threadId) {
-    return await this.request('thread/read', { threadId, includeTurns: true });
-  }
-
-  async nameThread(threadId, name) {
-    return await this.request('thread/name/set', { threadId, name });
-  }
-
-  async interrupt(threadId, turnId) {
-    return await this.request('turn/interrupt', { threadId, turnId });
-  }
-
   shutdown() {
     const child = this.child;
     if (!child) return;

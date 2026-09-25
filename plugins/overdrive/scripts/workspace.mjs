@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { assertAgentIdle, assertVerified, assertWorkersStopped, captureFeatureContract, featureChecks, verificationStatus } from './verification.mjs';
 import { AGENT_BUSY_SQL, DESCENDANTS_CLEAR_SQL, WORKERS_CLEAR_SQL, descendantsKey, ownsAgent, recoverAgentState, unconfirmedDescendants, workersKey } from './ownership.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -24,7 +23,6 @@ import {
 } from './util.mjs';
 import {
   createFeatureCheckout,
-  diffSummary,
   initializeMirror,
   inspectMirror,
   mirrorPath,
@@ -37,9 +35,6 @@ import {
 } from './git.mjs';
 import {
   assertBoundCheckout,
-  bindCandidateChecks,
-  candidateChecksKey,
-  candidateRecordedSummary,
   featureBySlug,
   initializeDatabase,
   listFeatureRows,
@@ -48,8 +43,6 @@ import {
   newId,
   parseJson,
   readWorkspaceConfig,
-  projectCandidateEvent,
-  receiptCheckText,
   recordEvent,
   transaction,
   workItems,
@@ -67,10 +60,6 @@ async function withContext(workspacePath, fn) {
   const root = await resolveWorkspace(workspacePath);
   const ctx = await loadWorkspace(root);
   try { return await fn(ctx); } finally { closeContext(ctx); }
-}
-
-async function withCheckoutLock(root, slug, fn) {
-  return withWorkspaceLock(root, `control-${slug}`, () => withWorkspaceLock(root, 'features', fn));
 }
 
 function progressFor(db, featureId) {
@@ -96,7 +85,7 @@ function latestSpec(db, featureId) {
 
 function evidenceRows(db, featureId, limit = 50) {
   return db.prepare('SELECT * FROM evidence WHERE feature_id = ? ORDER BY created_at DESC LIMIT ?').all(featureId, limit)
-    .map(({ output, ...row }) => ({ ...row, passed: row.passed === null ? null : Boolean(row.passed), outputAvailable: Boolean(output) }));
+    .map(({ output: _output, ...row }) => ({ ...row, passed: row.passed === null ? null : Boolean(row.passed) }));
 }
 
 function pendingRows(db, featureId) {
@@ -105,29 +94,11 @@ function pendingRows(db, featureId) {
     .map(({ payload_json: _payload, ...row }) => row);
 }
 
-// A candidate's checks are the executed receipts behind its exact revision and current contract.
-function receiptChecks(verification) {
-  return verification.checks.filter(check => check.receipt).map(check => {
-    const receipt = { key: check.key, receiptId: check.receipt.id, status: check.status, required: check.required, reused: check.reused };
-    return { text: receiptCheckText(receipt), receipt };
-  });
-}
-
-// Displayed checks are rebuilt from the candidate's marker; an unmarked row predates receipt provenance,
-// and saved strings that differ from the marker are shown apart as unverified, even when they name a receipt.
-function candidateRows(db, featureId) {
-  return db.prepare('SELECT * FROM candidates WHERE feature_id = ? ORDER BY created_at DESC LIMIT 20').all(featureId)
-    .map(row => ({ ...row, ...bindCandidateChecks(db, row.id, parseJson(row.checks_json, [])) }))
-    .map(({ checks_json: _checks, ...row }) => row);
-}
-
 function markdownCell(value) {
   return String(value ?? '').replaceAll('|', '\\|').replace(/\s+/g, ' ').trim();
 }
 
 async function ensureWorkspaceFiles(root, config) {
-  const coordinatorConfig = contained(root, '.codex', 'config.toml');
-  if (config?.harness !== 'claude' && !await exists(coordinatorConfig)) await atomicWrite(root, coordinatorConfig, 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n');
   const ignoreFile = contained(root, '.gitignore');
   const required = [
     'features/',
@@ -212,7 +183,7 @@ export async function writeIndex(ctx) {
     return `| ${markdownCell(feature.slug)} | ${markdownCell(feature.status)} | ${progress.done}/${progress.total || 0} | ${markdownCell(feature.agent_status)} | ${markdownCell(feature.next_action || '—')} |`;
   });
   const managedLine = ctx.config.managedProject
-    ? `Managed project: ${ctx.config.managedProject.name} · ${ctx.config.defaultBranch} @ ${ctx.config.defaultRevision.slice(0, 12)}\n`
+    ? `Managed project: ${ctx.config.managedProject.name} · ${meta(ctx.db, 'default_branch')} @ ${meta(ctx.db, 'default_revision').slice(0, 12)}\n`
     : '';
   const body = `# OVERDRIVE index
 
@@ -323,7 +294,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidenceLines = evidence.length
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
-  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
+  const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'context.md'), packet);
   return { feature, work, evidence, pending, snapshot, commitIdentity: identity };
 }
@@ -350,7 +321,6 @@ async function initializeSource(root, normalized, additions = {}) {
     repositoryKind: additions.managedProject ? 'managed' : normalized.kind,
     defaultRevision: mirror.defaultRevision,
     defaultBranch: mirror.defaultBranch,
-    model: 'gpt-6-astra',
     createdAt: now(),
     repositoryProfile: profile,
     ...additions,
@@ -494,9 +464,8 @@ export function overview(ctx) {
     workspaceId: ctx.config.workspaceId,
     root: ctx.root,
     repository: ctx.config.repository,
-    defaultBranch: ctx.config.defaultBranch,
-    defaultRevision: ctx.config.defaultRevision,
-    model: ctx.config.model,
+    defaultBranch: meta(ctx.db, 'default_branch'),
+    defaultRevision: meta(ctx.db, 'default_revision'),
     harness: ctx.config.harness ?? 'codex',
     managedProject: ctx.config.managedProject
       ? {
@@ -616,13 +585,8 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       // its default HEAD is reported as cached rather than refreshed.
       const canonicalSource = selectedBase ? 'cached' : 'refreshed';
       const refreshed = selectedBase ? await inspectMirror(root) : await refreshMirror(root);
-      // The cached default profile describes only the refreshed canonical default.
+      // The default profile describes only the refreshed canonical default.
       const defaultProfile = selectedBase ? null : await profileRepository(root, refreshed.defaultRevision);
-      if (!selectedBase) {
-        ctx.config.defaultRevision = refreshed.defaultRevision;
-        ctx.config.defaultBranch = refreshed.defaultBranch;
-        ctx.config.repositoryProfile = defaultProfile;
-      }
       const base = selectedBase || await resolveMirrorRevision(root, base_revision || refreshed.defaultRevision);
       const clone = await createFeatureCheckout(root, ctx.config, slug, base, baseRepository);
       // Setup and check hints describe the lane's own committed base, which may be a sibling-only
@@ -652,7 +616,6 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination, baseFeature: baseSlug, baseRevision: base, commitIdentity: { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
-      await writeJson(root, contained(root, CONFIG_FILE), ctx.config);
       return {
         feature: summarizeFeature(ctx, row),
         baseFeature: baseSlug,
@@ -689,7 +652,6 @@ function summarizeFeature(ctx, feature) {
       harness: feature.thread_id ? feature.thread_harness ?? 'unknown' : null,
       activeTurnId: feature.active_turn_id ?? null,
     },
-    compactionPending: feature.compaction_pending,
   };
 }
 
@@ -719,8 +681,6 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), 'utf8') },
       workItems: projection.work,
       evidence: projection.evidence,
-      candidates: candidateRows(ctx.db, row.id),
-      verification: verificationStatus(ctx, row, projection.snapshot.head),
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
       commitIdentity: projection.commitIdentity,
@@ -811,9 +771,6 @@ export async function updateWork({ workspace_path, feature, items = [], remove =
       transaction(ctx.db, () => {
         const existing = new Map(workItems(ctx.db, row.id).map(item => [item.item_key, item]));
         for (const key of removed) if (!existing.has(key)) throw new OverdriveError(`Unknown work item: ${key}`, 'WORK_ITEM_NOT_FOUND');
-        // A check scoped to removed work could no longer resolve its scope, which every verification read needs.
-        const scoped = featureChecks(ctx.db, row.id).find(check => check.work_scope?.some(key => removed.has(key)));
-        if (scoped) throw new OverdriveError(`Check ${scoped.key} is scoped to work being removed; change its work_scope with checks_update first.`, 'INVALID_INPUT');
         const ids = new Map([...existing].map(([key, item]) => [key, item.id]));
         for (const item of normalized) {
           const found = existing.get(item.key);
@@ -924,180 +881,10 @@ async function applyFeatureUpdate(root, slug, { status, spec, rationale, summary
   } finally { ctx.db.close(); }
 }
 
-export async function recordEvidence({ workspace_path, feature, work_item, kind, summary, command, artifact, revision, passed }) {
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  const evidenceKind = requiredText(kind, 'kind', { max: 100 });
-  const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  if (passed !== undefined && typeof passed !== 'boolean') throw new OverdriveError('passed must be true or false.', 'INVALID_INPUT');
-  return await withWorkspaceLock(root, 'features', async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      let work = null;
-      if (work_item) {
-        work = ctx.db.prepare('SELECT * FROM work_items WHERE feature_id = ? AND item_key = ?').get(row.id, workKey(work_item));
-        if (!work) throw new OverdriveError(`Unknown work item: ${work_item}`, 'WORK_ITEM_NOT_FOUND');
-      }
-      let resolved = optionalText(revision, 'revision', { max: 200 });
-      if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
-      const id = newId('evidence');
-      const stamp = now();
-      ctx.db.prepare('INSERT INTO evidence(id, feature_id, work_item_id, kind, summary, command, artifact, revision, passed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(id, row.id, work?.id ?? null, evidenceKind, cleanSummary, optionalText(command, 'command', { max: 20_000 }) ?? null, optionalText(artifact, 'artifact', { max: 4_096 }) ?? null, resolved ?? null, passed === undefined ? null : passed ? 1 : 0, stamp);
-      ctx.db.prepare('UPDATE features SET updated_at = ? WHERE id = ?').run(stamp, row.id);
-      await addEvent(ctx, { featureId: row.id, workItemId: work?.id ?? null, kind: 'evidence.recorded', summary: `${passed === true ? 'PASS' : passed === false ? 'FAIL' : 'NOTE'} · ${evidenceKind}: ${cleanSummary}`, details: { revision: resolved, artifact: artifact ?? null } });
-      await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
-      return { evidenceId: id, feature: slug, revision: resolved ?? null };
-    } finally { ctx.db.close(); }
-  });
-}
-
-export async function recordCandidate({ workspace_path, feature, revision = 'HEAD', summary, checks, allow_dirty = false }) {
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  // Caller-described checks are prose, not proof; they are kept apart as unverified notes.
-  const notes = cleanStringArray(checks, 'checks');
-  return await withCheckoutLock(root, slug, async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      // Recording moves the lane to review, so an archived lane must be reactivated explicitly first.
-      if (row.status === 'archived') throw new OverdriveError(`Feature ${slug} is archived; reactivate it with feature_update before recording a candidate.`, 'INVALID_TRANSITION');
-      // Likewise a paused lane stays paused until it is explicitly resumed.
-      if (row.status === 'paused') throw new OverdriveError(`Feature ${slug} is paused; resume it with feature_update before recording a candidate.`, 'INVALID_TRANSITION');
-      assertAgentIdle(row);
-      assertWorkersStopped(ctx.db, row);
-      const resolved = await verifyCheckoutRevision(row.checkout_path, revision);
-      const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-      if (snapshot.head !== resolved) throw new OverdriveError(`Candidate ${resolved.slice(0, 12)} is not the checkout HEAD ${snapshot.head.slice(0, 12)}.`, 'STALE_CANDIDATE');
-      if (allow_dirty || !snapshot.clean) throw new OverdriveError('Candidates require a clean committed checkout.', 'DIRTY_CANDIDATE');
-      const verification = assertVerified(ctx, row, resolved);
-      const derived = receiptChecks(verification);
-      const executed = derived.map(check => check.text);
-      const changes = await diffSummary(row.checkout_path, row.base_revision, resolved);
-      const id = newId('candidate');
-      const stamp = now();
-      transaction(ctx.db, () => {
-        ctx.db.prepare("UPDATE candidates SET status = 'superseded' WHERE feature_id = ? AND status = 'ready'").run(row.id);
-        ctx.db.prepare('INSERT INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, \'ready\', ?)')
-          .run(id, row.id, resolved, row.base_revision, cleanSummary, JSON.stringify(executed), stamp);
-        ctx.db.prepare('UPDATE candidates SET spec_revision = ?, contract_hash = ? WHERE id = ?').run(row.spec_revision, verification.contractHash, id);
-        captureFeatureContract(ctx.db, row);
-        meta(ctx.db, candidateChecksKey(id), JSON.stringify({ version: 1, source: 'executed-receipts', receipts: derived.map(check => check.receipt) }));
-        ctx.db.prepare("UPDATE features SET status = 'review', summary = ?, updated_at = ? WHERE id = ?").run(cleanSummary, stamp, row.id);
-      });
-      await addEvent(ctx, {
-        featureId: row.id, kind: 'candidate.recorded',
-        summary: candidateRecordedSummary(resolved, executed.length, notes.length),
-        details: { candidateId: id, checks: executed, unverifiedNotes: notes, clean: snapshot.clean },
-      });
-      const current = featureBySlug(ctx.db, slug);
-      await writeFeatureContext(ctx, current);
-      await writeIndex(ctx);
-      return { candidateId: id, revision: resolved, baseRevision: row.base_revision, checks: executed, unverifiedNotes: notes, checkProvenance: 'executed-receipts', changes, feature: summarizeFeature(ctx, current) };
-    } finally { ctx.db.close(); }
-  });
-}
-
-async function isGitAncestor(repository, ancestor, descendant) {
-  try {
-    await run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], { cwd: repository });
-    return true;
-  } catch (error) {
-    if (error?.code === 'COMMAND_FAILED') return false;
-    throw error;
-  }
-}
-
-export async function promoteManagedCandidate({ workspace_path, feature, revision, summary }) {
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  const cleanSummary = optionalText(summary, 'summary', { max: 50_000 });
-  // Promotion changes the revision used by lane creation, so both operations share one lock.
-  return await withCheckoutLock(root, slug, async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const managed = ctx.config.managedProject;
-      if (!managed) {
-        throw new OverdriveError('Candidate promotion is built in only for projects created by OVERDRIVE. Use the repository\'s normal review and integration flow for an adopted repository.', 'NOT_MANAGED_PROJECT');
-      }
-      const project = await ensureManagedPath(root, contained(root, 'project'));
-      if (path.resolve(managed.path) !== project) throw new OverdriveError('Managed project path does not match this workspace.', 'INVALID_STATE');
-      const row = featureBySlug(ctx.db, slug);
-      assertAgentIdle(row);
-      let resolved = optionalText(revision, 'revision', { max: 200 });
-      if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
-      const candidate = resolved
-        ? ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND revision = ? AND status IN ('ready','accepted') ORDER BY created_at DESC LIMIT 1").get(row.id, resolved)
-        : ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY created_at DESC LIMIT 1").get(row.id);
-      if (!candidate) throw new OverdriveError('No recorded candidate matches this promotion request.', 'PROMOTION_NOT_READY');
-      assertVerified(ctx, row, candidate.revision, candidate);
-      const featureSnapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-      if (!featureSnapshot.clean || featureSnapshot.head !== candidate.revision) {
-        throw new OverdriveError('The candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
-      }
-      const projectSnapshot = await repositorySnapshot(project);
-      if (!projectSnapshot.clean) throw new OverdriveError('The managed project has uncommitted changes; preserve or resolve them before promotion.', 'DIRTY_MANAGED_PROJECT');
-      if (projectSnapshot.branch !== managed.defaultBranch) {
-        throw new OverdriveError(`Managed project must be on ${managed.defaultBranch}, not ${projectSnapshot.branch || 'a detached HEAD'}.`, 'WRONG_MANAGED_BRANCH');
-      }
-      const candidateRef = `refs/overdrive/candidates/${slug}/${candidate.revision}`;
-      await run(['git', 'fetch', '--no-tags', row.checkout_path, `${candidate.revision}:${candidateRef}`], { cwd: project });
-      const fetched = await verifyCheckoutRevision(project, candidateRef);
-      if (fetched !== candidate.revision) throw new OverdriveError('Fetched candidate revision does not match the candidate.', 'STALE_CANDIDATE');
-      const alreadyIncluded = await isGitAncestor(project, candidate.revision, projectSnapshot.head);
-      if (!alreadyIncluded) {
-        const canFastForward = await isGitAncestor(project, projectSnapshot.head, candidate.revision);
-        if (!canFastForward) {
-          throw new OverdriveError('The managed project and candidate have diverged. Rebase or repair the feature lane; OVERDRIVE will not synthesize or resolve a merge silently.', 'PROMOTION_NOT_FAST_FORWARD');
-        }
-        await run(['git', '-c', `core.hooksPath=${contained(root, STATE_DIR, 'disabled-hooks')}`, 'merge', '--ff-only', candidateRef], { cwd: project });
-      }
-      const promotedSnapshot = await repositorySnapshot(project);
-      if (!promotedSnapshot.clean || !await isGitAncestor(project, candidate.revision, promotedSnapshot.head)) {
-        throw new OverdriveError('Managed project verification failed after promotion.', 'PROMOTION_FAILED');
-      }
-      const refreshed = await refreshMirror(root);
-      const profile = await profileRepository(root, refreshed.defaultRevision);
-      ctx.config.defaultRevision = refreshed.defaultRevision;
-      ctx.config.defaultBranch = refreshed.defaultBranch;
-      ctx.config.repositoryProfile = profile;
-      const stamp = now();
-      transaction(ctx.db, () => {
-        meta(ctx.db, 'default_revision', refreshed.defaultRevision);
-        meta(ctx.db, 'default_branch', refreshed.defaultBranch);
-        if (!alreadyIncluded) ctx.db.prepare('UPDATE features SET summary = ?, updated_at = ? WHERE id = ?').run(cleanSummary || candidate.summary, stamp, row.id);
-      });
-      await writeJson(root, contained(root, CONFIG_FILE), ctx.config);
-      if (!alreadyIncluded) {
-        await addEvent(ctx, {
-          featureId: row.id,
-          kind: 'candidate.promoted',
-          summary: cleanSummary || `Promoted ${candidate.revision.slice(0, 12)} to ${managed.defaultBranch}.`,
-          details: { revision: candidate.revision, project, branch: managed.defaultBranch },
-        });
-      }
-      await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
-      await writeIndex(ctx);
-      return {
-        promoted: !alreadyIncluded,
-        alreadyIncluded,
-        feature: slug,
-        candidateRevision: candidate.revision,
-        managedProject: { path: project, branch: managed.defaultBranch, head: promotedSnapshot.head },
-        repositoryProfile: profile,
-        next: 'New feature lanes now start from the refreshed managed-project revision.',
-      };
-    } finally { ctx.db.close(); }
-  });
-}
-
 function timelineRows(db, featureId, limit = 30) {
   const bounded = Math.max(1, Math.min(Number(limit) || 30, 200));
   return db.prepare('SELECT id, kind, summary, details_json, created_at FROM events WHERE feature_id = ? ORDER BY id DESC LIMIT ?').all(featureId, bounded)
-    .map(row => projectCandidateEvent(db, { id: Number(row.id), kind: row.kind, summary: row.summary, details: parseJson(row.details_json, {}), createdAt: row.created_at }));
+    .map(row => ({ id: Number(row.id), kind: row.kind, summary: row.summary, details: parseJson(row.details_json, {}), createdAt: row.created_at }));
 }
 
 export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false }) {
@@ -1121,7 +908,7 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
 
 // Binds the lane to a session it just created, recording the owning harness. The replaced
 // binding is kept in the timeline so its conversation stays reachable in its own backend.
-export async function bindAgentSession({ workspace_path, feature, thread_id, harness, expected_thread_id = null, compacted = false, owner_token }) {
+export async function bindAgentSession({ workspace_path, feature, thread_id, harness, expected_thread_id = null, owner_token }) {
   if (!HARNESSES.has(harness)) throw new OverdriveError('A native session must record its owning harness.', 'SESSION_OWNER_UNKNOWN');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
@@ -1133,8 +920,8 @@ export async function bindAgentSession({ workspace_path, feature, thread_id, har
       if ((row.thread_id ?? null) !== expected_thread_id || row.active_turn_id) throw new OverdriveError('The lane session changed before its replacement could be saved; inspect it and retry.', 'SESSION_CHANGED');
       const stamp = now();
       transaction(ctx.db, () => {
-        ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, active_turn_id = NULL, agent_status = 'starting', compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
-          .run(thread_id, harness, compacted ? 1 : 0, stamp, row.id);
+        ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, active_turn_id = NULL, agent_status = 'starting', updated_at = ? WHERE id = ?`)
+          .run(thread_id, harness, stamp, row.id);
         if (row.thread_id) ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND thread_id = ? AND status = 'pending'").run(stamp, row.id, row.thread_id);
       });
       if (row.thread_id) await addEvent(ctx, { featureId: row.id, kind: 'agent.session_replaced', summary: `Replaced native session ${row.thread_id} (${row.thread_harness ?? 'backend unknown'}) with ${thread_id} (${harness}). The previous conversation remains in its own backend.`, details: { previousThreadId: row.thread_id, previousHarness: row.thread_harness ?? null, threadId: thread_id, harness } });
@@ -1147,7 +934,7 @@ export async function bindAgentSession({ workspace_path, feature, thread_id, har
 
 // Undoes bindAgentSession when the new session never started a turn, restoring the previous
 // binding (or none) so a failed replacement cannot strand the lane on an unusable session.
-export async function releaseAgentSession({ workspace_path, feature, thread_id, previous_thread_id = null, previous_harness = null, compaction_pending = false, summary, owner_token }) {
+export async function releaseAgentSession({ workspace_path, feature, thread_id, previous_thread_id = null, previous_harness = null, summary, owner_token }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
@@ -1156,8 +943,8 @@ export async function releaseAgentSession({ workspace_path, feature, thread_id, 
       const row = featureBySlug(ctx.db, slug);
       if (!ownsAgent(ctx.db, row.id, owner_token) || row.thread_id !== thread_id || row.active_turn_id || row.agent_status !== 'starting') return { ignored: true };
       const cleanSummary = requiredText(summary, 'summary', { max: 100_000 });
-      ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, agent_status = 'failed', compaction_pending = ?, summary = ?, updated_at = ? WHERE id = ?`)
-        .run(previous_thread_id, previous_thread_id ? previous_harness : null, compaction_pending ? 1 : 0, cleanSummary, now(), row.id);
+      ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, agent_status = 'failed', summary = ?, updated_at = ? WHERE id = ?`)
+        .run(previous_thread_id, previous_thread_id ? previous_harness : null, cleanSummary, now(), row.id);
       await addEvent(ctx, { featureId: row.id, kind: 'agent.failed', summary: cleanSummary, details: { threadId: thread_id, restoredThreadId: previous_thread_id, restoredHarness: previous_thread_id ? previous_harness : null } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
@@ -1168,7 +955,7 @@ export async function releaseAgentSession({ workspace_path, feature, thread_id, 
 
 // Session state changes only for the session the lane is bound to, so late events from a
 // replaced session cannot mutate its replacement. New sessions are bound by bindAgentSession.
-export async function saveAgentSession({ workspace_path, feature, thread_id, turn_id = null, status, summary = undefined, compacted = false, owner_token, only_if_status = null, orphan_requests = false }) {
+export async function saveAgentSession({ workspace_path, feature, thread_id, turn_id = null, status, summary = undefined, owner_token, only_if_status = null, orphan_requests = false }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
@@ -1179,8 +966,8 @@ export async function saveAgentSession({ workspace_path, feature, thread_id, tur
       const cleanSummary = summary ? requiredText(summary, 'summary', { max: 100_000 }) : undefined;
       const stamp = now();
       transaction(ctx.db, () => {
-        ctx.db.prepare(`UPDATE features SET active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
-          .run(turn_id, status, cleanSummary ?? null, compacted ? 1 : 0, stamp, row.id);
+        ctx.db.prepare(`UPDATE features SET active_turn_id = ?, agent_status = ?, summary = COALESCE(?, summary), updated_at = ? WHERE id = ?`)
+          .run(turn_id, status, cleanSummary ?? null, stamp, row.id);
         if (status === 'disconnected' || orphan_requests) {
           ctx.db.prepare("UPDATE pending_agent_requests SET status = 'orphaned', resolved_at = ? WHERE feature_id = ? AND thread_id = ? AND status = 'pending'").run(stamp, row.id, thread_id);
         }
@@ -1382,32 +1169,5 @@ export async function resolveAgentRequestRecord({ workspace_path, feature, reque
       await writeIndex(ctx);
       return { status };
     } finally { ctx.db.close(); }
-  });
-}
-
-export async function markCompacted({ workspace_path, feature, owner_token, thread_id = undefined }) {
-  const root = await resolveWorkspace(workspace_path);
-  const slug = safeSlug(feature);
-  return await withWorkspaceLock(root, 'agent-state', async () => {
-    const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      if (!ownsAgent(ctx.db, row.id, owner_token) || (thread_id !== undefined && row.thread_id !== thread_id)) return { ignored: true };
-      ctx.db.prepare('UPDATE features SET compaction_pending = 0 WHERE id = ?').run(row.id);
-      await addEvent(ctx, { featureId: row.id, kind: 'agent.compacted', summary: 'Compacted the feature agent at a saved checkpoint.', details: { threadId: row.thread_id } });
-      const current = featureBySlug(ctx.db, slug);
-      await writeFeatureContext(ctx, current);
-      await writeIndex(ctx);
-      return summarizeFeature(ctx, current);
-    } finally { ctx.db.close(); }
-  });
-}
-
-export async function queueCompaction({ workspace_path, feature, owner_token }) {
-  return withContext(workspace_path, async ctx => {
-    const row = featureBySlug(ctx.db, safeSlug(feature));
-    if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
-    ctx.db.prepare('UPDATE features SET compaction_pending = 1 WHERE id = ?').run(row.id);
-    return { queued: true };
   });
 }

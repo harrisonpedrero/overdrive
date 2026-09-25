@@ -7,37 +7,8 @@ import { checkoutPath } from './git.mjs';
 import { OverdriveError, contained, ensureManagedPath, now, readJson, STATE_DIR, CONFIG_FILE } from './util.mjs';
 
 const SCHEMA_VERSION = 7;
-export const CHECK_QUEUE_META = 'checks:queue';
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
-
-// A direct check whose command was not confirmed stopped first records this marker in the lane's
-// database, so the clone stays reserved even if its interrupted queue job cannot be written.
-// Resolving that job with execution_stopped clears it.
-export const uncertainCheckKey = featureId => `checks-uncertain:${featureId}`;
-
-export function assertCheckReservation(db, featureId, receiptId = null) {
-  const marker = parseJson(meta(db, uncertainCheckKey(featureId)), null);
-  if (marker) throw new OverdriveError(`Verification job ${marker.jobKey} reserves this clone because its check command may still be running. Confirm it and its children stopped, then resolve the job with execution_stopped.`, 'CHECK_EXECUTION_RESERVED');
-  const raw = meta(db, CHECK_QUEUE_META);
-  if (!raw) return;
-  const queue = JSON.parse(raw);
-  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new OverdriveError('Unsupported verification queue state.', 'INVALID_STATE');
-  const reserved = queue.jobs.find(job => job.featureId === featureId && ['running', 'interrupted'].includes(job.status)
-    && !(job.status === 'running' && receiptId && job.attempts.at(-1)?.receiptId === receiptId));
-  if (reserved) throw new OverdriveError(`Verification job ${reserved.key} reserves this clone. Inspect the queue and resolve uncertain execution before reusing it.`, 'CHECK_EXECUTION_RESERVED');
-}
-
-// Records a directly run check whose command may still be running as an interrupted queue job, so
-// the clone stays reserved exactly as for an interrupted queued check until the coordinator confirms
-// execution stopped. The caller holds the verification-queue lock.
-export function reserveInterruptedCheck(db, job) {
-  const raw = meta(db, CHECK_QUEUE_META);
-  const queue = raw ? JSON.parse(raw) : { version: 1, runner: null, jobs: [] };
-  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new OverdriveError('Unsupported verification queue state.', 'INVALID_STATE');
-  queue.jobs.push(job);
-  meta(db, CHECK_QUEUE_META, JSON.stringify(queue));
-}
 
 function schema(db) {
   // The busy timeout comes first so another controller process holding a lock is waited for.
@@ -392,7 +363,6 @@ function normalizeFeature(row, root = undefined) {
     ...row,
     priority: Number(row.priority),
     spec_revision: Number(row.spec_revision),
-    compaction_pending: Boolean(row.compaction_pending),
   };
   if (root) {
     feature.checkout_location = checkoutLocation(root, row);
@@ -435,94 +405,6 @@ export function recordEvent(db, { featureId = null, workItemId = null, kind, sum
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(featureId, workItemId, kind, summary, JSON.stringify(details ?? {}), stamp);
   return { id: Number(result.lastInsertRowid), created_at: stamp };
-}
-
-// The runtime marks each candidate whose checks it derived from executed receipts, in the
-// candidate's own transaction. Authorship is never inferred from check text.
-export const candidateChecksKey = candidateId => `candidate-checks:${candidateId}`;
-
-// One string per receipt; checks never run are absent and optional failures stay labelled.
-export const receiptCheckText = receipt => `${receipt.key}${receipt.required ? '' : ' (optional)'}: ${receipt.status} · receipt ${receipt.receiptId}${receipt.reused ? ' · reused' : ''}`;
-
-// Verification snapshots each contract's per-check bindings (and reuse policy) under this key.
-export const contractSnapshotKey = (featureId, contract) => `verification-contract:${featureId}:${contract}`;
-
-// Verified checks are rebuilt only from the marker's receipt references, validated against the
-// candidate's own contract snapshot: every entry names a distinct check of that contract with its
-// required flag, every required check is present and passed, and each receipt is an executed receipt of
-// the candidate's feature, revision, key and outcome that was eligible under verificationStatus's
-// semantics: a direct receipt ran under that exact contract; a reused one ran under the same spec
-// revision with an identical check binding, and a passing reuse also needs that contract's
-// reuse_same_revision policy. A snapshot lacking those policies fails closed; saved strings are never
-// trusted. Returns null for an unmarked (legacy) candidate and checks: null for an inconsistent marker.
-export function markedCandidateChecks(db, candidateId) {
-  const raw = typeof candidateId === 'string' ? meta(db, candidateChecksKey(candidateId)) : undefined;
-  if (raw === undefined) return null;
-  const marker = parseJson(raw, null);
-  const candidate = db.prepare('SELECT feature_id, revision, contract_hash, spec_revision FROM candidates WHERE id = ?').get(candidateId);
-  if (!candidate?.contract_hash) return { checks: null };
-  const receipt = db.prepare("SELECT passed, contract_hash, spec_revision FROM evidence WHERE id = ? AND feature_id = ? AND source = 'executed' AND check_key = ? AND revision = ?");
-  const snapshot = contract => {
-    const saved = parseJson(meta(db, contractSnapshotKey(candidate.feature_id, contract)), null);
-    return saved?.version === 1 && saved.checks && typeof saved.checks === 'object' ? saved : null;
-  };
-  const current = snapshot(candidate.contract_hash);
-  const binding = key => Object.hasOwn(current?.checks ?? {}, key) && /^[a-f0-9]{64}$/.test(current.checks[key] ?? '') ? current.checks[key] : null;
-  const eligible = entry => {
-    const row = receipt.get(entry.receiptId, candidate.feature_id, entry.key, candidate.revision);
-    if (!row || row.passed !== (entry.status === 'passed' ? 1 : 0)) return false;
-    if (!entry.reused) return row.contract_hash === candidate.contract_hash;
-    if (row.contract_hash === candidate.contract_hash || row.spec_revision !== candidate.spec_revision) return false;
-    const original = snapshot(row.contract_hash);
-    return Object.hasOwn(original?.checks ?? {}, entry.key) && original.checks[entry.key] === binding(entry.key)
-      && (entry.status === 'failed' || current.reuse.includes(entry.key));
-  };
-  const receipts = marker?.version === 1 && marker.source === 'executed-receipts' && Array.isArray(marker.receipts) ? marker.receipts : [];
-  const keys = receipts.map(entry => entry?.key);
-  const valid = Array.isArray(current?.required) && Array.isArray(current.reuse) && current.required.length > 0
-    && new Set(keys).size === keys.length && current.required.every(key => keys.includes(key))
-    && receipts.every(entry => typeof entry?.key === 'string' && binding(entry.key) && typeof entry.receiptId === 'string'
-      && ['passed', 'failed'].includes(entry.status) && entry.required === current.required.includes(entry.key)
-      && typeof entry.reused === 'boolean' && (!entry.required || entry.status === 'passed') && eligible(entry));
-  return { checks: valid ? receipts.map(receiptCheckText) : null };
-}
-
-// Splits saved check strings against the marker: verified checks always come from the marker, and saved
-// strings that differ from it are only unverified claims.
-export function bindCandidateChecks(db, candidateId, saved) {
-  const entries = (Array.isArray(saved) ? saved : saved === undefined ? [] : [saved]).map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry));
-  const marked = markedCandidateChecks(db, candidateId);
-  if (!marked) return { checks: [], unverifiedChecks: entries, checkProvenance: 'legacy-caller-reported' };
-  const checks = marked.checks ?? [];
-  const exact = Boolean(marked.checks) && entries.length === checks.length && entries.every((entry, index) => entry === checks[index]);
-  return { checks, unverifiedChecks: exact ? [] : entries.filter(entry => !checks.includes(entry)), checkProvenance: exact ? 'executed-receipts' : 'marker-mismatch' };
-}
-
-export const candidateRecordedSummary = (revision, checkCount, noteCount) =>
-  `Recorded candidate ${revision.slice(0, 12)} with ${checkCount} executed check receipt(s)${noteCount ? `; ${noteCount} unverified caller note(s)` : ''}.`;
-
-// Events are immutable history, projected on read. A candidate.recorded event whose candidate lacks the
-// marker predates receipt provenance; a marked one is shown as recorded only when its checks match the
-// marker and its summary is exactly the one rebuilt from the candidate revision, verified check count and
-// the event's own note count. Otherwise saved check strings are only unverified claims, and a marked
-// event's summary is rebuilt from the candidate record instead of echoing altered text.
-const LEGACY_CANDIDATE_SUMMARY = / with (\d+) check\(s\)\.$/;
-export function projectCandidateEvent(db, event) {
-  if (event.kind !== 'candidate.recorded') return event;
-  const { checks: saved, ...details } = event.details ?? {};
-  const bound = bindCandidateChecks(db, details.candidateId, saved);
-  if (bound.checkProvenance === 'legacy-caller-reported') {
-    const summary = LEGACY_CANDIDATE_SUMMARY.test(event.summary)
-      ? event.summary.replace(LEGACY_CANDIDATE_SUMMARY, ' with $1 caller-reported check claim(s), not verified as executed.')
-      : `${event.summary} (caller-reported checks, not verified as executed)`;
-    return { ...event, summary, details: { ...details, ...bound } };
-  }
-  const revision = db.prepare('SELECT revision FROM candidates WHERE id = ?').get(details.candidateId)?.revision;
-  const notes = details.unverifiedNotes;
-  if (bound.checkProvenance === 'executed-receipts' && revision && Array.isArray(notes)
-    && event.summary === candidateRecordedSummary(revision, bound.checks.length, notes.length)) return event;
-  const summary = `Candidate ${revision ? revision.slice(0, 12) : details.candidateId} event does not match its receipt record; ${bound.checks.length} executed check receipt(s) verified.`;
-  return { ...event, summary, details: { ...details, ...bound, checkProvenance: 'marker-mismatch' } };
 }
 
 export function newId(prefix) {

@@ -4,11 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { DatabaseSync } from 'node:sqlite';
 import { run } from '../plugins/overdrive/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
-import { drainCheckQueue, enqueueChecks, inspectCheckQueue, resolveCheckJob } from '../plugins/overdrive/scripts/check-queue.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, recordCandidate } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'taskkill applies only on Windows' };
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -143,100 +139,4 @@ test('every timed-out Windows command settles within its close deadline while a 
   assert.match(failed.terminationUncertain, /did not close within 1s of it \(taskkill exited 1\)/);
   assert.equal(await stopped(await readPid(parent)), true);
   assert.equal(alive(await readPid(descendant)), true);
-});
-
-// A lane with a passing receipt and a ready candidate whose check, while .hang names a PID file,
-// records its PID there and outlives its one-second deadline.
-async function verifiedLane(t, feature) {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-uncertain-check-'));
-  t.after(() => fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 }));
-  const args = { workspace_path: workspace, feature };
-  await initializeManagedProject({ workspace_path: workspace, project_name: 'Hanging', description: 'A check can outlive its deadline.' });
-  const repo = (await createFeature({ ...args, title: 'Hanging', outcome: 'Verified only when its checks settle.', spec: '# Hanging\n\nThe README exists.' })).feature.checkoutPath;
-  await fs.appendFile(path.join(repo, '.git', 'info', 'exclude'), '\n.hang\n');
-  await updateChecks({ ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', timeout_seconds: 1, argv: [process.execPath, '-e',
-    "const fs = require('node:fs'); fs.readFileSync('README.md'); if (fs.existsSync('.hang')) { fs.writeFileSync(fs.readFileSync('.hang', 'utf8'), String(process.pid)); setTimeout(() => {}, 30000); }"] }] });
-  assert.equal((await runChecks(args)).verification.ready, true);
-  await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  const database = () => new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
-  const executedReceipts = () => {
-    const db = database();
-    try { return db.prepare("SELECT id, passed FROM evidence WHERE source = 'executed' ORDER BY rowid").all().map(row => ({ ...row })); }
-    finally { db.close(); }
-  };
-  return { workspace, args, repo, database, executedReceipts, hang: pidFile => fs.writeFile(path.join(repo, '.hang'), pidFile) };
-}
-
-test('an unconfirmed check stop records no receipt and reserves the clone until execution_stopped', windowsOnly, async t => {
-  const shim = await failingTaskkill(t);
-  const { workspace, args, repo, executedReceipts, hang } = await verifiedLane(t, 'hanging');
-  const directPid = shim.pidFile('direct');
-  const queuedPid = shim.pidFile('queued');
-  const receipts = executedReceipts();
-
-  await hang(directPid);
-  await assert.rejects(runChecks(args), error => error.code === 'COMMAND_TERMINATION_UNCERTAIN' && /^direct-/.test(error.details.reservedBy) && /No receipt was recorded/.test(error.message));
-  assert.equal(await stopped(await readPid(directPid)), true);
-  assert.deepEqual(executedReceipts(), receipts);
-  const reserved = (await inspectCheckQueue({ workspace_path: workspace })).jobs.find(job => job.direct);
-  assert.equal(reserved.status, 'interrupted');
-  assert.equal((await getFeatureContext(args)).timeline[0].kind, 'checks.execution_uncertain');
-  // The earlier pass stays on record but cannot be used, and the clone cannot be verified again.
-  const reservedError = error => error.code === 'CHECK_EXECUTION_RESERVED' && error.message.includes(reserved.key);
-  await assert.rejects(runChecks(args), reservedError);
-  await assert.rejects(recordCandidate({ ...args, summary: 'Ready again.', checks: ['README receipt'] }), reservedError);
-  await assert.rejects(resolveCheckJob({ workspace_path: workspace, job_key: reserved.key, action: 'cancel', reason: 'Unverified.' }), error => error.code === 'EXECUTION_UNCERTAIN');
-  await resolveCheckJob({ workspace_path: workspace, job_key: reserved.key, action: 'cancel', reason: 'The check process exited.', execution_stopped: true });
-
-  // A queued run keeps its own job interrupted, again without a receipt.
-  await hang(queuedPid);
-  await enqueueChecks({ workspace_path: workspace, jobs: [{ key: 'hanging-readme', feature: 'hanging', check_key: 'readme' }] });
-  const queued = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'hanging-readme');
-  assert.equal(queued.status, 'interrupted');
-  assert.match(queued.reason, /No receipt was recorded/);
-  assert.equal(await stopped(await readPid(queuedPid)), true);
-  assert.deepEqual(executedReceipts(), receipts);
-  await assert.rejects(runChecks(args), error => error.code === 'CHECK_EXECUTION_RESERVED');
-  await resolveCheckJob({ workspace_path: workspace, job_key: 'hanging-readme', action: 'cancel', reason: 'The check process exited.', execution_stopped: true });
-
-  await fs.rm(path.join(repo, '.hang'));
-  assert.equal((await runChecks(args)).verification.ready, true);
-});
-
-test('a direct check reservation fails closed on the lane when the queue cannot record it', windowsOnly, async t => {
-  const shim = await failingTaskkill(t);
-  const { workspace, args, repo, executedReceipts, hang } = await verifiedLane(t, 'unqueued');
-  const receipts = executedReceipts();
-  // A directory where the queue lock file belongs makes the interrupted job impossible to write.
-  const queueLock = path.join(workspace, '.overdrive', 'locks', 'verification-queue.lock');
-  await fs.mkdir(queueLock, { recursive: true });
-  await hang(shim.pidFile('direct'));
-  let reservedBy;
-  await assert.rejects(runChecks(args), error => {
-    reservedBy = error.details?.reservedBy;
-    return error.code === 'COMMAND_TERMINATION_UNCERTAIN' && /^direct-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(reservedBy)
-      && Boolean(error.details.reservationError) && /recorded on the lane only/.test(error.message);
-  });
-  await fs.rm(queueLock, { recursive: true });
-  assert.deepEqual(executedReceipts(), receipts);
-  assert.equal((await inspectCheckQueue({ workspace_path: workspace })).jobs.length, 0);
-  const reservedError = error => error.code === 'CHECK_EXECUTION_RESERVED' && error.message.includes(reservedBy);
-  await assert.rejects(runChecks(args), reservedError);
-  await assert.rejects(recordCandidate({ ...args, summary: 'Ready again.', checks: ['README receipt'] }), reservedError);
-  // A queued check for the lane is deferred before its command starts rather than interrupted.
-  await enqueueChecks({ workspace_path: workspace, jobs: [{ key: 'unqueued-readme', feature: 'unqueued', check_key: 'readme' }] });
-  const deferred = (await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'unqueued-readme');
-  assert.equal(deferred.status, 'queued');
-  assert.equal(deferred.attempts.at(-1).status, 'deferred');
-  assert.deepEqual(executedReceipts(), receipts);
-
-  await assert.rejects(resolveCheckJob({ workspace_path: workspace, job_key: reservedBy, action: 'cancel', reason: 'Unverified.' }), error => error.code === 'EXECUTION_UNCERTAIN');
-  await assert.rejects(resolveCheckJob({ workspace_path: workspace, job_key: reservedBy, action: 'retry', reason: 'No job.', execution_stopped: true }), error => error.code === 'INVALID_INPUT');
-  // A queue job that shares the marker's key but is not interrupted still cannot release it unconfirmed.
-  await enqueueChecks({ workspace_path: workspace, jobs: [{ key: reservedBy, feature: 'unqueued', check_key: 'readme' }] });
-  await assert.rejects(resolveCheckJob({ workspace_path: workspace, job_key: reservedBy, action: 'cancel', reason: 'Unverified.' }), error => error.code === 'EXECUTION_UNCERTAIN');
-  await assert.rejects(runChecks(args), reservedError);
-  assert.equal((await resolveCheckJob({ workspace_path: workspace, job_key: reservedBy, action: 'cancel', reason: 'The check process exited.', execution_stopped: true })).job.status, 'cancelled');
-  await fs.rm(path.join(repo, '.hang'));
-  assert.equal((await drainCheckQueue({ workspace_path: workspace })).jobs.find(job => job.key === 'unqueued-readme').status, 'passed');
 });

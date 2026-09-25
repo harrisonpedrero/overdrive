@@ -79,13 +79,6 @@ function handle({ id, method, params = {} }) {
     if (active?.completeOnSecondRead && active.reads === 2) complete(threadId, active.id, 'completed');
     return;
   }
-  if (method === 'thread/compact/start') {
-    send({ id, result: {} });
-    const turnId = `compact-${randomUUID()}`;
-    send({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress' } } });
-    send({ method: 'thread/compacted', params: { threadId, turnId } });
-    return send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed', items: [] } } });
-  }
   send({ id, result: { thread: { id: threadId } } });
 }
 

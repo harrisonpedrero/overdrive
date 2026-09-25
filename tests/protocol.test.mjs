@@ -35,7 +35,7 @@ test('app-server client initializes and filters final visible output', async t =
   await client.ensureStarted();
   const thread = await client.startThread({ cwd: here, runtimeWorkspaceRoots: [here], developerInstructions: 'fixture' });
   assert.equal(thread.thread.id, 'thread-fixture');
-  const turn = await client.startTurn({ threadId: 'thread-fixture', instruction: 'work', cwd: here, runtimeWorkspaceRoots: [here] });
+  const turn = await client.request('turn/start', { threadId: 'thread-fixture', input: [{ type: 'text', text: 'work', text_elements: [] }] });
   assert.equal(turn.turn.id, 'turn-fixture');
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.ok(notifications.some(event => event.method === 'item/reasoning/textDelta'));
@@ -71,7 +71,7 @@ test('MCP server advertises the native OVERDRIVE command surface', async t => {
   assert.equal(initialized.result.serverInfo.title, 'OVERDRIVE');
   const listed = await request(2, 'tools/list');
   const names = listed.result.tools.map(tool => tool.name);
-  for (const expected of ['workspace_init', 'project_create', 'feature_create', 'feature_update', 'work_update', 'agent_start', 'agent_steer', 'candidate_promote', 'checks_update', 'checks_run', 'view', 'agent_wait']) assert.ok(names.includes(expected));
+  for (const expected of ['workspace_init', 'project_create', 'feature_create', 'feature_update', 'work_update', 'agent_start', 'agent_steer', 'view', 'agents_wait']) assert.ok(names.includes(expected));
   assert.equal(new Set(names).size, names.length);
   server.stdin.end();
 });

@@ -5,25 +5,18 @@ import {
   initializeManagedProject,
   initializeWorkspace,
   listFeatures,
-  promoteManagedCandidate,
-  recordCandidate,
-  recordEvidence,
   updateFeature,
   updateWork,
 } from './workspace.mjs';
 import {
-  compactFeatureAgent,
   inspectFeatureAgent,
   interruptFeatureAgent,
   resolveFeatureAgentRequest,
   startFeatureAgent,
   steerFeatureAgent,
   stopFeatureLane,
-  waitFeatureAgent,
   waitFeatureAgents,
 } from './agent-runtime.mjs';
-import { readEvidence, runChecks, updateChecks } from './verification.mjs';
-import { enqueueChecks, inspectCheckQueue, drainCheckQueue, resolveCheckJob } from './check-queue.mjs';
 import { composeView } from './presentation.mjs';
 
 const string = (description, extra = {}) => ({ type: 'string', description, ...extra });
@@ -54,59 +47,16 @@ const priorTurnAttestation = consequence => ({
 const workspace = { workspace_path: string('Absolute path to the OVERDRIVE control workspace.') };
 const feature = { feature: string('Feature slug, such as search-redesign.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) };
 export const TOOLS = [
-  tool('agents_wait', 'Receive the next feature handoff', 'Wait on up to eight unreconciled feature workers together. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
+  tool('agents_wait', 'Receive the next feature handoff', 'Wait for a completion or input request from feature workers. Without features, waits on every lane this controller has running or has not yet handed off. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
     ...workspace,
-    features: { type: 'array', minItems: 1, maxItems: 8, uniqueItems: true, items: string('Feature slug still awaiting reconciliation; omit already handled idle lanes.') },
+    features: { type: 'array', minItems: 1, uniqueItems: true, items: string('Feature slug still awaiting reconciliation; omit already handled idle lanes.') },
     timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
-  }, ['workspace_path', 'features']), { readOnlyHint: true, openWorldHint: true }),
-  tool('checks_enqueue', 'Queue authorized verification', 'Bind reviewed configured checks to their current clean commit and full contract. One check per job; stable keys make identical enqueue requests idempotent. Dependencies stop on failure; the same clone and named shared resources serialize. The queue keeps up to 500 jobs; beyond that the oldest unreferenced passed or cancelled jobs are retired to the event log, keeping their receipts.', object({
-    ...workspace,
-    jobs: { type: 'array', minItems: 1, maxItems: 50, items: object({
-      key: string('Unique durable job key. Use a new key for a changed revision or plan.'), ...feature,
-      check_key: string('Exact configured check key.'),
-      depends_on: { type: 'array', maxItems: 50, uniqueItems: true, items: string('Prerequisite job key in this queue or batch.') },
-      resources: { type: 'array', maxItems: 20, uniqueItems: true, items: string('Shared exclusive resource key, such as port-4200 or gpu-benchmark. External commands must be coordinated separately.') },
-    }, ['key', 'feature', 'check_key']) },
-  }, ['workspace_path', 'jobs']), { destructiveHint: false, idempotentHint: true }),
-  tool('checks_queue', 'Inspect verification queue', 'Read durable jobs, timings, receipts and blockers; reconcile a dead controller with exact completed receipts or quarantine uncertain execution. Does not execute checks.', object(workspace, ['workspace_path']), { destructiveHint: false, idempotentHint: true }),
-  tool('checks_drain', 'Advance ready verification', 'Execute eligible jobs and immediately release successors. Failures stop dependents, while disjoint ready jobs continue. Returns completion and decision handoffs for prompt coordinator reconciliation; never launches feature workers or accepts candidates.', object({
-    ...workspace,
-    max_parallel: integer('Concurrent jobs; defaults to 2. Same-clone and shared-resource exclusion always applies.', 1, 4),
-    max_checks: integer('Maximum admissions in this call; defaults to 10.', 1, 50),
-    admission_seconds: integer('Stop admitting new jobs after this many seconds, default 60. Already admitted checks finish under their configured deadlines; this is not a call timeout.', 1, 300),
-  }, ['workspace_path']), { destructiveHint: false, openWorldHint: true }),
-  tool('checks_resolve', 'Resolve stopped verification', 'After inspecting a failure or interrupted command, explicitly retry its unchanged binding or cancel it. Changed commits/contracts require new jobs. Interrupted execution, including a direct checks_run job whose command was not confirmed stopped, retains resources until command termination is established.', object({
-    ...workspace, job_key: string('Queue job key.'), action: string('Resolution.', { enum: ['retry', 'cancel'] }),
-    reason: string('Observed cause and resolution; for interruption, include how command and child-process termination was established.'),
-    execution_stopped: boolean('Required true for interrupted jobs, only after verifying the old command and children stopped.'),
-  }, ['workspace_path', 'job_key', 'action', 'reason']), { destructiveHint: false }),
+  }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
   tool('view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
     ...workspace, ...feature,
     work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
     page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
-  tool('checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Commands execute in the submitted order, so list setup before dependent checks; reordering changes the contract. Changes invalidate earlier candidates; execute through checks_run or the verification queue.', object({
-    ...workspace, ...feature,
-    checks: { type: 'array', maxItems: 50, items: object({
-      key: string('Stable check key.'), purpose: string('Behavior this command verifies.'),
-      argv: { type: 'array', minItems: 1, items: string('Executable followed by its arguments; no implicit shell.') },
-      kind: string('Evidence kind, such as test, typecheck, browser, integration.'),
-      required: boolean('Whether a failure prevents completion; defaults to true.'),
-      timeout_seconds: integer('Command deadline; defaults to 300 seconds.', 1, 1800),
-      reuse_same_revision: boolean('Opt in only for a standalone check whose non-Git inputs are immutable and bound by its command or spec/work contract. Preserve exact same-revision proof across unrelated check changes. Do not enable for mutable shared setup or opaque external inputs.'),
-      work_scope: { type: 'array', minItems: 1, maxItems: 200, uniqueItems: true, items: string('Exact existing work item key.'), description: 'Optional prospective work binding for an independent reuse_same_revision check: selected definitions plus all transitive prerequisites. Omit to bind all work. Adding or changing scope requires new proof; unrelated work cannot inherit its receipt. Full spec and exact source binding remain required.' },
-      artifact_paths: { type: 'array', maxItems: 20, items: string('Existing output file or directory to retain after this check, relative to its checkout. No globs, overlapping paths, Git metadata, or symlinks.'), description: 'Optional artifact collection contract. Copy these paths into the receipt archive before the next check. Missing paths or copy errors fail the receipt and stop remaining checks.' },
-    }, ['key', 'purpose', 'argv']) },
-  }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),
-
-  tool('checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature, stopping at the first failure for inspection. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract. A timed-out command whose process tree cannot be confirmed stopped fails with COMMAND_TERMINATION_UNCERTAIN and no receipt; its interrupted job then reserves the clone until checks_resolve.', object({
-    ...workspace, ...feature,
-    check_keys: { type: 'array', minItems: 1, maxItems: 50, uniqueItems: true, items: string('Exact configured check key.'), description: 'Optional nonempty selection of known checks, executed in saved order. Omit to run all. Does not edit the contract or create receipts for omitted checks.' },
-  }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
-
-  tool('evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks or feature context.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
-
-  tool('agent_wait', 'Wait for a feature result', 'Wait up to 60 seconds for a feature completion or input request and return compact progress. Use after dispatch when the coordinator is continuing the work; no repeated model polling is needed.', object({ ...workspace, ...feature, timeout_seconds: integer('Bounded wait; defaults to 30 seconds.', 1, 60) }, ['workspace_path', 'feature']), { readOnlyHint: true, openWorldHint: true }),
 
   tool('workspace_init', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
@@ -141,7 +91,7 @@ export const TOOLS = [
     refresh_git: boolean('Refresh Git status for each clone; slower on many features.'),
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, safe timeline, Git facts, evidence, candidate, and pending agent requests.', object({
+  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, safe timeline, Git facts, recorded evidence history, and pending agent requests.', object({
     ...workspace,
     ...feature,
     timeline_limit: integer('Number of recent safe events.', 1, 200),
@@ -180,34 +130,6 @@ export const TOOLS = [
     remove: { type: 'array', items: string('Key of a work item to remove.'), maxItems: 200 },
   }, ['workspace_path', 'feature']), { destructiveHint: false }),
 
-  tool('evidence_record', 'Record feature evidence', 'Record an actually executed check, artifact inspection, review, or other evidence at an exact revision when available.', object({
-    ...workspace,
-    ...feature,
-    work_item: string('Optional associated work item key.'),
-    kind: string('Evidence kind, such as test, typecheck, browser, review, or benchmark.'),
-    summary: string('Observed result, including relevant limitations.'),
-    command: string('Exact command when one was executed.'),
-    artifact: string('Artifact or report path.'),
-    revision: string('Exact Git revision the evidence applies to.'),
-    passed: boolean('Whether this is passing or failing evidence; omit for a neutral note.'),
-  }, ['workspace_path', 'feature', 'kind', 'summary']), { destructiveHint: false }),
-
-  tool('candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate. Its checks are derived only from the executed receipts for that revision and current contract, one "key: outcome · receipt id" string each; caller text is never counted or shown as an executed check. A paused or archived lane is refused until it is made active again. Does not push, open a PR, or merge.', object({
-    ...workspace,
-    ...feature,
-    revision: string('Candidate commit; defaults to HEAD.'),
-    summary: string('What the candidate changes and why it is ready.'),
-    checks: { type: 'array', maxItems: 100, items: string('Optional reviewer note.'), description: 'Optional caller notes, echoed only as unverifiedNotes in the response and timeline event. They are never stored, counted or shown as the candidate\'s executed checks; those come only from runtime receipts.' },
-    allow_dirty: boolean('Deprecated: true is refused because evidence must describe a clean commit.'),
-  }, ['workspace_path', 'feature', 'summary']), { destructiveHint: false }),
-
-  tool('candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to a recorded feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
-    ...workspace,
-    ...feature,
-    revision: string('Candidate revision; defaults to the latest recorded candidate.'),
-    summary: string('Optional concise promotion disposition.'),
-  }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
-
   tool('agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only that feature context and the repository instructions. For a bounded work item, include its key and outcome in instruction.', object({
     ...workspace,
     ...feature,
@@ -230,8 +152,6 @@ export const TOOLS = [
     effort: string('Reasoning effort for a new follow-up turn.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
   }, ['workspace_path', 'feature', 'instruction']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('agent_compact', 'Compact feature agent', 'Compact an idle feature task. If a turn is active, leave compaction queued.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
-
   tool('agent_interrupt', 'Interrupt feature agent', 'Interrupt an active feature turn while preserving the task and checkout.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: true, openWorldHint: true }),
 
   tool('agent_request_resolve', 'Resolve feature agent request', 'Relay the user-approved answer to a pending command, permission, elicitation, or input request from the feature task.', object({
@@ -246,14 +166,6 @@ export const TOOLS = [
 
 const handlers = {
   view: composeView,
-  checks_update: updateChecks,
-  checks_run: runChecks,
-  checks_enqueue: enqueueChecks,
-  checks_queue: inspectCheckQueue,
-  checks_drain: drainCheckQueue,
-  checks_resolve: resolveCheckJob,
-  evidence_get: readEvidence,
-  agent_wait: waitFeatureAgent,
   agents_wait: waitFeatureAgents,
   workspace_init: initializeWorkspace,
   project_create: initializeManagedProject,
@@ -265,13 +177,9 @@ const handlers = {
     return await (['paused', 'archived'].includes(args.status) ? stopFeatureLane(args) : updateFeature(args));
   },
   work_update: updateWork,
-  evidence_record: recordEvidence,
-  candidate_record: recordCandidate,
-  candidate_promote: promoteManagedCandidate,
   agent_start: startFeatureAgent,
   agent_inspect: inspectFeatureAgent,
   agent_steer: steerFeatureAgent,
-  agent_compact: compactFeatureAgent,
   agent_interrupt: interruptFeatureAgent,
   agent_request_resolve: resolveFeatureAgentRequest,
 };

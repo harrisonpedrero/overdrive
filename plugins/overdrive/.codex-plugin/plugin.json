@@ -43,9 +43,6 @@
         "workspace_init": {
           "approval_mode": "prompt"
         },
-        "candidate_promote": {
-          "approval_mode": "prompt"
-        },
         "agent_request_resolve": {
           "approval_mode": "prompt"
         }

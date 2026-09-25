@@ -77,12 +77,13 @@ test('a restarted controller waits for saved Codex turns and preserves inspect-b
     await createFeature({ workspace_path: root, feature, title: feature, outcome: 'Finish a saved turn.', spec: '# Saved turn' });
   }
   const args = feature => ({ workspace_path: root, feature });
+  const wait = feature => ({ workspace_path: root, features: [feature], timeout_seconds: 3 });
   let current = await launch();
   await current.call('start', args('normal'));
-  const normal = await current.call('wait', { ...args('normal'), timeout_seconds: 2 });
+  const normal = await current.call('wait', wait('normal'));
   assert.equal(normal.timedOut, false);
-  assert.equal(normal.feature.agent.status, 'idle');
-  assert.match(normal.feature.summary, /^Codex handoff for turn-/);
+  assert.equal(normal.handoffs[0].feature.agent.status, 'idle');
+  assert.match(normal.handoffs[0].feature.summary, /^Codex handoff for turn-/);
 
   const after = await current.call('start', { ...args('after'), instruction: 'FAKE_COMPLETE_AFTER_RESUME' });
   const during = await current.call('start', { ...args('during'), instruction: 'FAKE_COMPLETE_ON_RESUME' });
@@ -94,28 +95,28 @@ test('a restarted controller waits for saved Codex turns and preserves inspect-b
   await current.kill();
   current = await launch();
 
-  const waited = await current.call('wait', { ...args('after'), timeout_seconds: 3 });
+  const waited = await current.call('wait', wait('after'));
   assert.equal(waited.timedOut, false);
-  assert.deepEqual({ status: waited.feature.agent.status, turnId: waited.feature.agent.activeTurnId }, { status: 'idle', turnId: null });
-  assert.equal(waited.feature.summary, `Codex handoff for ${after.turnId}.`);
+  assert.deepEqual({ status: waited.handoffs[0].feature.agent.status, turnId: waited.handoffs[0].feature.agent.activeTurnId }, { status: 'idle', turnId: null });
+  assert.equal(waited.handoffs[0].feature.summary, `Codex handoff for ${after.turnId}.`);
 
   const inspected = await current.call('inspect', args('during'));
   assert.equal(inspected.warning, null);
   assert.equal(inspected.feature.agent.status, 'idle');
   assert.equal(inspected.feature.summary, `Codex handoff for ${during.turnId}.`);
-  const afterInspect = await current.call('wait', { ...args('during'), timeout_seconds: 2 });
+  const afterInspect = await current.call('wait', wait('during'));
   assert.equal(afterInspect.timedOut, false);
-  assert.equal(afterInspect.feature.summary, `Codex handoff for ${during.turnId}.`);
-  assert.equal(afterInspect.feature.agent.status, 'idle');
+  assert.equal(afterInspect.handoffs[0].feature.summary, `Codex handoff for ${during.turnId}.`);
+  assert.equal(afterInspect.handoffs[0].feature.agent.status, 'idle');
   const completions = (await getFeatureContext({ ...args('during'), timeline_limit: 50 })).timeline.filter(event => event.kind === 'agent.idle' && event.summary === `Codex handoff for ${during.turnId}.`);
   assert.equal(completions.length, 1);
   const runningInspect = await current.call('inspect', args('inspected'));
   assert.equal(runningInspect.warning, null);
   assert.equal(runningInspect.feature.agent.status, 'running');
-  const afterRunningInspect = await current.call('wait', { ...args('inspected'), timeout_seconds: 3 });
+  const afterRunningInspect = await current.call('wait', wait('inspected'));
   assert.equal(afterRunningInspect.timedOut, false);
-  assert.equal(afterRunningInspect.feature.agent.status, 'idle');
-  assert.equal(afterRunningInspect.feature.summary, `Codex handoff for ${inspectedTurn.turnId}.`);
+  assert.equal(afterRunningInspect.handoffs[0].feature.agent.status, 'idle');
+  assert.equal(afterRunningInspect.handoffs[0].feature.summary, `Codex handoff for ${inspectedTurn.turnId}.`);
   const resumed = (await lines(env.FAKE_CODEX_LOG)).filter(entry => entry.method === 'thread/resume').map(entry => entry.threadId);
   assert.ok([after.threadId, during.threadId, inspectedTurn.threadId].every(threadId => resumed.includes(threadId)));
   await current.stop();
@@ -222,15 +223,6 @@ test('saved sessions keep their owning backend across harness changes and real c
   assert.deepEqual({ interrupted: interrupted.interrupted, harness: interrupted.harness }, { interrupted: true, harness: 'claude' });
   await settled('interrupted');
 
-  // Compaction queued behind an active turn runs on the owning backend when the turn ends.
-  await current.call('start', { ...args, instruction: 'Write one more file.' });
-  assert.equal((await current.call('compact', args)).queued, true);
-  await eventually(async () => {
-    const state = await getFeatureContext(args);
-    return state.feature.agent.status === 'idle' && !state.feature.compactionPending;
-  }, 'queued compaction');
-  assert.ok((await getFeatureContext({ ...args, timeline_limit: 50 })).timeline.some(event => event.kind === 'agent.compacted' && event.details.threadId === claudeThread));
-
   // A hard controller kill mid-turn leaves a turn that may still be running. The next controller
   // cannot see Claude history, so it keeps the turn uncertain and dispatches nothing until the
   // coordinator attests; then it resumes on the owner, not the configured harness.
@@ -275,7 +267,7 @@ test('saved sessions keep their owning backend across harness changes and real c
   assert.ok(codexLog.length > 0 && claudeLog.length > 0);
   assert.ok(codexLog.every(entry => entry.threadId === null || entry.threadId.startsWith('codex-')), 'Codex never received a Claude session');
   assert.ok(claudeLog.every(entry => entry.sessionId === claudeThread), 'Claude never received a Codex session');
-  assert.deepEqual(claudeLog.map(entry => entry.mode), ['create', 'resume', 'resume', 'resume', 'resume', 'resume']);
+  assert.deepEqual(claudeLog.map(entry => entry.mode), ['create', 'resume', 'resume', 'resume', 'resume']);
 });
 
 test('a real Codex app-server refusal fails the turn while a lost response is reconciled without a duplicate turn', async t => {

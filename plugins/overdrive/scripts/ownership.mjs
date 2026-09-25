@@ -1,4 +1,4 @@
-import { assertCheckReservation, loadWorkspace, featureBySlug, meta, parseJson, readFeatureRow, recordEvent, transaction } from './state.mjs';
+import { loadWorkspace, featureBySlug, meta, parseJson, readFeatureRow, recordEvent, transaction } from './state.mjs';
 import { OverdriveError, now, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function ownerAlive(owner) {
@@ -27,7 +27,7 @@ const RELEASE_DEAD_OWNER = `UPDATE features SET
 
 export function recoverAgentState(ctx, feature) {
   const owner = agentOwner(ctx.db, feature.id);
-  if (!owner || ownerAlive(owner) || feature.agent_status === 'uncertain' || (!feature.active_turn_id && !['starting','compacting','waiting_for_user'].includes(feature.agent_status))) return feature;
+  if (!owner || ownerAlive(owner) || feature.agent_status === 'uncertain' || (!feature.active_turn_id && !['starting', 'waiting_for_user'].includes(feature.agent_status))) return feature;
   transaction(ctx.db, () => {
     if (agentOwner(ctx.db, feature.id)?.token !== owner.token) return;
     ctx.db.prepare(RELEASE_DEAD_OWNER).run(feature.id);
@@ -39,7 +39,7 @@ export function recoverAgentState(ctx, feature) {
 }
 
 // 'uncertain': a turn request had no confirmed outcome, so the turn may be running.
-const BUSY_STATUSES = ['starting', 'uncertain', 'compacting', 'waiting_for_user'];
+const BUSY_STATUSES = ['starting', 'uncertain', 'waiting_for_user'];
 export const AGENT_BUSY_SQL = `(active_turn_id IS NOT NULL OR agent_status IN (${BUSY_STATUSES.map(status => `'${status}'`).join(', ')}))`;
 
 // Set when a worker process was stopped without its process tree, so tools it launched may
@@ -74,11 +74,8 @@ export async function withAgentControl(args, token, fn) {
   const slug = safeSlug(args.feature);
   return withWorkspaceLock(root, `control-${slug}`, async () => {
     const ctx = await loadWorkspace(root);
-    try {
-      const row = featureBySlug(ctx.db, slug);
-      assertCheckReservation(ctx.db, row.id);
-      claimAgentControl(ctx, row, token);
-    } finally { ctx.db.close(); }
+    try { claimAgentControl(ctx, featureBySlug(ctx.db, slug), token); }
+    finally { ctx.db.close(); }
     return fn(root, slug);
   });
 }

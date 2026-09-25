@@ -8,7 +8,7 @@ import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.m
 import { initializeManagedProject, createFeature, getFeatureContext, updateFeature } from '../plugins/overdrive/scripts/workspace.mjs';
 
 class Bridge extends EventEmitter {
-  constructor() { super(); this.turns = []; this.starts = 0; this.compactions = 0; this.quick = false; this.requests = []; }
+  constructor() { super(); this.turns = []; this.starts = 0; this.quick = false; this.requests = []; }
   async ensureStarted() {}
   async startThread(params) { this.startParams = params; return { thread: { id: 'fixture-thread' } }; }
   async resumeThread(params) { this.resumeParams = params; return { thread: { id: 'fixture-thread' } }; }
@@ -22,14 +22,6 @@ class Bridge extends EventEmitter {
       return { turn };
     }
     if (method === 'thread/read') return { thread: { id: 'fixture-thread', turns: this.turns } };
-    if (method === 'thread/compact/start') {
-      this.compactions++;
-      if (this.failCompaction) throw new Error('fixture compaction rejected');
-      const turnId = `compact-${this.compactions}`;
-      this.emit('notification', { method: 'turn/started', params: { threadId: 'fixture-thread', turn: { id: turnId } } });
-      this.emit('notification', { method: 'item/completed', params: { threadId: 'fixture-thread', turnId, item: { type: 'contextCompaction' } } });
-      this.emit('notification', { method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: turnId, status: 'completed' } } });
-    }
     return {};
   }
   finish() {
@@ -132,7 +124,7 @@ test('short completion cannot be overwritten by its start response; private item
   await runtime.shutdownAgentRuntime();
 });
 
-test('one controller owns a running lane, deferred compaction completes, and stale owners cannot overwrite it', async t => {
+test('one controller owns a running lane and stale owners cannot overwrite it', async t => {
   const args = await fixture(t);
   const bridge = new Bridge();
   const first = createAgentRuntime(bridge);
@@ -140,12 +132,8 @@ test('one controller owns a running lane, deferred compaction completes, and sta
   const second = createAgentRuntime(otherBridge);
   await first.startFeatureAgent(args);
   await assert.rejects(second.startFeatureAgent(args), error => error.code === 'AGENT_OWNED');
-  const queued = await first.compactFeatureAgent(args);
-  assert.equal(queued.queued, true);
-  assert.equal((await getFeatureContext(args)).feature.compactionPending, true);
   bridge.finish();
-  await eventually(async () => !(await getFeatureContext(args)).feature.compactionPending);
-  assert.equal(bridge.compactions, 1);
+  await eventually(async () => (await getFeatureContext(args)).feature.agent.status === 'idle');
   await second.startFeatureAgent(args);
   bridge.emit('notification', { method: 'turn/completed', params: { threadId: 'fixture-thread', turn: { id: 'old-turn', status: 'failed' } } });
   await new Promise(resolve => setTimeout(resolve, 80));
@@ -165,27 +153,5 @@ test('native compaction inside a normal turn retains the final handoff', async t
   bridge.finish();
   await eventually(async () => (await getFeatureContext(args)).feature.summary === 'Verified fixture result.');
   await updateFeature({ ...args, summary: 'Saved the result.', next_action: 'Review.' });
-  await runtime.shutdownAgentRuntime();
-});
-
-test('rejected compaction preserves the checkpoint and can be retried', async t => {
-  const args = await fixture(t);
-  const bridge = new Bridge();
-  bridge.quick = true;
-  const runtime = createAgentRuntime(bridge);
-  await runtime.startFeatureAgent(args);
-  await eventually(async () => (await getFeatureContext(args)).feature.agent.status === 'idle');
-  await updateFeature({ ...args, summary: 'Verified handoff to preserve.', next_action: 'Review.' });
-  bridge.failCompaction = true;
-  await assert.rejects(runtime.compactFeatureAgent(args), /fixture compaction rejected/);
-  const failed = await getFeatureContext(args);
-  assert.equal(failed.feature.agent.status, 'failed');
-  assert.equal(failed.feature.compactionPending, true);
-  assert.equal(failed.feature.summary, 'Verified handoff to preserve.');
-  bridge.failCompaction = false;
-  assert.equal((await runtime.compactFeatureAgent(args)).compacted, true);
-  const retried = await getFeatureContext(args);
-  assert.equal(retried.feature.agent.status, 'idle');
-  assert.equal(retried.feature.compactionPending, false);
   await runtime.shutdownAgentRuntime();
 });

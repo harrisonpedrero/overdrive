@@ -5,8 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { run } from '../plugins/overdrive/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, initializeWorkspace, recordCandidate } from '../plugins/overdrive/scripts/workspace.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, initializeWorkspace } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const AUTOMATION = 'OVERDRIVE <overdrive@local.invalid>';
 const IDENTITY_ENV = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS'];
@@ -56,7 +55,7 @@ async function commitWork(repo, file) {
   return (await git(repo, 'log', '-1', '--format=%an <%ae>|%cn <%ce>')).stdout;
 }
 
-test('an identity-free managed project reaches a verified commit under the disclosed automation identity', async t => {
+test('an identity-free managed project reaches a commit under the disclosed automation identity', async t => {
   const { parent, hostUntouched } = await isolatedHost(t);
   const workspace = path.join(parent, 'workspace');
   await fs.mkdir(workspace);
@@ -78,9 +77,6 @@ test('an identity-free managed project reaches a verified commit under the discl
 
   const repo = lane.feature.checkoutPath;
   assert.equal(await commitWork(repo, 'notes.txt'), 'OVERDRIVE <overdrive@local.invalid>|OVERDRIVE <overdrive@local.invalid>');
-  await updateChecks({ ...args, checks: [{ key: 'notes', purpose: 'Read the committed notes', argv: [process.execPath, '-e', "require('node:fs').readFileSync('notes.txt')"] }] });
-  assert.equal((await runChecks(args)).verification.ready, true);
-  await recordCandidate({ ...args, summary: 'Committed notes.', checks: ['notes receipt'] });
   assert.equal((await getFeatureContext(args)).commitIdentity.origin, 'automation');
   assert.equal((await gitStatus(repo, 'config', '--global', '--get', 'user.name')).exitCode, 1);
   await hostUntouched();

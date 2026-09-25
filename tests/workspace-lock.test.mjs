@@ -6,7 +6,11 @@ import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
+import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
+import { callTool } from '../plugins/overdrive/scripts/tools.mjs';
 import { withWorkspaceLock } from '../plugins/overdrive/scripts/util.mjs';
+import { getFeatureContext } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const CONTENDER = path.join(import.meta.dirname, 'fixtures', 'lock-contender.mjs');
 const DEAD_PID = 2 ** 30;
@@ -237,4 +241,43 @@ test('a throwing callback releases its lock and distinct lock names do not block
   await assert.rejects(withWorkspaceLock(workspace, 'features', () => withWorkspaceLock(workspace, 'agent-state', () => { throw new Error('boom'); }, { timeoutMs: 300 }), { timeoutMs: 300 }), /boom/);
   assert.equal(await withWorkspaceLock(workspace, 'features', () => withWorkspaceLock(workspace, 'agent-state', () => 'free', { timeoutMs: 300 }), { timeoutMs: 300 }), 'free');
   assert.deepEqual(await fs.readdir(locks), []);
+});
+
+test('every accepted slug length acquires its own control lock for agent turns', async t => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-long-slug-'));
+  const runtime = createAgentRuntime(new WorkerBridge({ claude: { launch: { command: process.execPath, args: [path.join(import.meta.dirname, 'fixtures', 'fake-claude-cli.mjs')] } } }));
+  t.after(async () => {
+    await runtime.shutdownAgentRuntime();
+    await fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 });
+  });
+  await callTool('project_create', { workspace_path: workspace, project_name: 'Long slugs', description: 'Exercise slug boundaries.', harness: 'claude' });
+  const slug = (length, lead = 'l') => `${lead}${'a'.repeat(length - 1)}`;
+  const slugs = [slug(55), slug(56), slug(63), slug(63, 'm')];
+  assert.deepEqual(slugs.map(value => value.length), [55, 56, 63, 63]);
+  for (const feature of slugs) {
+    const args = { workspace_path: workspace, feature };
+    await callTool('feature_create', { ...args, title: `Length ${feature.length}`, outcome: 'Operates under its control lock.', spec: '# Long\n\nThe README exists.' });
+    const started = await runtime.startFeatureAgent({ ...args, instruction: 'Write one file.' });
+    assert.ok(started.threadId);
+    for (let attempt = 0; (await getFeatureContext(args)).feature.agent.status !== 'idle'; attempt++) {
+      assert.ok(attempt < 200, `agent for ${feature.length}-character slug did not finish`);
+      await sleep(20);
+    }
+  }
+
+  // Slugs sharing their first 55 characters keep distinct locks: one lane's lock never blocks another.
+  const [, , first, second] = slugs;
+  assert.equal(await withWorkspaceLock(workspace, `control-${first}`, () => withWorkspaceLock(workspace, `control-${first.slice(0, 55)}`, () =>
+    withWorkspaceLock(workspace, `control-${second}`, () => 'distinct', { timeoutMs: 300 }), { timeoutMs: 300 })), 'distinct');
+  await assert.rejects(withWorkspaceLock(workspace, `control-${first}`, () => withWorkspaceLock(workspace, `control-${first}`, () => {}, { timeoutMs: 300 })), error => error.code === 'WORKSPACE_BUSY');
+
+  for (const name of ['features', 'agent-state', slug(63), `control-${slug(1)}`]) assert.equal(await withWorkspaceLock(workspace, name, () => name), name);
+  for (const name of [slug(64), `control-${slug(64)}`, `xontrol-${slug(63)}`, `control-1${'a'.repeat(62)}`, `control-${slug(63).toUpperCase()}`, `control--${slug(62)}`, '', 'Features', '-x', '1x', 'control-../x', 'control-a/b', 'a.b', 'a b', `control-${slug(3)}\n`, 42, null]) {
+    await assert.rejects(withWorkspaceLock(workspace, name, () => assert.fail(`lock ${JSON.stringify(name)} ran`)), error => error.code === 'INVALID_LOCK', JSON.stringify(name));
+  }
+  for (const [feature, code] of [[slug(64), 'INVALID_INPUT'], [`${slug(30)}--${slug(31)}`, 'INVALID_SLUG'], [`1${slug(62)}`, 'INVALID_SLUG']]) {
+    const refused = { workspace_path: workspace, feature };
+    await assert.rejects(callTool('feature_create', { ...refused, title: 'Refused', outcome: 'Refused.', spec: '# Refused' }), error => error.code === code, feature);
+    await assert.rejects(runtime.startFeatureAgent(refused), error => error.code === code, feature);
+  }
 });
