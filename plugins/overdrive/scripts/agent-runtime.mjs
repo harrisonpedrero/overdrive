@@ -621,14 +621,18 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
   // Messages to the coordinator are only in the database, so the wait polls for them.
   const inbox = await openCoordinatorInbox({ workspace_path: root });
   const poll = setInterval(() => { if (inbox.waiting()) finish(true); }, 1_000);
-  const signalThread = threadId => {
-    const runtime = runtimes.find(runtime => runtime.feature.thread_id && runtime.feature.thread_id === threadId);
-    if (runtime) { signalled.add(runtime.feature.slug); finish(true); }
+  // Without features, a turn this controller starts during the wait, such as a message delivery,
+  // also wakes it when it completes or needs input.
+  const signalThread = (threadId, handoff = false) => {
+    const registration = registrations.get(threadId);
+    const slug = runtimes.find(runtime => runtime.feature.thread_id && runtime.feature.thread_id === threadId)?.feature.slug
+      ?? (handoff && !features && registration?.workspacePath === root ? registration.feature : null);
+    if (slug) { signalled.add(slug); finish(true); }
   };
   const notification = message => {
-    if (['turn/completed', 'thread/status/changed'].includes(message.method)) signalThread(message.params?.threadId);
+    if (['turn/completed', 'thread/status/changed'].includes(message.method)) signalThread(message.params?.threadId, message.method === 'turn/completed');
   };
-  const request = message => signalThread(message.params?.threadId);
+  const request = message => signalThread(message.params?.threadId, true);
   bridge.on('notification', notification);
   bridge.on('serverRequest', request);
   timer = setTimeout(() => finish(false), timeout_seconds * 1000);
@@ -640,8 +644,6 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
       }
     }
     await notificationQueue;
-    // Taken after adoption, which registers sessions this controller did not hold before.
-    const pending = new Map([...lanes()].map(([slug, lane]) => [slug, lane.handoffPending]));
     const initial = await Promise.all(runtimes.map(runtime => getFeatureContext({ workspace_path, feature: runtime.feature.slug, timeline_limit: 1 })));
     for (const state of initial) {
       if (!state.feature.agent.activeTurnId || state.pendingAgentRequests.length) signalled.add(state.feature.slug);
@@ -649,6 +651,9 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
     const signal = signalled.size || inbox.waiting() ? true : await changed;
     await notificationQueue;
     const selected = signal ? [...signalled] : runtimes.map(runtime => runtime.feature.slug);
+    // Taken after adoption and just before inspection, so a turn that started during the wait and
+    // is handed off at rest counts as handed off.
+    const pending = new Map([...lanes()].map(([slug, lane]) => [slug, lane.handoffPending]));
     const handoffs = await Promise.all(selected.map(async feature => {
       const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true });
       return { feature: state.feature, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
