@@ -155,7 +155,7 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 export function qaAgentInstructions(root, agent) {
   return `# OVERDRIVE QA agent: ${agent.slug}
 
-You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${contained(root, 'lab')}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
+You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
 
 - Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. The lab README describes the suite format.
 - Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
@@ -756,7 +756,6 @@ export async function agentProfile({ workspace_path, agent }) {
   return await withContext(workspace_path, ctx => workerProfile(readFeatureRow(ctx.db, safeSlug(agent, 'agent'))));
 }
 
-// Depends on the messages table of schema v8.
 export async function sendAgentMessage({ workspace_path, from, to, body }) {
   const sender = safeSlug(from, 'from');
   const recipient = to === 'coordinator' ? to : safeSlug(to, 'to');
@@ -772,16 +771,14 @@ export async function sendAgentMessage({ workspace_path, from, to, body }) {
 // Every lane and QA agent as other agents need to see it; archived rows are left out.
 export async function listLanes({ workspace_path }) {
   return await withContext(workspace_path, async ctx => {
-    const findings = ctx.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'findings'").get()
-      ? new Map(ctx.db.prepare("SELECT feature, COUNT(*) AS count FROM findings WHERE status = 'open' GROUP BY feature").all().map(row => [row.feature, Number(row.count)]))
-      : null;
+    const openFindings = ctx.db.prepare("SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'");
     const lanes = [];
     for (const row of listFeatureRows(ctx.db)) {
       const git = await repositorySnapshot(row.checkout_path).catch(() => null);
       lanes.push({
-        slug: row.slug, kind: workerProfile(row), title: row.title, status: row.status, agentStatus: row.agent_status,
+        slug: row.slug, kind: row.kind, title: row.title, status: row.status, agentStatus: row.agent_status,
         checkoutPath: row.checkout_path, head: git?.head ?? null, dirty: git ? !git.clean : null,
-        ...(findings ? { openFindings: findings.get(row.slug) ?? 0 } : {}),
+        openFindings: Number(openFindings.get(row.slug).count),
       });
     }
     return { lanes };
