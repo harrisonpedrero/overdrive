@@ -6,19 +6,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { TREE_MARK, defaultContainment } from './process-tree.mjs';
 import { OverdriveError, now, redactString, refusedRequest, run } from './util.mjs';
+import { workerToolDecision } from './worker-policy.mjs';
 
-// Workers get no MCP servers, hooks, skills, plugins or browser integration; the OVERDRIVE
-// coordinator therefore cannot be called recursively from a lane.
-export const ISOLATION_ARGS = ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--disable-slash-commands', '--no-chrome'];
+// Server-level rules; they remove these servers' tools from a feature worker entirely.
+const COMPUTER_USE_SERVERS = ['mcp__claude-in-chrome', 'mcp__computer-use', 'mcp__playwright', 'mcp__puppeteer', 'mcp__chrome-devtools', 'mcp__browser'];
+// The coordinator plugin never loads in a worker; the injected worker server replaces it.
+const WORKER_SETTINGS = JSON.stringify({ enabledPlugins: { 'overdrive@overdrive-local': false, 'feature-theater@feature-theater-local': false } });
 const NESTED_SESSION_ENV = /^(?:CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(?:CHILD_SESSION|SESSION_ID|HOST_SESSION_ID|MESSAGING_SOCKET|MESSAGING_TOKEN|ENTRYPOINT|SESSION_ATTENDED))$/;
 const EDITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell']);
 const EFFORTS = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'max' };
 const PERMISSION_MODES = new Set(['acceptEdits', 'auto', 'bypassPermissions', 'dontAsk']);
-const DEFAULT_OPTIONS = Object.freeze({
-  permissionMode: 'acceptEdits',
-  allowedTools: ['Bash', 'PowerShell'],
-  disallowedTools: ['Bash(git push:*)', 'Bash(gh pr:*)', 'WebFetch', 'WebSearch'],
-});
+const DEFAULT_OPTIONS = Object.freeze({ permissionMode: 'acceptEdits', allowedTools: [], disallowedTools: [] });
 const RETAINED_TURNS = 4;
 const DIFF_DEBOUNCE_MS = 4_000;
 const RESULT_GRACE_MS = 15_000;
@@ -48,16 +46,22 @@ export function normalizeWorkerOptions(raw = {}) {
   };
 }
 
+// The user's MCP servers, connectors, plugins, skills and hooks load. Tool calls the permission
+// mode would prompt for arrive as control requests, which the worker permission policy answers.
 export function workerLaunchArgs(meta, effort) {
   const options = meta.options;
+  const feature = meta.profile !== 'qa';
   const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose', meta.persisted ? '--resume' : '--session-id', meta.id];
   if (meta.model) args.push('--model', meta.model);
   if (effort && EFFORTS[effort]) args.push('--effort', EFFORTS[effort]);
-  args.push('--permission-mode', options.permissionMode);
+  args.push('--permission-mode', options.permissionMode, '--permission-prompt-tool', 'stdio');
   if (options.permissionMode === 'bypassPermissions') args.push('--allow-dangerously-skip-permissions');
   if (options.allowedTools.length) args.push('--allowedTools', ...options.allowedTools);
-  if (options.disallowedTools.length) args.push('--disallowedTools', ...options.disallowedTools);
-  args.push(...ISOLATION_ARGS);
+  const disallowed = [...options.disallowedTools, ...(feature ? COMPUTER_USE_SERVERS : [])];
+  if (disallowed.length) args.push('--disallowedTools', ...disallowed);
+  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', WORKER_SETTINGS);
+  // Without Chrome integration set up, --chrome adds no tools rather than failing.
+  args.push(feature ? '--no-chrome' : '--chrome');
   for (const dir of meta.addDirs) args.push('--add-dir', dir);
   if (meta.developerInstructions) args.push('--append-system-prompt', meta.developerInstructions);
   if (meta.name && !meta.persisted) args.push('--name', meta.name);
@@ -66,9 +70,10 @@ export function workerLaunchArgs(meta, effort) {
 
 // Auto-memory lives outside OVERDRIVE state and would carry notes across replaced sessions or
 // reused checkouts, so it is forced off regardless of any inherited value or key casing.
+// OVERDRIVE_WORKER leaves any copy of the OVERDRIVE plugin server that the worker loads without tools.
 export function workerEnvironment(env = process.env) {
   const inherited = Object.entries(env).filter(([key]) => !NESTED_SESSION_ENV.test(key) && key.toUpperCase() !== 'CLAUDE_CODE_DISABLE_AUTO_MEMORY');
-  return { ...Object.fromEntries(inherited), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
+  return { ...Object.fromEntries(inherited), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' };
 }
 
 // The Claude Code executable a worker launch would use: CLAUDE_CLI_PATH, then the PATH, then the
@@ -191,9 +196,10 @@ async function terminateProcess(child, treeKill, timeoutMs) {
 export class ClaudeWorkerBridge extends EventEmitter {
   // containment is the process-tree boundary (see process-tree.mjs); null runs every worker
   // uncontained, so no worker exit or stop can confirm the tools it launched.
-  constructor({ launch, treeKill = defaultTreeKill, containment = defaultContainment(), terminationTimeoutMs = TERMINATION_TIMEOUT_MS, containmentStartMs = CONTAINMENT_START_MS } = {}) {
+  constructor({ launch, profile = 'feature', treeKill = defaultTreeKill, containment = defaultContainment(), terminationTimeoutMs = TERMINATION_TIMEOUT_MS, containmentStartMs = CONTAINMENT_START_MS } = {}) {
     super();
     this.launchOverride = launch;
+    this.profile = profile;
     this.treeKill = treeKill;
     this.containment = containment;
     this.containmentUnavailable = null;
@@ -215,7 +221,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     return meta;
   }
 
-  #register({ threadId, cwd, runtimeWorkspaceRoots = [], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, persisted }) {
+  #register({ threadId, cwd, runtimeWorkspaceRoots = [], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, workerServer, persisted }) {
     const existing = this.threads.get(threadId);
     // An in-flight turn and any lingering process keep the same session record.
     const meta = Object.assign(existing ?? {}, {
@@ -226,6 +232,8 @@ export class ClaudeWorkerBridge extends EventEmitter {
       model: model || null,
       effort,
       options: normalizeWorkerOptions(harnessOptions),
+      profile: this.profile,
+      workerServer,
       name: existing?.name ?? null,
       persisted: existing?.persisted || persisted,
       turns: existing?.turns ?? [],
@@ -592,7 +600,17 @@ export class ClaudeWorkerBridge extends EventEmitter {
     };
   }
 
+  // Every control request gets an answer so the CLI never waits on one; only tool permission is handled.
+  #answerControl(turn, { request_id, request }) {
+    const decision = request?.subtype === 'can_use_tool' ? workerToolDecision(this.profile, request.tool_name, request.input) : null;
+    const response = !decision
+      ? { subtype: 'error', request_id, error: `OVERDRIVE does not handle ${request?.subtype} control requests.` }
+      : { subtype: 'success', request_id, response: decision.allow ? { behavior: 'allow', updatedInput: request.input ?? {} } : { behavior: 'deny', message: decision.message } };
+    if (turn.child?.stdin?.writable) turn.child.stdin.write(`${JSON.stringify({ type: 'control_response', response })}\n`);
+  }
+
   #event(meta, turn, message) {
+    if (message.type === 'control_request') return this.#answerControl(turn, message);
     if (turn.status !== 'inProgress' || turn.interrupted || turn.failedResult) return;
     if (message.type === 'system' && message.subtype === 'init') {
       meta.persisted = true;
@@ -715,12 +733,11 @@ export class ClaudeWorkerBridge extends EventEmitter {
     // Failure text is bounded where it is produced; any failed-turn text is redacted here too.
     if (text) items.push({ type: 'agentMessage', text: status === 'failed' ? redactString(text) : text });
     if (turn.descendantsUnconfirmed && status === 'interrupted') items.push({ type: 'agentMessage', text: 'The worker process tree could not be ended as a whole, so only the worker process itself was terminated; tools it launched may still be running.' });
-    if (turn.denials.length) items.push({ type: 'agentMessage', text: `Worker permission policy denied ${turn.denials.length} tool call(s): ${[...new Set(turn.denials)].join(', ')}. Route those needs through the coordinator.` });
     if (turn.uncontained && status === 'completed') items.push({ type: 'agentMessage', text: uncontainedNote(turn.uncontained) });
     turn.items = items;
     turn.text = [];
     turn.child = null;
-    this.emit('notification', { method: 'turn/completed', params: { threadId: meta.id, turn: { id: turn.id, status, items, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) } } });
+    this.emit('notification', { method: 'turn/completed', params: { threadId: meta.id, turn: { id: turn.id, status, items, denials: turn.denials, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) } } });
     this.#reportCleanExit(meta, turn);
   }
 }

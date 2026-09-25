@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
-import { ClaudeWorkerBridge, ISOLATION_ARGS, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/overdrive/scripts/claude-worker.mjs';
+import { ClaudeWorkerBridge, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/overdrive/scripts/claude-worker.mjs';
 import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
 import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, updateFeature, workerHarness } from '../plugins/overdrive/scripts/workspace.mjs';
 
@@ -46,22 +46,27 @@ function expireControllerOwner(root) {
   finally { db.close(); }
 }
 
-test('claude worker launch is isolated, resumable and free of nested-session markers', () => {
-  const meta = { id: 'session-1', persisted: false, model: 'opus', options: normalizeWorkerOptions({}), addDirs: ['C:/overdrive/.overdrive/features/alpha'], developerInstructions: 'lane contract', name: 'OVERDRIVE · Alpha' };
+test('claude worker launch follows its capability profile, resumes and is free of nested-session markers', () => {
+  const workerServer = { command: 'node', args: ['server.mjs'], env: { OVERDRIVE_AGENT: 'alpha', OVERDRIVE_WORKSPACE: 'C:/overdrive' } };
+  const meta = { id: 'session-1', persisted: false, model: 'opus', options: normalizeWorkerOptions({}), profile: 'feature', workerServer, addDirs: ['C:/overdrive/.overdrive/features/alpha'], developerInstructions: 'lane contract', name: 'OVERDRIVE · Alpha' };
   const first = workerLaunchArgs(meta, 'ultra');
-  for (const flag of ISOLATION_ARGS) assert.ok(first.includes(flag), flag);
+  for (const flag of ['--no-chrome', '--settings', 'mcp__claude-in-chrome', 'mcp__playwright']) assert.ok(first.includes(flag), flag);
+  for (const flag of ['--strict-mcp-config', '--setting-sources', '--disable-slash-commands', '--allowedTools']) assert.ok(!first.includes(flag), flag);
+  assert.deepEqual(JSON.parse(first[first.indexOf('--mcp-config') + 1]), { mcpServers: { overdrive: workerServer } });
+  assert.equal(first[first.indexOf('--permission-prompt-tool') + 1], 'stdio');
   assert.ok(first.includes('--session-id') && first.includes('session-1'));
   assert.ok(first.includes('--effort') && first.includes('max'));
   assert.ok(first.includes('--permission-mode') && first.includes('acceptEdits'));
-  assert.ok(first.includes('Bash(git push:*)'));
   assert.ok(first.includes('--add-dir') && first.includes('--append-system-prompt') && first.includes('--name'));
+  const qa = workerLaunchArgs({ ...meta, profile: 'qa' }, 'high');
+  assert.ok(qa.includes('--chrome') && !qa.includes('--no-chrome') && !qa.includes('--disallowedTools') && qa.includes('--mcp-config'));
   const resumed = workerLaunchArgs({ ...meta, persisted: true }, 'high');
   assert.ok(resumed.includes('--resume') && !resumed.includes('--session-id') && !resumed.includes('--name'));
   const env = workerEnvironment({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_PID: '1', PATH: 'p', ANTHROPIC_BASE_URL: 'u' });
-  assert.deepEqual(env, { ANTHROPIC_BASE_URL: 'u', PATH: 'p', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' });
+  assert.deepEqual(env, { ANTHROPIC_BASE_URL: 'u', PATH: 'p', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' });
   for (const inherited of [{ CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0' }, { claude_code_disable_auto_memory: '0' }]) {
     const forced = workerEnvironment({ ...inherited, CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h' });
-    assert.deepEqual(forced, { CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' });
+    assert.deepEqual(forced, { CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' });
   }
   assert.throws(() => normalizeWorkerOptions({ permissionMode: 'plan' }), error => error.code === 'INVALID_STATE');
   assert.throws(() => normalizeWorkerOptions({ allowedTools: 'Bash' }), error => error.code === 'INVALID_STATE');
@@ -93,8 +98,9 @@ test('claude harness turn records only visible handoff and working diff, accepts
   assert.equal(started.model, 'harness-default');
   const launch = JSON.parse(await fs.readFile(argsFile, 'utf8'));
   assert.ok(launch.args.includes('--session-id') && launch.args.includes(started.threadId));
-  for (const flag of ISOLATION_ARGS) assert.ok(launch.args.includes(flag), flag);
-  assert.ok(launch.args.includes('--add-dir'));
+  const { env: identity } = JSON.parse(launch.args[launch.args.indexOf('--mcp-config') + 1]).mcpServers.overdrive;
+  assert.deepEqual(identity, { OVERDRIVE_AGENT: 'alpha', OVERDRIVE_WORKSPACE: path.resolve(args.workspace_path) });
+  assert.ok(launch.args.includes('--no-chrome') && launch.args.includes('--add-dir'));
   assert.ok(!launch.claudeEnv.includes('CLAUDECODE') && !launch.claudeEnv.includes('CLAUDE_CODE_SESSION_ID'));
   assert.ok(launch.claudeEnv.includes('CLAUDE_CODE_DISABLE_AUTO_MEMORY'));
   assert.equal(path.resolve(launch.cwd), path.resolve(started.checkoutPath));

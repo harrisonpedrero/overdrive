@@ -3,45 +3,45 @@ import fsSync from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { OverdriveError, refusedRequest } from './util.mjs';
 import { ClaudeWorkerBridge } from './claude-worker.mjs';
+import { BROWSER_CONTROL, workerToolDecision } from './worker-policy.mjs';
 
 const DEFAULT_REQUEST_TIMEOUT = 120_000;
 const HARNESSES = new Set(['codex', 'claude']);
-const WORKER_CONFIG_OVERRIDES = [
-  'features.plugins=false',
-  'features.apps=false',
-  'features.browser_use=false',
-  'features.computer_use=false',
-  'features.enable_mcp_apps=false',
-  'features.hooks=false',
-  'features.image_generation=false',
-  'features.in_app_browser=false',
-  'features.skill_mcp_dependency_install=false',
-];
+const PROFILES = new Set(['feature', 'qa']);
+const COORDINATOR_PLUGINS = ['overdrive@overdrive-local', 'feature-theater@feature-theater-local'];
+const BROWSER_PLUGINS = ['browser@openai-bundled', 'chrome@openai-bundled', 'computer-use@openai-bundled', 'unified-computer-use@openai-bundled'];
+const DISABLED_STDIO = Object.freeze({ enabled: false, command: 'node', args: ['-e', ''] });
+const DISABLED_URL = Object.freeze({ enabled: false, url: 'http://127.0.0.1/' });
+// Escalations a worker may need follow the worker permission policy; questions and MCP
+// elicitations still reach the coordinator as pending requests.
+const POLICY_APPROVALS = {
+  'item/commandExecution/requestApproval': { tool: 'shell', answer: allow => ({ decision: allow ? 'accept' : 'decline' }) },
+  'item/fileChange/requestApproval': { tool: 'apply_patch', answer: allow => ({ decision: allow ? 'accept' : 'decline' }) },
+  'item/permissions/requestApproval': { tool: 'permissions', answer: (allow, params) => ({ permissions: allow ? params.permissions ?? {} : {}, scope: 'turn' }) },
+};
 
-function configArgs(values) {
-  return values.flatMap(value => ['-c', value]);
+// Plugin keys stay unquoted because Codex keeps quotes in a -c key segment literally.
+export function workerConfigOverrides(profile) {
+  const feature = profile !== 'qa';
+  const plugins = [...COORDINATOR_PLUGINS, ...(feature ? BROWSER_PLUGINS : [])];
+  return [
+    ...(feature ? ['features.browser_use=false', 'features.computer_use=false', 'features.in_app_browser=false'] : []),
+    'features.skill_mcp_dependency_install=false',
+    ...plugins.map(id => `plugins.${id}.enabled=false`),
+  ].flatMap(value => ['-c', value]);
 }
 
-function tomlKeySegment(value) {
-  return /^[A-Za-z0-9_-]+$/.test(value)
-    ? value
-    : JSON.stringify(value);
-}
-
-export function isolatedMcpConfigArgs(servers) {
+// Credential-free stand-ins for the MCP servers a profile denies. They are applied per thread,
+// because a process-wide override does not reach servers that plugins provide.
+export function deniedMcpServers(servers, profile) {
   if (!Array.isArray(servers)) throw new OverdriveError('Codex returned an unexpected MCP inventory.', 'CODEX_CONFIG_INVALID');
-  return servers
-    .filter(server => server?.enabled && typeof server.name === 'string')
-    .flatMap(server => {
-      const key = `mcp_servers.${tomlKeySegment(server.name)}`;
-      const transport = server.transport?.type === 'stdio'
-        ? '{enabled=false,command="node",args=["-e",""]}'
-        : '{enabled=false,url="http://127.0.0.1/"}';
-      return ['-c', `${key}=${transport}`];
-    });
+  const denied = name => ['overdrive', 'feature_theater'].includes(name) || (profile !== 'qa' && BROWSER_CONTROL.test(name));
+  return Object.fromEntries(servers
+    .filter(server => server?.enabled && typeof server.name === 'string' && denied(server.name))
+    .map(server => [server.name, server.transport?.type === 'stdio' ? DISABLED_STDIO : DISABLED_URL]));
 }
 
-function disabledMcpOverrides(executable) {
+function mcpInventory(executable) {
   const listed = spawnSync(executable, ['mcp', 'list', '--json'], {
     encoding: 'utf8',
     windowsHide: true,
@@ -49,12 +49,10 @@ function disabledMcpOverrides(executable) {
     maxBuffer: 5_000_000,
   });
   if (listed.status !== 0 || listed.error) {
-    throw new OverdriveError('Unable to inventory configured MCP servers for an isolated feature task. Repair the Codex configuration and retry.', 'CODEX_CONFIG_INVALID');
+    throw new OverdriveError('Unable to inventory configured MCP servers for a worker task. Repair the Codex configuration and retry.', 'CODEX_CONFIG_INVALID');
   }
-  let servers;
-  try { servers = JSON.parse(listed.stdout); }
-  catch { throw new OverdriveError('Codex returned an invalid MCP inventory; refusing to start a feature task without tool isolation.', 'CODEX_CONFIG_INVALID'); }
-  return isolatedMcpConfigArgs(servers);
+  try { return JSON.parse(listed.stdout); }
+  catch { throw new OverdriveError('Codex returned an invalid MCP inventory; refusing to start a worker task without its capability profile.', 'CODEX_CONFIG_INVALID'); }
 }
 
 // The Codex executable a worker launch would use: CODEX_CLI_PATH, then codex.exe on the Windows
@@ -68,16 +66,18 @@ export function codexExecutable() {
   return direct && fsSync.existsSync(direct) ? direct : 'codex';
 }
 
-function launchSpec(override = undefined) {
+function launchSpec(override, profile) {
   if (override) return override;
-  return { command: codexExecutable(), args: [...configArgs(WORKER_CONFIG_OVERRIDES), 'app-server', '--stdio'] };
+  return { command: codexExecutable(), args: [...workerConfigOverrides(profile), 'app-server', '--stdio'] };
 }
 
 export class CodexAppServer extends EventEmitter {
-  constructor({ launch, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT } = {}) {
+  constructor({ launch, profile = 'feature', requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT } = {}) {
     super();
-    this.launch = launchSpec(launch);
+    this.profile = profile;
+    this.launch = launchSpec(launch, profile);
     this.isolateWorker = !launch;
+    this.deniedServers = {};
     this.requestTimeoutMs = requestTimeoutMs;
     this.child = null;
     this.starting = null;
@@ -86,6 +86,7 @@ export class CodexAppServer extends EventEmitter {
     this.nextId = 1;
     this.pending = new Map();
     this.serverRequests = new Map();
+    this.denials = new Map();
   }
 
   async ensureStarted() {
@@ -96,16 +97,13 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async #start() {
-    // A lane may edit its checkout, but apps, hooks, plugins, browser control,
-    // and every configured external MCP server remain coordinator-only.
-    const launch = this.isolateWorker
-      ? { ...this.launch, args: [...disabledMcpOverrides(this.launch.command), ...this.launch.args] }
-      : this.launch;
-    const child = spawn(launch.command, launch.args, {
+    if (this.isolateWorker) this.deniedServers = deniedMcpServers(mcpInventory(this.launch.command), this.profile);
+    // OVERDRIVE_WORKER leaves any copy of the OVERDRIVE plugin server a worker loads without tools.
+    const child = spawn(this.launch.command, this.launch.args, {
       windowsHide: true,
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: { ...process.env, OVERDRIVE_WORKER: '1' },
     });
     this.child = child;
     this.stdoutBuffer = '';
@@ -136,6 +134,7 @@ export class CodexAppServer extends EventEmitter {
     }
     this.pending.clear();
     this.serverRequests.clear();
+    this.denials.clear();
     this.emit('exit', error);
   }
 
@@ -162,6 +161,7 @@ export class CodexAppServer extends EventEmitter {
         continue;
       }
       if (message.id !== undefined && message.method) {
+        if (this.#answerByPolicy(message)) continue;
         this.serverRequests.set(String(message.id), { id: message.id, method: message.method, params: message.params ?? {} });
         this.emit('serverRequest', { id: message.id, method: message.method, params: message.params ?? {} });
         continue;
@@ -170,8 +170,35 @@ export class CodexAppServer extends EventEmitter {
         const key = String(message.params?.requestId);
         if (this.serverRequests.get(key)?.params.threadId === message.params?.threadId) this.serverRequests.delete(key);
       }
+      if (message.method === 'turn/completed') this.#attachDenials(message.params);
       if (message.method) this.emit('notification', { method: message.method, params: message.params ?? {} });
     }
+  }
+
+  #answerByPolicy({ id, method, params = {} }) {
+    const approval = POLICY_APPROVALS[method];
+    if (!approval) return false;
+    const { allow } = workerToolDecision(this.profile, approval.tool, params);
+    if (!allow) this.denials.set(params.turnId, [...(this.denials.get(params.turnId) ?? []), approval.tool]);
+    if (this.child?.stdin?.writable) this.child.stdin.write(`${JSON.stringify({ id, result: approval.answer(allow, params) })}\n`);
+    return true;
+  }
+
+  // Denied escalations travel with the turn's completion into its recorded handoff.
+  #attachDenials(params) {
+    const denials = this.denials.get(params?.turn?.id);
+    if (!denials) return;
+    this.denials.delete(params.turn.id);
+    params.turn = { ...params.turn, denials };
+  }
+
+  // The injected worker server gives the thread its OVERDRIVE identity and replaces any server of
+  // that name, including a denied stand-in.
+  #threadConfig(workerServer) {
+    return {
+      mcp_servers: { ...this.deniedServers, ...(workerServer ? { overdrive: { ...workerServer, default_tools_approval_mode: 'approve' } } : {}) },
+      sandbox_workspace_write: { network_access: true },
+    };
   }
 
   notify(method, params) {
@@ -179,8 +206,12 @@ export class CodexAppServer extends EventEmitter {
     this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
   }
 
+  async #ready() {
+    await this.ensureStarted().catch(error => { throw refusedRequest(error); });
+  }
+
   async request(method, params, timeoutMs = this.requestTimeoutMs, skipEnsure = false) {
-    if (!skipEnsure) await this.ensureStarted().catch(error => { throw refusedRequest(error); });
+    if (!skipEnsure) await this.#ready();
     if (!this.child?.stdin?.writable) throw refusedRequest(new OverdriveError('Codex app-server is not running.', 'CODEX_NOT_RUNNING'));
     const id = this.nextId++;
     const response = new Promise((resolve, reject) => {
@@ -210,14 +241,16 @@ export class CodexAppServer extends EventEmitter {
     return this.serverRequests.get(String(requestId)) ?? null;
   }
 
-  async startThread({ cwd, runtimeWorkspaceRoots, developerInstructions, model = 'gpt-6-sol', effort = 'high' }) {
+  // Thread config needs the denied-server inventory, which is taken when the app-server starts.
+  async startThread({ cwd, runtimeWorkspaceRoots, developerInstructions, workerServer, model = 'gpt-6-sol', effort = 'high' }) {
+    await this.#ready();
     const response = await this.request('thread/start', {
       cwd,
       runtimeWorkspaceRoots,
       model,
       approvalPolicy: 'on-request',
-      permissions: ':workspace',
-      config: { features: { plugins: false } },
+      sandbox: 'workspace-write',
+      config: this.#threadConfig(workerServer),
       developerInstructions,
       personality: 'pragmatic',
       ephemeral: false,
@@ -225,15 +258,16 @@ export class CodexAppServer extends EventEmitter {
     return { ...response, requestedEffort: effort };
   }
 
-  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, developerInstructions, model = 'gpt-6-sol' }) {
+  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, developerInstructions, workerServer, model = 'gpt-6-sol' }) {
+    await this.#ready();
     return await this.request('thread/resume', {
       threadId,
       cwd,
       runtimeWorkspaceRoots,
       model,
       approvalPolicy: 'on-request',
-      permissions: ':workspace',
-      config: { features: { plugins: false } },
+      sandbox: 'workspace-write',
+      config: this.#threadConfig(workerServer),
       developerInstructions,
       personality: 'pragmatic',
       excludeTurns: true,
@@ -248,62 +282,69 @@ export class CodexAppServer extends EventEmitter {
   }
 }
 
-// Routes each feature thread to the harness backend that owns it. Backends start lazily,
-// so a Claude-only workspace never launches a Codex app-server and vice versa.
+// Routes each worker thread to the backend that owns it, one per harness and capability profile,
+// so the two profiles never share a process. Backends start lazily, so a Claude-only workspace
+// never launches a Codex app-server and vice versa.
 export class WorkerBridge extends EventEmitter {
   constructor({ codex, claude } = {}) {
     super();
-    this.factories = { codex: () => new CodexAppServer(codex), claude: () => new ClaudeWorkerBridge(claude) };
+    this.factories = { codex: profile => new CodexAppServer({ ...codex, profile }), claude: profile => new ClaudeWorkerBridge({ ...claude, profile }) };
     this.backends = new Map();
     this.threads = new Map();
   }
 
-  backend(harness = 'codex') {
+  // key is 'harness' or 'harness:profile'; the profile defaults to feature.
+  backend(key = 'codex') {
+    const [harness, profile = 'feature'] = key.split(':');
     if (!HARNESSES.has(harness)) throw refusedRequest(new OverdriveError(`Unknown worker harness: ${harness}`, 'INVALID_STATE'));
-    let backend = this.backends.get(harness);
+    if (!PROFILES.has(profile)) throw refusedRequest(new OverdriveError(`Unknown worker profile: ${profile}`, 'INVALID_STATE'));
+    const owner = `${harness}:${profile}`;
+    let backend = this.backends.get(owner);
     if (backend) return backend;
-    backend = this.factories[harness]();
+    backend = this.factories[harness](profile);
     backend.on('notification', message => this.emit('notification', message));
     backend.on('serverRequest', message => this.emit('serverRequest', message));
     backend.on('exit', (error, threadIds) => {
-      const owned = threadIds ?? [...this.threads].filter(([, owner]) => owner === harness).map(([threadId]) => threadId);
+      const owned = threadIds ?? [...this.threads].filter(([, loaded]) => loaded === owner).map(([threadId]) => threadId);
       for (const threadId of owned) this.threads.delete(threadId);
       this.emit('exit', error, owned);
     });
-    this.backends.set(harness, backend);
+    this.backends.set(owner, backend);
     return backend;
   }
 
   async ensureStarted() {}
 
-  // A session belongs to the harness that created it. Callers name that owner; a loaded
-  // session confirms it and a disagreement is refused instead of silently rerouted.
-  owner(threadId, harness) {
+  // A session belongs to the backend that created it. Callers name its harness and profile; a
+  // loaded session confirms them and a disagreement is refused instead of silently rerouted.
+  owner(threadId, harness, profile = 'feature') {
     const loaded = this.threads.get(threadId);
-    if (loaded && harness && loaded !== harness) throw refusedRequest(new OverdriveError(`Native session ${threadId} belongs to the ${loaded} harness, not ${harness}.`, 'SESSION_OWNER_CONFLICT'));
-    const owner = loaded ?? harness;
+    const named = harness && `${harness}:${profile}`;
+    if (loaded && named && loaded !== named) throw refusedRequest(new OverdriveError(`Native session ${threadId} belongs to the ${loaded} worker backend, not ${named}.`, 'SESSION_OWNER_CONFLICT'));
+    const owner = loaded ?? named;
     if (!owner) throw refusedRequest(new OverdriveError(`Native session ${threadId} has no recorded owning harness.`, 'SESSION_OWNER_UNKNOWN'));
     return owner;
   }
 
   // Makes a saved session readable in this controller without launching a turn. Only backends
   // that keep session metadata in process need this; others read their persisted sessions.
-  async attachThread({ harness, ...params }) {
-    const owner = this.owner(params.threadId, harness);
+  async attachThread({ harness, profile, ...params }) {
+    const owner = this.owner(params.threadId, harness, profile);
     const backend = this.backend(owner);
     if (!backend.attachThread) return;
     await backend.attachThread(params);
     this.threads.set(params.threadId, owner);
   }
 
-  async startThread({ harness = 'codex', ...params }) {
-    const response = await this.backend(harness).startThread(params);
-    this.threads.set(response.thread.id, harness);
+  async startThread({ harness = 'codex', profile = 'feature', ...params }) {
+    const owner = `${harness}:${profile}`;
+    const response = await this.backend(owner).startThread(params);
+    this.threads.set(response.thread.id, owner);
     return response;
   }
 
-  async resumeThread({ harness, ...params }) {
-    const owner = this.owner(params.threadId, harness);
+  async resumeThread({ harness, profile, ...params }) {
+    const owner = this.owner(params.threadId, harness, profile);
     const response = await this.backend(owner).resumeThread(params);
     this.threads.set(params.threadId, owner);
     return response;
@@ -311,13 +352,13 @@ export class WorkerBridge extends EventEmitter {
 
   // A loaded session adopts changed session-bound settings before its next turn, exactly as a
   // resume after restart would. Backends whose settings travel with each turn need no update.
-  async updateThread({ harness, ...params }) {
-    const backend = this.backend(this.owner(params.threadId, harness));
+  async updateThread({ harness, profile, ...params }) {
+    const backend = this.backend(this.owner(params.threadId, harness, profile));
     return backend.updateThread ? await backend.updateThread(params) : null;
   }
 
-  async request(method, { harness, ...params } = {}) {
-    return await this.backend(params.threadId ? this.owner(params.threadId, harness) : harness).request(method, params);
+  async request(method, { harness, profile = 'feature', ...params } = {}) {
+    return await this.backend(params.threadId ? this.owner(params.threadId, harness, profile) : `${harness ?? 'codex'}:${profile}`).request(method, params);
   }
 
   // Waits for, or stops, a worker process that a loaded session's ended turn left running (such
@@ -333,19 +374,21 @@ export class WorkerBridge extends EventEmitter {
     this.backends.get(owner)?.acknowledgeDescendants?.({ threadId, turnId });
   }
 
-  liveRequest(requestId) {
-    for (const backend of this.backends.values()) {
-      const request = backend.liveRequest(requestId);
-      if (request) return request;
-    }
-    return null;
+  // Request IDs are unique only within one backend, so the backend owning threadId is asked first.
+  #requestBackend(requestId, threadId) {
+    const owner = this.backends.get(this.threads.get(threadId));
+    if (owner?.liveRequest(requestId)) return owner;
+    return [...this.backends.values()].find(backend => backend.liveRequest(requestId)) ?? null;
   }
 
-  respondToServer(requestId, result, error = undefined) {
-    for (const backend of this.backends.values()) {
-      if (backend.liveRequest(requestId)) return backend.respondToServer(requestId, result, error);
-    }
-    throw new OverdriveError(`Worker request is no longer live: ${requestId}`, 'REQUEST_ORPHANED');
+  liveRequest(requestId, threadId = undefined) {
+    return this.#requestBackend(requestId, threadId)?.liveRequest(requestId) ?? null;
+  }
+
+  respondToServer(requestId, result, error = undefined, threadId = undefined) {
+    const backend = this.#requestBackend(requestId, threadId);
+    if (!backend) throw new OverdriveError(`Worker request is no longer live: ${requestId}`, 'REQUEST_ORPHANED');
+    return backend.respondToServer(requestId, result, error);
   }
 
   // Resolves once every backend has shut down, reporting processes a backend could not stop.

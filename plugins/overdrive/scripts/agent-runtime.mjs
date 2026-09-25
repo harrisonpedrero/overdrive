@@ -1,6 +1,6 @@
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
+import { denialNote, workerServer } from './worker-policy.mjs';
 import { summarizePatch, OverdriveError, parseJsonObject, requiredText, redactString, resolveWorkspace } from './util.mjs';
 import { adoptAgentObservation, agentBusy, withAgentControl, withLaneStop } from './ownership.mjs';
 import { workerJobState } from './process-tree.mjs';
@@ -86,7 +86,7 @@ const descendantsSummary = turnId => `The worker process of turn ${turnId ?? 'un
 async function onServerRequest(message) {
   const registration = registrations.get(message.params?.threadId);
   if (!registration) {
-    try { bridge.respondToServer(message.id, undefined, 'OVERDRIVE cannot route this request to a registered feature.'); } catch { /* process may be exiting */ }
+    try { bridge.respondToServer(message.id, undefined, 'OVERDRIVE cannot route this request to a registered feature.', message.params?.threadId); } catch { /* process may be exiting */ }
     return;
   }
   const payload = safePayload(message.params);
@@ -102,7 +102,7 @@ async function onServerRequest(message) {
     payload,
   });
   if (saved.ignored) {
-    try { bridge.respondToServer(message.id, undefined, 'This native session is no longer bound to its feature lane.'); } catch { /* process may be exiting */ }
+    try { bridge.respondToServer(message.id, undefined, 'This native session is no longer bound to its feature lane.', message.params.threadId); } catch { /* process may be exiting */ }
   }
 }
 
@@ -149,7 +149,8 @@ async function onNotification({ method, params }) {
     if (turnId && completedTurns.has(completionKey)) return;
     // Recorded before the turn's end, so no reader sees the lane stopped without the marker.
     if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, thread_id: params.threadId, turn_id: turnId ?? null, summary: descendantsSummary(turnId) });
-    const visible = redactString(clip(finalVisibleMessage(turn) || turnMessages.get(turnId) || `Agent turn ${turn.status || 'completed'}.`));
+    const handoff = finalVisibleMessage(turn) || turnMessages.get(turnId) || `Agent turn ${turn.status || 'completed'}.`;
+    const visible = redactString(clip(turn.denials?.length ? `${handoff}\n${denialNote(turn.denials)}` : handoff));
     const diff = turnDiffs.get(turnId);
     const plan = turnPlans.get(turnId);
     if (plan) await recordAgentEvent({ ...base, thread_id: params.threadId, kind: 'agent.plan', summary: 'Agent updated its visible plan.', details: plan });
@@ -197,12 +198,9 @@ bridge.on('exit', (error, threadIds = null) => {
   }).catch(() => {});
 });
 
-function runtimeRoots(runtime) {
-  return [runtime.feature.checkout_path, path.dirname(runtime.contextPath)];
-}
-
+// The capability profile always comes from the lane's recorded kind, never from a tool argument.
 function harnessParams(runtime) {
-  return { harness: runtime.harness, model: runtime.workerModel, harnessOptions: runtime.harnessOptions };
+  return { harness: runtime.harness, profile: runtime.profile, model: runtime.workerModel, harnessOptions: runtime.harnessOptions };
 }
 
 // Callers validate the instruction before any native session or lane state changes.
@@ -222,9 +220,10 @@ function sessionParams(runtime) {
   return {
     ...harnessParams(runtime),
     threadId: runtime.feature.thread_id,
-    cwd: runtime.feature.checkout_path,
-    runtimeWorkspaceRoots: runtimeRoots(runtime),
+    cwd: runtime.cwd,
+    runtimeWorkspaceRoots: runtime.roots,
     developerInstructions: runtime.developerInstructions,
+    workerServer: workerServer(runtime.root, runtime.feature.slug),
   };
 }
 
@@ -303,7 +302,7 @@ async function reconcileDispatch(runtime, attestation = null) {
       const { harness: _configured, model: _model, harnessOptions: _options, ...session } = sessionParams(runtime);
       await bridge.attachThread?.({ ...session, harness: owner });
     }
-    thread = (await bridge.request('thread/read', { harness: owner, threadId: runtime.feature.thread_id, includeTurns: true })).thread;
+    thread = (await bridge.request('thread/read', { harness: owner, profile: runtime.profile, threadId: runtime.feature.thread_id, includeTurns: true })).thread;
   } catch (error) {
     unreadable = redactString(error.message);
   }
@@ -374,8 +373,8 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
   try {
     if (guardId && (await registerWorkerGuard({ ...base, guard_id: guardId })).ignored) throw new OverdriveError('The Claude worker guard could not be recorded for this session.', 'AGENT_OWNED');
     const result = await bridge.request('turn/start', {
-      harness: runtime.harness, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
-      runtimeWorkspaceRoots: runtimeRoots(runtime), model: runtime.workerModel, effort, summary: 'concise', guardId,
+      harness: runtime.harness, profile: runtime.profile, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.cwd,
+      runtimeWorkspaceRoots: runtime.roots, model: runtime.workerModel, effort, summary: 'concise', guardId,
     });
     if (result.treeStoppedGuardId) await clearWorkerGuards({ ...base, guard_id: result.treeStoppedGuardId });
     await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_status: 'starting' }));
@@ -419,17 +418,12 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
   if (threadId && !force_new_session) {
     await resume(runtime);
   } else {
-    const started = await bridge.startThread({
-      ...harnessParams(runtime),
-      cwd: runtime.feature.checkout_path,
-      runtimeWorkspaceRoots: runtimeRoots(runtime),
-      developerInstructions: runtime.developerInstructions,
-      effort,
-    });
+    const { threadId: _replaced, ...session } = sessionParams(runtime);
+    const started = await bridge.startThread({ ...session, effort });
     threadId = started.thread.id;
     created = true;
     register(threadId, runtime.root, runtime.feature.slug);
-    await bridge.request('thread/name/set', { harness: runtime.harness, threadId, name: `OVERDRIVE · ${runtime.feature.title}` }).catch(() => {});
+    await bridge.request('thread/name/set', { harness: runtime.harness, profile: runtime.profile, threadId, name: `OVERDRIVE · ${runtime.feature.title}` }).catch(() => {});
   }
   const turn = await dispatchTurn(runtime, threadId, direction, effort, created);
   return {
@@ -440,7 +434,7 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
     harness: runtime.harness,
     model: runtime.workerModel ?? 'harness-default',
     effort,
-    checkoutPath: runtime.feature.checkout_path,
+    checkoutPath: runtime.cwd,
     next: 'The feature task is running. Use agent_inspect for safe progress or agent_steer to revise direction mid-turn.',
   };
 }
@@ -456,6 +450,7 @@ async function steerOwned({ workspace_path, feature, effort = 'high' }, directio
   if (runtime.feature.active_turn_id) {
     result = await bridge.request('turn/steer', {
       harness: runtime.harness,
+      profile: runtime.profile,
       threadId: runtime.feature.thread_id,
       expectedTurnId: runtime.feature.active_turn_id,
       input: textInput(direction),
@@ -501,7 +496,7 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
       // cover a completion delivered before resume registered the session.
       const observing = await prepareCodexObservation(runtime);
       if (!observing && !registrations.has(runtime.feature.thread_id)) await bridge.attachThread?.(sessionParams(runtime));
-      const response = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
+      const response = await bridge.request('thread/read', { harness: runtime.harness, profile: runtime.profile, threadId: runtime.feature.thread_id, includeTurns: true });
       thread = safeThreadView(response.thread);
       if (observing || registrations.has(runtime.feature.thread_id)) await reconcileCompletedNativeTurn(runtime, response.thread);
       if (runtime.feature.agent_status === 'uncertain') {
@@ -557,7 +552,7 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
   try {
     for (const runtime of runtimes) {
       if (await prepareCodexObservation(runtime)) {
-        const response = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
+        const response = await bridge.request('thread/read', { harness: runtime.harness, profile: runtime.profile, threadId: runtime.feature.thread_id, includeTurns: true });
         await reconcileCompletedNativeTurn(runtime, response.thread);
       }
     }
@@ -596,7 +591,7 @@ async function interruptOwned({ workspace_path, feature }) {
   requireSessionOwner(runtime);
   await bridge.ensureStarted();
   await resume(runtime);
-  const result = await bridge.request('turn/interrupt', { harness: runtime.harness, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id });
+  const result = await bridge.request('turn/interrupt', { harness: runtime.harness, profile: runtime.profile, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id });
   // A backend that reports nothing to interrupt (the turn ended first) is taken at its word.
   if (result?.interrupted === false) return { interrupted: false, threadId: runtime.feature.thread_id, turnId: runtime.feature.active_turn_id, harness: runtime.harness, reason: 'The turn had already ended; its completion is recorded from the native session.' };
   await recordAgentEvent({ workspace_path: runtime.root, feature: runtime.feature.slug, kind: 'coordinator.interrupted', summary: `Interrupted active turn ${runtime.feature.active_turn_id}.`, details: {} });
@@ -628,7 +623,7 @@ async function recordedLane(runtime) {
 async function settleEndedTurn(runtime, turnId) {
   let turn;
   try {
-    const { thread } = await bridge.request('thread/read', { harness: runtime.harness, threadId: runtime.feature.thread_id, includeTurns: true });
+    const { thread } = await bridge.request('thread/read', { harness: runtime.harness, profile: runtime.profile, threadId: runtime.feature.thread_id, includeTurns: true });
     turn = thread.history === 'unavailable' ? null : thread.turns?.find(candidate => candidate.id === turnId);
   } catch { return false; }
   if (!turn || !['completed', 'interrupted', 'failed'].includes(turn.status)) return false;
@@ -671,7 +666,7 @@ async function stopWorker(runtime, status, attestation) {
     try {
       await bridge.ensureStarted();
       await resume(runtime);
-      result = await bridge.request('turn/interrupt', { harness: runtime.harness, threadId, turnId });
+      result = await bridge.request('turn/interrupt', { harness: runtime.harness, profile: runtime.profile, threadId, turnId });
     } catch (error) {
       throw await unconfirmed(`interrupting turn ${turnId} failed (${redactString(error.message)}). Inspect the lane and retry once its turn has ended.`, { turnId, interruptError: error.code ?? null });
     }
@@ -743,7 +738,7 @@ async function resolveRequestOwned({ workspace_path, feature, request_id, action
   if (!['turn', 'session'].includes(scope)) throw new OverdriveError('scope must be turn or session.', 'INVALID_INPUT');
   const request = await pendingAgentRequest({ workspace_path, feature, request_id });
   await bridge.ensureStarted();
-  const liveRequest = bridge.liveRequest(request_id);
+  const liveRequest = bridge.liveRequest(request_id, request.thread_id);
   if (!liveRequest || liveRequest.params?.threadId !== request.thread_id) {
     await resolveAgentRequestRecord({ workspace_path, feature, request_id, status: 'orphaned', summary: `${request.method} belongs to an earlier app-server process and must be requested again.` });
     throw new OverdriveError('This request belongs to an earlier server process and can no longer be answered. Inspect the feature task and retry the blocked operation.', 'REQUEST_ORPHANED');
@@ -759,7 +754,7 @@ async function resolveRequestOwned({ workspace_path, feature, request_id, action
     if (action !== 'respond') throw new OverdriveError('This request requires a structured response object.', 'INVALID_INPUT');
     result = parseJsonObject(response, 'response') || {};
   }
-  bridge.respondToServer(request_id, result);
+  bridge.respondToServer(request_id, result, undefined, request.thread_id);
   await resolveAgentRequestRecord({ workspace_path, feature, request_id, owner_token: ownerToken, thread_id: request.thread_id, ignore_missing: true, summary: `Resolved ${request.method} with ${action}.` });
   return { resolved: true, requestId: String(request_id), action, feature };
 }
