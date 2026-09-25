@@ -2,10 +2,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { withWorkspaceLock } from '../../plugins/feature-theater/scripts/util.mjs';
+import { withWorkspaceLock } from '../../plugins/overdrive/scripts/util.mjs';
 
 const [workspace, mode, name = mode] = process.argv.slice(2);
-const lockFile = path.join(workspace, '.theater', 'locks', 'features.lock');
+const lockFile = path.join(workspace, '.overdrive', 'locks', 'features.lock');
 const markers = path.join(workspace, 'markers');
 const marker = file => path.join(markers, file);
 const exists = file => fs.access(marker(file)).then(() => true, () => false);

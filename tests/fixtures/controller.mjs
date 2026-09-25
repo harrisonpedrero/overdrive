@@ -1,11 +1,11 @@
-// A real Feature Theater controller process for restart tests: one WorkerBridge and agent
+// A real OVERDRIVE controller process for restart tests: one WorkerBridge and agent
 // runtime per process over the fake Codex and Claude backends, one JSON command per stdin line.
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { WorkerBridge } from '../../plugins/feature-theater/scripts/app-server.mjs';
-import { createAgentRuntime } from '../../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { TheaterError } from '../../plugins/feature-theater/scripts/util.mjs';
+import { WorkerBridge } from '../../plugins/overdrive/scripts/app-server.mjs';
+import { createAgentRuntime } from '../../plugins/overdrive/scripts/agent-runtime.mjs';
+import { OverdriveError } from '../../plugins/overdrive/scripts/util.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const node = script => ({ launch: { command: process.execPath, args: [path.join(here, script)] } });
@@ -23,7 +23,7 @@ bridge.request = async (method, params) => {
   losing = method === 'turn/start' && JSON.stringify(params.input).includes('FAKE_LOST_AFTER_SEND');
   try {
     const result = await request(method, params);
-    if (losing) throw new TheaterError('Worker request timed out: turn/start', 'CODEX_TIMEOUT');
+    if (losing) throw new OverdriveError('Worker request timed out: turn/start', 'CODEX_TIMEOUT');
     return result;
   } finally { losing = false; }
 };

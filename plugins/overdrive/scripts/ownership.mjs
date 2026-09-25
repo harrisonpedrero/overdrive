@@ -1,5 +1,5 @@
 import { assertCheckReservation, loadWorkspace, featureBySlug, meta, parseJson, readFeatureRow, recordEvent, transaction } from './state.mjs';
-import { TheaterError, now, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
+import { OverdriveError, now, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 export function ownerAlive(owner) {
   if (!owner?.pid) return false;
@@ -60,7 +60,7 @@ export function agentBusy(row) {
 function claimAgentControl(ctx, row, token) {
   const previous = agentOwner(ctx.db, row.id);
   if (previous?.token !== token && agentBusy(row) && ownerAlive(previous)) {
-    throw new TheaterError('This feature is running in another coordinator session. Inspect it there or wait for its current turn to finish.', 'AGENT_OWNED');
+    throw new OverdriveError('This feature is running in another coordinator session. Inspect it there or wait for its current turn to finish.', 'AGENT_OWNED');
   }
   if (previous?.token !== token && !ownerAlive(previous)) {
     ctx.db.prepare(RELEASE_DEAD_OWNER).run(row.id);

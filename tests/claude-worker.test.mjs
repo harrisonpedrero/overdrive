@@ -6,17 +6,17 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
-import { ClaudeWorkerBridge, ISOLATION_ARGS, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/feature-theater/scripts/claude-worker.mjs';
-import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, recordCandidate, setFeatureStatus, workerHarness } from '../plugins/feature-theater/scripts/workspace.mjs';
-import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
+import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
+import { ClaudeWorkerBridge, ISOLATION_ARGS, normalizeWorkerOptions, workerEnvironment, workerLaunchArgs } from '../plugins/overdrive/scripts/claude-worker.mjs';
+import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, readUnconfirmedDescendants, readWorkerGuards, recordCandidate, setFeatureStatus, workerHarness } from '../plugins/overdrive/scripts/workspace.mjs';
+import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeCli = path.join(here, 'fixtures', 'fake-claude-cli.mjs');
 
 async function fixture(t, claude = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-'));
   await initializeManagedProject({ workspace_path: root, project_name: 'Claude fixture', description: 'Exercise the Claude worker bridge.', harness: 'claude' });
   await createFeature({ workspace_path: root, feature: 'alpha', title: 'Alpha', outcome: 'Complete one bounded turn.', spec: '# Alpha\n\nComplete the fixture.' });
   const argsFile = path.join(root, 'fake-claude-args.json');
@@ -42,13 +42,13 @@ async function eventually(check) {
 const agentStatus = async args => (await getFeatureContext(args)).feature.agent.status;
 
 function expireControllerOwner(root) {
-  const db = new DatabaseSync(path.join(root, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(root, '.overdrive', 'state.sqlite3'));
   try { db.prepare("UPDATE meta SET value = json_set(value, '$.pid', ?) WHERE key LIKE 'agent-owner:%'").run(spawnSync(process.execPath, ['-e', '']).pid); }
   finally { db.close(); }
 }
 
 test('claude worker launch is isolated, resumable and free of nested-session markers', () => {
-  const meta = { id: 'session-1', persisted: false, model: 'opus', options: normalizeWorkerOptions({}), addDirs: ['C:/theater/.theater/features/alpha'], developerInstructions: 'lane contract', name: 'Theater · Alpha' };
+  const meta = { id: 'session-1', persisted: false, model: 'opus', options: normalizeWorkerOptions({}), addDirs: ['C:/overdrive/.overdrive/features/alpha'], developerInstructions: 'lane contract', name: 'OVERDRIVE · Alpha' };
   const first = workerLaunchArgs(meta, 'ultra');
   for (const flag of ISOLATION_ARGS) assert.ok(first.includes(flag), flag);
   assert.ok(first.includes('--session-id') && first.includes('session-1'));
@@ -70,7 +70,7 @@ test('claude worker launch is isolated, resumable and free of nested-session mar
   assert.ok(workerLaunchArgs({ ...meta, options: custom }, 'high').includes('--allow-dangerously-skip-permissions'));
 });
 
-test('theater.json selects the harness and per-lane model', () => {
+test('overdrive.json selects the harness and per-lane model', () => {
   assert.deepEqual(workerHarness({}, 'alpha'), { harness: 'codex', workerModel: 'gpt-6-sol', harnessOptions: {} });
   assert.equal(workerHarness({ codex: { model: 'gpt-6-luna' } }, 'alpha').workerModel, 'gpt-6-luna');
   assert.equal(workerHarness({ codex: { model: 'gpt-6-luna', laneModels: { alpha: 'gpt-6-sol' } } }, 'alpha').workerModel, 'gpt-6-sol');
@@ -255,7 +255,7 @@ const stalledKiller = () => ({ command: process.execPath, args: ['-e', 'setTimeo
 // Bridge-level turns run uncontained unless a test opts in, so stubbed killers and processes
 // model the worker process itself; containment has its own tests.
 async function bridgeTurn(t, { input = 'hang', launchArgs = [fakeCli], ...options } = {}) {
-  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-bridge-'));
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-bridge-'));
   const bridge = new ClaudeWorkerBridge({ launch: { command: process.execPath, args: launchArgs }, terminationTimeoutMs: 500, containment: null, ...options });
   const completed = [];
   bridge.on('notification', message => { if (message.method === 'turn/completed') completed.push(message.params.turn); });
@@ -308,7 +308,7 @@ test('claude worker result that arrives during an interrupt cannot complete the 
   const worker = "let seen = ''; process.stdin.on('data', chunk => { seen += chunk; if (!seen.includes('trigger')) return; seen = ''; process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Late result.' }) + '\\n', () => require('fs').writeFileSync(process.argv[1], 'written')); }); setInterval(() => {}, 1000);";
   const killer = "const fs = require('fs'); setInterval(() => { if (fs.existsSync(process.argv[1])) process.exit(1); }, 20);";
   for (const killable of [false, true]) {
-    const marker = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-marker-')), 'result-written');
+    const marker = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-marker-')), 'result-written');
     t.after(() => fs.rm(path.dirname(marker), { recursive: true, force: true }));
     let worker$;
     const treeKill = () => {
@@ -421,7 +421,7 @@ const toolLauncher = "const { spawn } = require('child_process'); const tool = s
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 
 test('a pause that ends the worker but not the tools it launched is refused until they are verified stopped', async t => {
-  const pidFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-tool-')), 'tool.pid');
+  const pidFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-tool-')), 'tool.pid');
   const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', toolLauncher, '--', pidFile] }, treeKill: failingKiller, terminationTimeoutMs: 500, containment: null });
   const tools = [];
   t.after(async () => {
@@ -554,7 +554,7 @@ test('a tool that outlives its Claude turn keeps checks, candidates, completion 
   // 'tool-tree' is an ordinary shell -> test runner -> test process chain, as npm test run by a
   // Bash tool call; 'spoof' also writes forged containment reports to the stderr it shares.
   for (const [mode, ending] of [['detached', 'exits'], ['tool-tree', 'exits'], ['spoof', 'exits'], ['detached', 'pause'], ['tool-tree', 'next-turn']]) {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-tool-'));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-tool-'));
     const pidFile = path.join(dir, 'tool.pid');
     const release = path.join(dir, 'release');
     const { args, bridge, runtime } = await fixture(t, { launch: { command: process.execPath, args: [lingeringTool, 'cli', mode, pidFile, release] }, terminationTimeoutMs: 500 });
@@ -625,7 +625,7 @@ test('an uncontained Claude worker leaves every turn unconfirmed until the coord
 });
 
 test('after a controller loses a clean exit, inspection alone clears a guard whose job has ended', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-inspect-'));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-inspect-'));
   const pidFile = path.join(dir, 'tool.pid');
   const release = path.join(dir, 'release');
   const claude = { launch: { command: process.execPath, args: [lingeringTool, 'cli', 'detached', pidFile, release] }, terminationTimeoutMs: 500 };
@@ -640,7 +640,7 @@ test('after a controller loses a clean exit, inspection alone clears a guard who
   expireControllerOwner(args.workspace_path);
   const observer = createAgentRuntime(new WorkerBridge({ claude }));
   t.after(() => observer.shutdownAgentRuntime());
-  const refused = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /theater_agent_inspect/.test(error.message);
+  const refused = error => error.code === 'AGENT_BUSY' && error.details?.workerGuards === 1 && /agent_inspect/.test(error.message);
 
   // While the tool runs, inspection keeps the guard and checks stay refused.
   await observer.inspectFeatureAgent(args);
@@ -678,7 +678,7 @@ const forgingWarden = [
 
 test('only the job itself, never a warden report, confirms a Claude worker tree ended', async t => {
   for (const [state, released] of [['present', false], ['unknown', false], ['empty', true], ['absent', true]]) {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-claude-forged-'));
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-forged-'));
     const containment = {
       jobName: id => `Global\\overdrive-worker-${id}`,
       launch: (_cli, job) => ({ command: process.execPath, args: ['-e', forgingWarden], env: {}, job, token: 'tok' }),

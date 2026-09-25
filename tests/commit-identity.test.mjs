@@ -4,16 +4,16 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { run } from '../plugins/feature-theater/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, initializeWorkspace, recordCandidate } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { run } from '../plugins/overdrive/scripts/util.mjs';
+import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, initializeWorkspace, recordCandidate } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const AUTOMATION = 'OVERDRIVE <overdrive@local.invalid>';
 const IDENTITY_ENV = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS'];
 
 // Every Git child of this process sees only the given global file and an empty system file.
 async function isolatedHost(t, globalConfig = '') {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-identity-'));
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-identity-'));
   const saved = Object.fromEntries(['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', ...IDENTITY_ENV].map(key => [key, process.env[key]]));
   t.after(async () => {
     for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }

@@ -1,14 +1,14 @@
 {
-  "name": "feature-theater-local",
+  "name": "overdrive-local",
   "interface": {
     "displayName": "OVERDRIVE Development"
   },
   "plugins": [
     {
-      "name": "feature-theater",
+      "name": "overdrive",
       "source": {
         "source": "local",
-        "path": "./plugins/feature-theater"
+        "path": "./plugins/overdrive"
       },
       "policy": {
         "installation": "AVAILABLE",

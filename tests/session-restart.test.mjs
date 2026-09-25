@@ -6,16 +6,16 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
-import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, readWorkerGuards } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
+import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, readWorkerGuards } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Each controller is a separate OS process; restarting one loses every in-memory session cache,
 // so ownership can only come from durable state.
 function controller(env) {
-  const child = spawn(process.execPath, [path.join(here, 'fixtures', 'theater-controller.mjs')], { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
+  const child = spawn(process.execPath, [path.join(here, 'fixtures', 'controller.mjs')], { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
   const exited = new Promise(resolve => child.once('exit', resolve));
   const pending = new Map();
   let ready;
@@ -59,7 +59,7 @@ async function lines(file) {
 }
 
 test('a restarted controller waits for saved Codex turns and preserves inspect-before-wait completion', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-restart-wait-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-restart-wait-'));
   const env = { FAKE_CODEX_STORE: path.join(root, 'codex-store.json'), FAKE_CODEX_LOG: path.join(root, 'codex.log') };
   const controllers = [];
   t.after(async () => {
@@ -122,7 +122,7 @@ test('a restarted controller waits for saved Codex turns and preserves inspect-b
 });
 
 test('a controller killed alone takes its Claude worker trees with it, and a later inspection proves it', { skip: process.platform !== 'win32' && 'process-tree containment is Windows-only' }, async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-crash-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-crash-'));
   const pidFile = path.join(root, 'tool.pid');
   const release = path.join(root, 'release');
   const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
@@ -158,7 +158,7 @@ test('a controller killed alone takes its Claude worker trees with it, and a lat
 });
 
 test('saved sessions keep their owning backend across harness changes and real controller restarts', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-restart-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-restart-'));
   const controllers = [];
   t.after(async () => {
     for (const running of controllers) await running.kill().catch(() => {});
@@ -178,7 +178,7 @@ test('saved sessions keep their owning backend across harness changes and real c
     return running;
   };
   const configure = async harness => {
-    const file = path.join(root, 'theater.json');
+    const file = path.join(root, 'overdrive.json');
     await fs.writeFile(file, JSON.stringify({ ...JSON.parse(await fs.readFile(file, 'utf8')), harness }, null, 2));
   };
   const agent = async () => (await getFeatureContext(args)).feature.agent;
@@ -196,7 +196,7 @@ test('saved sessions keep their owning backend across harness changes and real c
   await current.stop();
   current = await launch();
   assert.deepEqual({ threadId: (await agent()).threadId, harness: (await agent()).harness }, { threadId: claudeThread, harness: 'claude' });
-  assert.match(await fs.readFile(path.join(root, '.theater', 'features', 'alpha', 'context.md'), 'utf8'), new RegExp(`thread ${claudeThread} \\(claude\\)`));
+  assert.match(await fs.readFile(path.join(root, '.overdrive', 'features', 'alpha', 'context.md'), 'utf8'), new RegExp(`thread ${claudeThread} \\(claude\\)`));
   // A fresh controller reads the Claude session from its metadata without launching a turn, and
   // says that earlier turns are not loaded instead of presenting an empty transcript.
   const inspected = await current.call('inspect', args);
@@ -279,7 +279,7 @@ test('saved sessions keep their owning backend across harness changes and real c
 });
 
 test('a real Codex app-server refusal fails the turn while a lost response is reconciled without a duplicate turn', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-dispatch-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-dispatch-'));
   const env = { FAKE_CODEX_STORE: path.join(root, 'codex-store.json'), FAKE_CODEX_LOG: path.join(root, 'codex.log'), FAKE_CODEX_TIMEOUT_MS: '800' };
   const running = controller(env);
   t.after(async () => {
@@ -315,7 +315,7 @@ test('a real Codex app-server refusal fails the turn while a lost response is re
   await running.stop();
 });
 test('an unconfirmed turn request survives a controller crash and is reconciled by the next controller', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-crash-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-crash-'));
   const env = {
     FAKE_CODEX_STORE: path.join(root, 'codex-store.json'), FAKE_CODEX_LOG: path.join(root, 'codex.log'), FAKE_CODEX_TIMEOUT_MS: '800',
     FAKE_CLAUDE_STORE: path.join(root, 'claude-store.json'), FAKE_CLAUDE_LOG: path.join(root, 'claude.log'),
@@ -346,7 +346,7 @@ test('an unconfirmed turn request survives a controller crash and is reconciled 
   let current = await launch();
   const codexSession = await current.call('start', codexLane);
   await settled(codexLane, 'idle');
-  const file = path.join(root, 'theater.json');
+  const file = path.join(root, 'overdrive.json');
   await fs.writeFile(file, JSON.stringify({ ...JSON.parse(await fs.readFile(file, 'utf8')), harness: 'claude' }, null, 2));
   const claudeSession = await current.call('start', claudeLane);
   assert.equal(claudeSession.harness, 'claude');

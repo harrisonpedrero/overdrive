@@ -6,7 +6,7 @@ import path from 'node:path';
 import { codexExecutable } from './app-server.mjs';
 import { claudeExecutable, normalizeWorkerOptions } from './claude-worker.mjs';
 import {
-  TheaterError,
+  OverdriveError,
   atomicWrite,
   contained,
   ensureManagedPath,
@@ -20,7 +20,7 @@ import {
   run,
   safeSlug,
   withWorkspaceLock,
-  writeJson,
+  writeJson, STATE_DIR, CONFIG_FILE,
 } from './util.mjs';
 import {
   checkoutFingerprint,
@@ -124,7 +124,7 @@ function assertCheckpointFresh(db, feature) {
   const current = Number(db.prepare('SELECT semantic_generation FROM features WHERE id = ?').get(feature.id).semantic_generation);
   const recorded = checkpoint?.semantic_generation ?? null;
   if (recorded !== null && Number(recorded) === current) return;
-  throw new TheaterError(`Checkpoint ${feature.slug} after its latest change before switching.`, 'CHECKPOINT_REQUIRED', {
+  throw new OverdriveError(`Checkpoint ${feature.slug} after its latest change before switching.`, 'CHECKPOINT_REQUIRED', {
     feature: feature.slug,
     reason: !checkpoint ? 'missing' : recorded === null ? 'legacy_checkpoint' : 'changed',
     checkpointId: checkpoint?.id ?? null,
@@ -198,7 +198,7 @@ function workerEvidence(db, featureId) {
 function applyCheckoutFreshness(db, feature, observation, acceptUnverified) {
   const { checkpoint, saved, current, comparison } = observation;
   if (latestCheckpoint(db, feature.id)?.id !== checkpoint.id) {
-    throw new TheaterError(`${feature.slug} was checkpointed while it was being switched; switch again.`, 'CHECKPOINT_CONFLICT', { feature: feature.slug, observedCheckpointId: checkpoint.id });
+    throw new OverdriveError(`${feature.slug} was checkpointed while it was being switched; switch again.`, 'CHECKPOINT_CONFLICT', { feature: feature.slug, observedCheckpointId: checkpoint.id });
   }
   const worker = workerEvidence(db, feature.id);
   const reasons = indeterminateReasons(saved, current);
@@ -213,13 +213,13 @@ function applyCheckoutFreshness(db, feature, observation, acceptUnverified) {
   const details = reason => ({ feature: feature.slug, reason, checkpointId: checkpoint.id, checkout, worker });
   if (!worker.active) {
     if (comparison.status === 'changed') {
-      throw new TheaterError(`Checkpoint ${feature.slug} again before switching: its checkout changed after the checkpoint (${comparison.changed.join(', ')}).`, 'CHECKPOINT_REQUIRED', details('checkout_changed'));
+      throw new OverdriveError(`Checkpoint ${feature.slug} again before switching: its checkout changed after the checkpoint (${comparison.changed.join(', ')}).`, 'CHECKPOINT_REQUIRED', details('checkout_changed'));
     }
     if (comparison.status === 'unverified') {
-      throw new TheaterError(`Checkpoint ${feature.slug} again before switching: its latest checkpoint has no comparable checkout fingerprint.`, 'CHECKPOINT_REQUIRED', details('checkout_unverified'));
+      throw new OverdriveError(`Checkpoint ${feature.slug} again before switching: its latest checkpoint has no comparable checkout fingerprint.`, 'CHECKPOINT_REQUIRED', details('checkout_unverified'));
     }
     if (comparison.status === 'indeterminate' && !acceptUnverified) {
-      throw new TheaterError(`${feature.slug}'s checkout could not be compared completely with its checkpoint (${reasons.join(', ') || comparison.indeterminate.join(', ')}).`, 'CHECKOUT_INDETERMINATE', {
+      throw new OverdriveError(`${feature.slug}'s checkout could not be compared completely with its checkpoint (${reasons.join(', ') || comparison.indeterminate.join(', ')}).`, 'CHECKOUT_INDETERMINATE', {
         ...details('checkout_indeterminate'),
         recovery: 'Retry once transient conditions clear, reduce dirty and untracked content below the limits (commit, stash or ignore generated files) and checkpoint again, or switch with accept_unverified_checkout: true to record an explicit unverified-checkout caveat.',
       });
@@ -279,11 +279,11 @@ async function ensureWorkspaceFiles(root, config) {
   const ignoreFile = contained(root, '.gitignore');
   const required = [
     'features/',
-    '.theater/cache/',
-    '.theater/locks/',
-    '.theater/state.sqlite3*',
-    '.theater/events.ndjson',
-    'theater.json',
+    '.overdrive/cache/',
+    '.overdrive/locks/',
+    '.overdrive/state.sqlite3*',
+    '.overdrive/events.ndjson',
+    'overdrive.json',
     ...(config?.managedProject ? ['project/'] : []),
   ];
   let ignore = '';
@@ -295,16 +295,16 @@ async function ensureWorkspaceFiles(root, config) {
   }
   const agentsFile = contained(root, 'AGENTS.md');
   if (!await exists(agentsFile)) {
-    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the feature-theater skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nOn a feature switch, checkpoint the outgoing lane, call the switch tool, honor its compaction directive, then load only the destination context packet. Recover from .theater/index.md, the focused context, live Git state, and the saved agent session. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
+    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the overdrive skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nOn a feature switch, checkpoint the outgoing lane, call the switch tool, honor its compaction directive, then load only the destination context packet. Recover from .overdrive/index.md, the focused context, live Git state, and the saved agent session. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
   }
 }
 
 function featureAgentInstructions(root, feature) {
-  const contextFile = contained(root, '.theater', 'features', feature.slug, 'context.md');
-  const specFile = contained(root, '.theater', 'features', feature.slug, 'spec.md');
+  const contextFile = contained(root, STATE_DIR, 'features', feature.slug, 'context.md');
+  const specFile = contained(root, STATE_DIR, 'features', feature.slug, 'spec.md');
   return `# OVERDRIVE lane: ${feature.slug}
 
-You are the implementation director for exactly one feature lane. Work only inside repo/; OVERDRIVE context lives outside the application checkout. You are a lane worker, not the OVERDRIVE coordinator: do not invoke OVERDRIVE (theater_*) tools, alter other lanes, or recursively inspect or steer this task. Apps, hooks, plugins, browser/computer control, and external MCP servers are deliberately unavailable; route cross-lane and external-system needs through your visible handoff.
+You are the implementation director for exactly one feature lane. Work only inside repo/; OVERDRIVE context lives outside the application checkout. You are a lane worker, not the OVERDRIVE coordinator: do not invoke OVERDRIVE coordinator tools, alter other lanes, or recursively inspect or steer this task. Apps, hooks, plugins, browser/computer control, and external MCP servers are deliberately unavailable; route cross-lane and external-system needs through your visible handoff.
 
 Before each turn, read:
 
@@ -332,7 +332,7 @@ async function writeFeatureAgentFile(ctx, feature) {
 }
 
 async function writeEventLog(ctx, event) {
-  const file = contained(ctx.root, '.theater', 'events.ndjson');
+  const file = contained(ctx.root, STATE_DIR, 'events.ndjson');
   await withWorkspaceLock(ctx.root, 'events', async () => {
     await ensureManagedPath(ctx.root, file);
     await fs.mkdir(path.dirname(file), { recursive: true });
@@ -374,7 +374,7 @@ ${rows.length ? rows.join('\n') : '| | _No features yet_ | | | | |'}
 
 This is a compact navigation projection. Load one feature's context packet instead of every spec.
 `;
-  await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'index.md'), body);
+  await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'index.md'), body);
 }
 
 // Rewrites a lane's context packet and the workspace index after a change made under the lane's
@@ -437,7 +437,7 @@ async function fileStartsWith(file, text, size) {
 // removes only regular files this code generated, proved by their exact name and marker, so notes
 // left in the directory survive.
 async function writeWorkDetails(ctx, feature, work) {
-  const directory = await ensureManagedPath(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'work'));
+  const directory = await ensureManagedPath(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'work'));
   const files = new Map(work.filter(item => item.status === 'running').map(item => [item.item_key, contained(directory, workDetailsName(item.item_key))]));
   for (const item of work) {
     const file = files.get(item.item_key);
@@ -466,7 +466,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const evidence = evidenceRows(ctx.db, feature.id, 10);
   const pending = pendingRows(ctx.db, feature.id);
   const canonicalSpec = latestSpec(ctx.db, feature.id);
-  if (canonicalSpec) await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'spec.md'), `${canonicalSpec.content.trim()}\n`);
+  if (canonicalSpec) await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'spec.md'), `${canonicalSpec.content.trim()}\n`);
   const caveat = checkoutCaveat(ctx.db, feature.id);
   let snapshot;
   try { snapshot = await repositorySnapshot(feature.checkout_path, feature.base_revision); }
@@ -486,23 +486,23 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
     ? evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')
     : '- No evidence recorded yet.';
   const packet = `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\nAgent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}\n\n## Current checkpoint\n\n${checkpoint?.summary || feature.summary || 'No checkpoint yet.'}\n\nNext action: ${feature.next_action || checkpoint?.next_action || 'Refine the spec and plan the first bounded work.'}\n${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}\n${checkpoint?.unresolved?.length ? `\nUnresolved: ${checkpoint.unresolved.join('; ')}\n` : ''}\n## Work graph\n\n${workLines}\n\n## Evidence\n\n${evidenceLines}\n\n## Live facts\n\n- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}${caveat ? `- CHECKOUT FRESHNESS CAVEAT: ${caveat.message}\n` : ''}- Pending agent requests: ${pending.length}\n- Compaction pending: ${feature.compaction_pending ? 'yes' : 'no'}\n\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
-  await atomicWrite(ctx.root, contained(ctx.root, '.theater', 'features', feature.slug, 'context.md'), packet);
+  await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'context.md'), packet);
   return { feature, work, checkpoint, evidence, pending, snapshot, commitIdentity: identity, checkoutCaveat: caveat };
 }
 
 async function existingInitialization(root, normalized) {
   return await withContext(root, async ctx => {
     if (ctx.config.repository !== normalized.source) {
-      throw new TheaterError(`This workspace already tracks ${ctx.config.repository}; refusing to replace it with ${normalized.source}. Use a fresh workspace directory for a different repository.`, 'REPOSITORY_MISMATCH');
+      throw new OverdriveError(`This workspace already tracks ${ctx.config.repository}; refusing to replace it with ${normalized.source}. Use a fresh workspace directory for a different repository.`, 'REPOSITORY_MISMATCH');
     }
     return { initialized: false, alreadyInitialized: true, workspace: overview(ctx) };
   });
 }
 
 async function initializeSource(root, normalized, additions = {}) {
-  const existingConfig = contained(root, 'theater.json');
+  const existingConfig = contained(root, CONFIG_FILE);
   if (await exists(existingConfig)) return await existingInitialization(root, normalized);
-  await fs.mkdir(contained(root, '.theater', 'features'), { recursive: true });
+  await fs.mkdir(contained(root, STATE_DIR, 'features'), { recursive: true });
   const mirror = await initializeMirror(root, normalized.source);
   const profile = await profileRepository(root, mirror.defaultRevision);
   const config = {
@@ -543,49 +543,49 @@ async function initializeSource(root, normalized, additions = {}) {
 }
 
 function partialInitializationError() {
-  return new TheaterError('A partial .theater directory already exists. Inspect it before retrying initialization.', 'PARTIAL_INITIALIZATION');
+  return new OverdriveError('A partial .overdrive directory already exists. Inspect it before retrying initialization.', 'PARTIAL_INITIALIZATION');
 }
 
 const HARNESSES = new Set(['codex', 'claude']);
 
 function harnessAddition(harness) {
   if (harness === undefined) return {};
-  if (!HARNESSES.has(harness)) throw new TheaterError('harness must be codex or claude.', 'INVALID_INPUT');
+  if (!HARNESSES.has(harness)) throw new OverdriveError('harness must be codex or claude.', 'INVALID_INPUT');
   return { harness };
 }
 
 function codexWorkerModel(config, slug) {
   const settings = config.codex;
   if (settings !== undefined && (settings === null || typeof settings !== 'object' || Array.isArray(settings))) {
-    throw new TheaterError('theater.json codex must be an object.', 'INVALID_STATE');
+    throw new OverdriveError('overdrive.json codex must be an object.', 'INVALID_STATE');
   }
   const options = settings ?? {};
   const laneModels = options.laneModels === undefined ? {} : options.laneModels;
   if (laneModels === null || typeof laneModels !== 'object' || Array.isArray(laneModels)) {
-    throw new TheaterError('theater.json codex.laneModels must be an object.', 'INVALID_STATE');
+    throw new OverdriveError('overdrive.json codex.laneModels must be an object.', 'INVALID_STATE');
   }
   for (const model of [options.model, ...Object.values(laneModels)]) {
     if (model !== undefined && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) {
-      throw new TheaterError('theater.json codex.model and codex.laneModels values must be model names.', 'INVALID_STATE');
+      throw new OverdriveError('overdrive.json codex.model and codex.laneModels values must be model names.', 'INVALID_STATE');
     }
   }
   return (Object.hasOwn(laneModels, slug) ? laneModels[slug] : undefined) ?? options.model ?? 'gpt-6-sol';
 }
 
-// theater.json selects the lane worker harness and its workspace or lane model.
+// overdrive.json selects the lane worker harness and its workspace or lane model.
 export function workerHarness(config, slug) {
   const harness = config.harness ?? 'codex';
-  if (!HARNESSES.has(harness)) throw new TheaterError(`theater.json harness must be codex or claude, not ${JSON.stringify(harness)}.`, 'INVALID_STATE');
+  if (!HARNESSES.has(harness)) throw new OverdriveError(`overdrive.json harness must be codex or claude, not ${JSON.stringify(harness)}.`, 'INVALID_STATE');
   if (harness === 'codex') return { harness, workerModel: codexWorkerModel(config, slug), harnessOptions: {} };
   const settings = config.claude && typeof config.claude === 'object' && !Array.isArray(config.claude) ? config.claude : {};
   const laneModels = settings.laneModels && typeof settings.laneModels === 'object' ? settings.laneModels : {};
   const model = (Object.hasOwn(laneModels, slug) ? laneModels[slug] : undefined) ?? settings.model ?? null;
-  if (model !== null && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) throw new TheaterError('theater.json claude.model and claude.laneModels values must be model names.', 'INVALID_STATE');
+  if (model !== null && (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(model))) throw new OverdriveError('overdrive.json claude.model and claude.laneModels values must be model names.', 'INVALID_STATE');
   const { model: _model, laneModels: _laneModels, ...harnessOptions } = settings;
   return { harness, workerModel: model, harnessOptions };
 }
 
-// theater.json chooses the harness for new sessions only; a saved session always runs on the
+// overdrive.json chooses the harness for new sessions only; a saved session always runs on the
 // harness that created it. Unknown legacy ownership yields no harness, so callers refuse it.
 function sessionHarness(config, row, forceNew = false) {
   if (!row.thread_id || forceNew) return workerHarness(config, row.slug);
@@ -597,9 +597,9 @@ export async function initializeWorkspace({ workspace_path, repository, harness 
   const root = await resolveWorkspace(workspace_path);
   const additions = harnessAddition(harness);
   const normalized = await normalizeRepositorySource(repository);
-  const existingConfig = contained(root, 'theater.json');
+  const existingConfig = contained(root, CONFIG_FILE);
   if (await exists(existingConfig)) return await existingInitialization(root, normalized);
-  if (await exists(contained(root, '.theater'))) throw partialInitializationError();
+  if (await exists(contained(root, STATE_DIR))) throw partialInitializationError();
   return await withWorkspaceLock(root, 'initialize', () => initializeSource(root, normalized, additions));
 }
 
@@ -607,28 +607,28 @@ export async function initializeManagedProject({ workspace_path, project_name, d
   const root = await resolveWorkspace(workspace_path);
   const additions = harnessAddition(harness);
   const name = requiredText(project_name, 'project_name', { max: 200 });
-  if (/\r|\n/.test(name)) throw new TheaterError('project_name must be one line.', 'INVALID_INPUT');
+  if (/\r|\n/.test(name)) throw new OverdriveError('project_name must be one line.', 'INVALID_INPUT');
   const brief = requiredText(description, 'description', { max: 50_000 });
   const branch = requiredText(default_branch, 'default_branch', { max: 200 });
   const project = await ensureManagedPath(root, contained(root, 'project'));
-  const existingConfig = contained(root, 'theater.json');
+  const existingConfig = contained(root, CONFIG_FILE);
   if (await exists(existingConfig)) {
     return await withContext(root, async ctx => {
       if (!ctx.config.managedProject
         || ctx.config.managedProject.name !== name
         || ctx.config.managedProject.description !== brief
         || ctx.config.managedProject.defaultBranch !== branch) {
-        throw new TheaterError('This workspace is already initialized for a different repository or managed project.', 'ALREADY_INITIALIZED');
+        throw new OverdriveError('This workspace is already initialized for a different repository or managed project.', 'ALREADY_INITIALIZED');
       }
       const workspace = overview(ctx);
       return { initialized: false, alreadyInitialized: true, workspace, managedProject: workspace.managedProject };
     });
   }
-  if (await exists(contained(root, '.theater'))) throw partialInitializationError();
-  if (await exists(project)) throw new TheaterError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
+  if (await exists(contained(root, STATE_DIR))) throw partialInitializationError();
+  if (await exists(project)) throw new OverdriveError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
   await run(['git', 'check-ref-format', '--branch', branch], { cwd: root });
   return await withWorkspaceLock(root, 'initialize', async () => {
-    if (await exists(project)) throw new TheaterError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
+    if (await exists(project)) throw new OverdriveError(`Managed project path is occupied: ${project}`, 'PROJECT_PATH_OCCUPIED');
     await fs.mkdir(project);
     await atomicWrite(root, contained(project, 'README.md'), `# ${name}\n\n${brief}\n`);
     await atomicWrite(root, contained(project, 'AGENTS.md'), `# Project instructions\n\nThis is the canonical source repository for ${name}. Implement only the currently selected OVERDRIVE specification, preserve unrelated work, and report exact checks and revisions. Do not add orchestration state to application commits.\n`);
@@ -636,7 +636,7 @@ export async function initializeManagedProject({ workspace_path, project_name, d
     await run(['git', 'add', '--', 'README.md', 'AGENTS.md'], { cwd: project });
     await run([
       'git',
-      '-c', `core.hooksPath=${contained(root, '.theater', 'disabled-hooks')}`,
+      '-c', `core.hooksPath=${contained(root, STATE_DIR, 'disabled-hooks')}`,
       '-c', 'commit.gpgSign=false',
       '-c', 'user.name=OVERDRIVE',
       '-c', 'user.email=overdrive@local.invalid',
@@ -700,13 +700,13 @@ export async function doctorWorkspace({ workspace_path }) {
   if (cli) {
     try {
       const command = cli.executable();
-      if (!command) throw new TheaterError(`${cli.name} CLI not found.`, 'CLI_NOT_FOUND');
+      if (!command) throw new OverdriveError(`${cli.name} CLI not found.`, 'CLI_NOT_FOUND');
       checks.push({ name: cli.name, ok: true, detail: `${await version(command)} (${command})` });
     } catch (error) {
       checks.push({ name: cli.name, ok: false, detail: `${error.message.replace(/\.?$/, '.')} Install it or set ${cli.override}.` });
     }
   }
-  // An unreadable theater.json was already reported; the database and cache are still inspected
+  // An unreadable overdrive.json was already reported; the database and cache are still inspected
   // independently so one damaged part does not hide the health of the others.
   let ctx = null;
   if (config) {
@@ -762,18 +762,18 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
   const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
   const baseSlug = base_feature === undefined ? null : safeSlug(base_feature, 'base feature');
   if (baseSlug && (typeof base_revision !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(base_revision))) {
-    throw new TheaterError('base_feature requires an explicitly selected full commit ID in base_revision.', 'INVALID_REVISION');
+    throw new OverdriveError('base_feature requires an explicitly selected full commit ID in base_revision.', 'INVALID_REVISION');
   }
-  if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new TheaterError('priority must be an integer from -100 to 100.', 'INVALID_INPUT');
+  if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new OverdriveError('priority must be an integer from -100 to 100.', 'INVALID_INPUT');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
-      if (ctx.db.prepare('SELECT 1 FROM features WHERE slug = ?').get(slug)) throw new TheaterError(`Feature already exists: ${slug}`, 'FEATURE_EXISTS');
+      if (ctx.db.prepare('SELECT 1 FROM features WHERE slug = ?').get(slug)) throw new OverdriveError(`Feature already exists: ${slug}`, 'FEATURE_EXISTS');
       const baseSource = baseSlug ? featureBySlug(ctx.db, baseSlug) : null;
       const baseRepository = baseSource ? await ensureManagedPath(root, baseSource.checkout_path) : mirrorPath(root);
       const selectedBase = baseSource ? await verifyCheckoutRevision(baseRepository, base_revision) : null;
       if (selectedBase && selectedBase.toLowerCase() !== base_revision.toLowerCase()) {
-        throw new TheaterError('base_revision must identify the exact source commit, not a hexadecimal ref name.', 'INVALID_REVISION');
+        throw new OverdriveError('base_revision must identify the exact source commit, not a hexadecimal ref name.', 'INVALID_REVISION');
       }
       // An exact sibling commit needs the cache only as a clone seed, so canonical source may be unavailable;
       // its default HEAD is reported as cached rather than refreshed.
@@ -819,22 +819,22 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       });
       const row = featureBySlug(ctx.db, slug);
       const specBody = initialSpec || `# ${cleanTitle}\n\n## Outcome\n\n${cleanOutcome}\n\n## User-visible behavior\n\n## Constraints and compatibility\n\n## Acceptance criteria\n\n## Out of scope\n\n## Open decisions\n`;
-      await atomicWrite(root, contained(root, '.theater', 'features', slug, 'spec.md'), `${specBody.trim()}\n`);
+      await atomicWrite(root, contained(root, STATE_DIR, 'features', slug, 'spec.md'), `${specBody.trim()}\n`);
       await writeFeatureAgentFile(ctx, row);
       const { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } = clone.commitIdentity;
       await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination, baseFeature: baseSlug, baseRevision: base, commitIdentity: { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
-      await writeJson(root, contained(root, 'theater.json'), ctx.config);
+      await writeJson(root, contained(root, CONFIG_FILE), ctx.config);
       return {
         feature: summarizeFeature(ctx, row),
         baseFeature: baseSlug,
         repositoryProfile: profile,
         canonicalSource: { status: canonicalSource, defaultRevision: refreshed.defaultRevision, defaultBranch: refreshed.defaultBranch },
         commitIdentity: clone.commitIdentity,
-        contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
-        specPath: contained(root, '.theater', 'features', slug, 'spec.md'),
-        next: `${initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call theater_spec_update.'}${clone.commitIdentity.automation ? ' Disclose that this lane commits as the OVERDRIVE automation identity and show the optional lane-local override from commitIdentity.override; work and commits need not wait for an answer.' : clone.commitIdentity.overridden ? ' Disclose that inherited Git identity overrides decide this lane\'s author and committer (see commitIdentity).' : ''}`,
+        contextPath: contained(root, STATE_DIR, 'features', slug, 'context.md'),
+        specPath: contained(root, STATE_DIR, 'features', slug, 'spec.md'),
+        next: `${initialSpec ? 'Review the saved spec and plan work items.' : 'Develop the spec with the user, then call spec_update.'}${clone.commitIdentity.automation ? ' Disclose that this lane commits as the OVERDRIVE automation identity and show the optional lane-local override from commitIdentity.override; work and commits need not wait for an answer.' : clone.commitIdentity.overridden ? ' Disclose that inherited Git identity overrides decide this lane\'s author and committer (see commitIdentity).' : ''}`,
       };
     } finally { ctx.db.close(); }
   });
@@ -895,7 +895,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
     const timeline = timelineRows(ctx.db, row.id, timeline_limit);
     return {
       feature: summarizeFeature(ctx, featureBySlug(ctx.db, row.slug)),
-      specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, '.theater', 'features', row.slug, 'spec.md'), 'utf8') },
+      specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), 'utf8') },
       workItems: projection.work,
       checkpoint: projection.checkpoint,
       evidence: projection.evidence,
@@ -906,7 +906,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       commitIdentity: projection.commitIdentity,
       checkoutCaveat: projection.checkoutCaveat,
       timeline,
-      contextPath: contained(ctx.root, '.theater', 'features', row.slug, 'context.md'),
+      contextPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md'),
     };
   });
 }
@@ -934,18 +934,18 @@ export async function updateSpec({ workspace_path, feature, content, rationale =
         bumpSemanticGeneration(ctx.db, row.id);
       });
       const diff = lineDiff(previous, cleanContent);
-      await atomicWrite(root, contained(root, '.theater', 'features', slug, 'spec.md'), `${cleanContent}\n`);
+      await atomicWrite(root, contained(root, STATE_DIR, 'features', slug, 'spec.md'), `${cleanContent}\n`);
       await addEvent(ctx, { featureId: row.id, kind: 'spec.revised', summary: `Saved spec revision ${revision} (+${diff.added}/-${diff.removed} logical lines).`, details: { revision, rationale: cleanRationale } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
       await writeIndex(ctx);
-      return { changed: true, revision, diff, specPath: contained(root, '.theater', 'features', slug, 'spec.md'), next: 'Update the durable work graph to reflect this revision.' };
+      return { changed: true, revision, diff, specPath: contained(root, STATE_DIR, 'features', slug, 'spec.md'), next: 'Update the durable work graph to reflect this revision.' };
     } finally { ctx.db.close(); }
   });
 }
 
 function workKey(value, name = 'work item key') {
   const key = requiredText(value, name, { max: 63 });
-  if (!/^[A-Za-z][A-Za-z0-9._-]{0,62}$/.test(key)) throw new TheaterError(`${name} has an invalid format.`, 'INVALID_WORK_KEY');
+  if (!/^[A-Za-z][A-Za-z0-9._-]{0,62}$/.test(key)) throw new OverdriveError(`${name} has an invalid format.`, 'INVALID_WORK_KEY');
   return key;
 }
 
@@ -955,11 +955,11 @@ function validateWorkGraph(db, featureId) {
   const visiting = new Set();
   const visited = new Set();
   function visit(key, chain = []) {
-    if (visiting.has(key)) throw new TheaterError(`Work graph cycle: ${[...chain, key].join(' -> ')}`, 'WORK_GRAPH_CYCLE');
+    if (visiting.has(key)) throw new OverdriveError(`Work graph cycle: ${[...chain, key].join(' -> ')}`, 'WORK_GRAPH_CYCLE');
     if (visited.has(key)) return;
     visiting.add(key);
     for (const dependency of graph.get(key) ?? []) {
-      if (!graph.has(dependency)) throw new TheaterError(`Unknown dependency ${dependency} for ${key}.`, 'UNKNOWN_DEPENDENCY');
+      if (!graph.has(dependency)) throw new OverdriveError(`Unknown dependency ${dependency} for ${key}.`, 'UNKNOWN_DEPENDENCY');
       visit(dependency, [...chain, key]);
     }
     visiting.delete(key);
@@ -1007,16 +1007,16 @@ function refreshWorkAction(db, featureId, previousItems) {
 }
 
 export async function planWork({ workspace_path, feature, items }) {
-  if (!Array.isArray(items) || !items.length || items.length > 200) throw new TheaterError('items must contain 1 to 200 work items.', 'INVALID_INPUT');
+  if (!Array.isArray(items) || !items.length || items.length > 200) throw new OverdriveError('items must contain 1 to 200 work items.', 'INVALID_INPUT');
   const normalized = items.map((item, index) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new TheaterError(`items[${index}] must be an object.`, 'INVALID_INPUT');
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new OverdriveError(`items[${index}] must be an object.`, 'INVALID_INPUT');
     const key = workKey(item.key, `items[${index}].key`);
     const kind = item.kind || 'build';
-    if (!WORK_KINDS.has(kind)) throw new TheaterError(`Unknown work kind: ${kind}`, 'INVALID_INPUT');
+    if (!WORK_KINDS.has(kind)) throw new OverdriveError(`Unknown work kind: ${kind}`, 'INVALID_INPUT');
     const priority = item.priority ?? 0;
-    if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new TheaterError(`Invalid priority for ${key}.`, 'INVALID_INPUT');
+    if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new OverdriveError(`Invalid priority for ${key}.`, 'INVALID_INPUT');
     const dependencies = item.dependencies ?? [];
-    if (!Array.isArray(dependencies) || dependencies.length > 100) throw new TheaterError(`Invalid dependencies for ${key}.`, 'INVALID_INPUT');
+    if (!Array.isArray(dependencies) || dependencies.length > 100) throw new OverdriveError(`Invalid dependencies for ${key}.`, 'INVALID_INPUT');
     return {
       key,
       title: requiredText(item.title, `${key}.title`, { max: 500 }),
@@ -1027,7 +1027,7 @@ export async function planWork({ workspace_path, feature, items }) {
       dependencies: [...new Set(dependencies.map(dep => workKey(dep, `${key}.dependency`)))],
     };
   });
-  if (new Set(normalized.map(item => item.key)).size !== normalized.length) throw new TheaterError('Work item keys must be unique in one plan call.', 'INVALID_INPUT');
+  if (new Set(normalized.map(item => item.key)).size !== normalized.length) throw new OverdriveError('Work item keys must be unique in one plan call.', 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'features', async () => {
@@ -1056,7 +1056,7 @@ export async function planWork({ workspace_path, feature, items }) {
               || found.acceptance !== item.acceptance
               || JSON.stringify([...found.dependencies].sort()) !== JSON.stringify([...item.dependencies].sort());
             if (['running', 'review', 'done', 'cancelled'].includes(found.status)) {
-              if (definitionChanged) throw new TheaterError(`${found.status} item ${item.key} is immutable; add a new repair or follow-up item.`, 'INVALID_TRANSITION');
+              if (definitionChanged) throw new OverdriveError(`${found.status} item ${item.key} is immutable; add a new repair or follow-up item.`, 'INVALID_TRANSITION');
               immutable.add(item.key);
               continue;
             }
@@ -1077,7 +1077,7 @@ export async function planWork({ workspace_path, feature, items }) {
           ctx.db.prepare('DELETE FROM work_dependencies WHERE work_item_id = ?').run(id);
           for (const dependency of item.dependencies) {
             const target = byKey.get(dependency) ?? ctx.db.prepare('SELECT id FROM work_items WHERE feature_id = ? AND item_key = ?').get(row.id, dependency);
-            if (!target) throw new TheaterError(`Unknown dependency ${dependency} for ${item.key}.`, 'UNKNOWN_DEPENDENCY');
+            if (!target) throw new OverdriveError(`Unknown dependency ${dependency} for ${item.key}.`, 'UNKNOWN_DEPENDENCY');
             ctx.db.prepare('INSERT INTO work_dependencies(work_item_id, depends_on_id) VALUES (?, ?)').run(id, target.id);
           }
         }
@@ -1108,11 +1108,11 @@ export async function planWork({ workspace_path, feature, items }) {
       await writeIndex(ctx);
       const submittedKeys = new Set(normalized.map(item => item.key));
       const next = archived
-        ? `${slug} is archived; reactivate it with theater_feature_status before claiming or dispatching its work.`
+        ? `${slug} is archived; reactivate it with feature_status before claiming or dispatching its work.`
         : paused
           // A paused lane still derives its post-resume direction, but dispatches nothing yet.
-          ? `${slug} is paused; resume it with theater_feature_status (status active) before claiming or dispatching its work.`
-          : 'Claim the selected ready work with theater_work_update, then dispatch its key and outcome to the feature agent.';
+          ? `${slug} is paused; resume it with feature_status (status active) before claiming or dispatching its work.`
+          : 'Claim the selected ready work with work_update, then dispatch its key and outcome to the feature agent.';
       return { feature: summarizeFeature(ctx, current), workItems: workItems(ctx.db, row.id).filter(item => submittedKeys.has(item.item_key)), next };
     } finally { ctx.db.close(); }
   });
@@ -1130,8 +1130,8 @@ const ALLOWED_WORK_TRANSITIONS = {
 };
 
 export async function updateWork({ workspace_path, feature, key, status, owner, summary, blocker, result_revision, lease_seconds = 3600 }) {
-  if (!WORK_STATUSES.has(status)) throw new TheaterError(`Unknown work status: ${status}`, 'INVALID_INPUT');
-  if (!Number.isInteger(lease_seconds) || lease_seconds < 60 || lease_seconds > 86_400) throw new TheaterError('lease_seconds must be from 60 to 86400.', 'INVALID_INPUT');
+  if (!WORK_STATUSES.has(status)) throw new OverdriveError(`Unknown work status: ${status}`, 'INVALID_INPUT');
+  if (!Number.isInteger(lease_seconds) || lease_seconds < 60 || lease_seconds > 86_400) throw new OverdriveError('lease_seconds must be from 60 to 86400.', 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   const itemKey = workKey(key);
@@ -1141,29 +1141,29 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
       const row = featureBySlug(ctx.db, slug);
       const featureWork = workItems(ctx.db, row.id);
       const item = featureWork.find(candidate => candidate.item_key === itemKey);
-      if (!item) throw new TheaterError(`Unknown work item: ${itemKey}`, 'WORK_ITEM_NOT_FOUND');
-      if (!ALLOWED_WORK_TRANSITIONS[item.status]?.has(status)) throw new TheaterError(`Invalid work transition: ${item.status} -> ${status}`, 'INVALID_TRANSITION');
+      if (!item) throw new OverdriveError(`Unknown work item: ${itemKey}`, 'WORK_ITEM_NOT_FOUND');
+      if (!ALLOWED_WORK_TRANSITIONS[item.status]?.has(status)) throw new OverdriveError(`Invalid work transition: ${item.status} -> ${status}`, 'INVALID_TRANSITION');
       const cleanOwner = optionalText(owner, 'owner', { max: 200 });
       // An owner renewing running work keeps whichever saved text it omits; blank text still clears it.
       const renewing = item.status === 'running' && status === 'running' && item.owner === cleanOwner;
       const cleanSummary = renewing && summary === undefined ? item.result_summary : optionalText(summary, 'summary', { max: 50_000 }) || '';
       const cleanBlocker = renewing && blocker === undefined ? item.blocker : optionalText(blocker, 'blocker', { max: 20_000 }) || '';
-      if (status === 'running' && !cleanOwner) throw new TheaterError('Running work requires an owner.', 'INVALID_INPUT');
+      if (status === 'running' && !cleanOwner) throw new OverdriveError('Running work requires an owner.', 'INVALID_INPUT');
       // An inactive lane gains no new running claim; while paused its current owner may still renew.
       if (status === 'running' && (['done', 'archived'].includes(row.status) || (row.status === 'paused' && !renewing))) {
-        throw new TheaterError(`Feature ${slug} is ${row.status}; ${row.status === 'paused' ? 'resume' : 'reactivate'} it with theater_feature_status before claiming running work.`, 'INVALID_TRANSITION');
+        throw new OverdriveError(`Feature ${slug} is ${row.status}; ${row.status === 'paused' ? 'resume' : 'reactivate'} it with feature_status before claiming running work.`, 'INVALID_TRANSITION');
       }
-      if (status === 'done' && !cleanSummary) throw new TheaterError('Completed work requires a result summary.', 'INVALID_INPUT');
-      if (['blocked', 'failed'].includes(status) && !cleanBlocker) throw new TheaterError(`${status} work requires a blocker or failure description.`, 'INVALID_INPUT');
+      if (status === 'done' && !cleanSummary) throw new OverdriveError('Completed work requires a result summary.', 'INVALID_INPUT');
+      if (['blocked', 'failed'].includes(status) && !cleanBlocker) throw new OverdriveError(`${status} work requires a blocker or failure description.`, 'INVALID_INPUT');
       if (status === 'running') {
         const statuses = new Map(featureWork.map(candidate => [candidate.item_key, candidate.status]));
         const waitingOn = item.dependencies.filter(dependency => statuses.get(dependency) !== 'done');
-        if (waitingOn.length) throw new TheaterError(`${itemKey} is waiting on: ${waitingOn.join(', ')}.`, 'DEPENDENCY_NOT_READY');
+        if (waitingOn.length) throw new OverdriveError(`${itemKey} is waiting on: ${waitingOn.join(', ')}.`, 'DEPENDENCY_NOT_READY');
       }
       let revision = optionalText(result_revision, 'result_revision', { max: 200 });
       if (revision) revision = await verifyCheckoutRevision(row.checkout_path, revision);
       if (item.status === 'running' && item.owner && item.owner !== cleanOwner && item.lease_expires_at && item.lease_expires_at > now()) {
-        throw new TheaterError(`${itemKey} is leased to ${item.owner} until ${item.lease_expires_at}. To renew or change this claimed work as its owner, pass owner "${item.owner}".`, 'WORK_LEASED');
+        throw new OverdriveError(`${itemKey} is leased to ${item.owner} until ${item.lease_expires_at}. To renew or change this claimed work as its owner, pass owner "${item.owner}".`, 'WORK_LEASED');
       }
       const lease = status === 'running' ? new Date(Date.now() + lease_seconds * 1000).toISOString() : null;
       const clearResultRevision = ['planned', 'ready', 'running'].includes(status);
@@ -1195,7 +1195,7 @@ export async function updateWork({ workspace_path, feature, key, status, owner, 
 
 function cleanStringArray(value, name, max = 100) {
   if (value === undefined || value === null) return [];
-  if (!Array.isArray(value) || value.length > max) throw new TheaterError(`${name} must be an array with at most ${max} entries.`, 'INVALID_INPUT');
+  if (!Array.isArray(value) || value.length > max) throw new OverdriveError(`${name} must be an array with at most ${max} entries.`, 'INVALID_INPUT');
   return value.map((entry, index) => requiredText(entry, `${name}[${index}]`, { max: 20_000 }));
 }
 
@@ -1217,7 +1217,7 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
       const fingerprint = await checkoutFingerprint(row.checkout_path);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       if (fingerprint.head && fingerprint.head.oid !== snapshot.head) {
-        throw new TheaterError(`${slug}'s HEAD moved while it was being checkpointed; checkpoint again once it settles.`, 'CHECKPOINT_CONFLICT', { feature: slug, reason: 'checkout_moved', fingerprintHead: fingerprint.head.oid, snapshotHead: snapshot.head });
+        throw new OverdriveError(`${slug}'s HEAD moved while it was being checkpointed; checkpoint again once it settles.`, 'CHECKPOINT_CONFLICT', { feature: slug, reason: 'checkout_moved', fingerprintHead: fingerprint.head.oid, snapshotHead: snapshot.head });
       }
       const complete = fingerprintComplete(fingerprint);
       const stamp = now();
@@ -1225,7 +1225,7 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
       transaction(ctx.db, () => {
         const current = Number(ctx.db.prepare('SELECT semantic_generation FROM features WHERE id = ?').get(row.id).semantic_generation);
         if (current !== semanticGeneration) {
-          throw new TheaterError(`${slug} changed while it was being checkpointed; review its current state and checkpoint again.`, 'CHECKPOINT_CONFLICT', { feature: slug, observedGeneration: semanticGeneration, currentGeneration: current });
+          throw new OverdriveError(`${slug} changed while it was being checkpointed; review its current state and checkpoint again.`, 'CHECKPOINT_CONFLICT', { feature: slug, observedGeneration: semanticGeneration, currentGeneration: current });
         }
         ctx.db.prepare('INSERT INTO checkpoints(id, feature_id, head_revision, dirty_summary, summary, next_action, unresolved_json, semantic_generation, checkout_fingerprint_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
           .run(id, row.id, snapshot.head, snapshot.clean ? 'clean' : `${snapshot.changedFileCount} changed path(s)`, cleanSummary, next, JSON.stringify(openQuestions), semanticGeneration, JSON.stringify(fingerprint), stamp);
@@ -1248,12 +1248,12 @@ export async function checkpointFeature({ workspace_path, feature, summary, next
 export async function switchFeature({ workspace_path, feature, accept_unverified_checkout = false }) {
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
-  if (typeof accept_unverified_checkout !== 'boolean') throw new TheaterError('accept_unverified_checkout must be a boolean.', 'INVALID_INPUT');
+  if (typeof accept_unverified_checkout !== 'boolean') throw new OverdriveError('accept_unverified_checkout must be a boolean.', 'INVALID_INPUT');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const destination = featureBySlug(ctx.db, slug);
-      if (destination.status === 'archived') throw new TheaterError('Archived features cannot become the active focus.', 'INVALID_TRANSITION');
+      if (destination.status === 'archived') throw new OverdriveError('Archived features cannot become the active focus.', 'INVALID_TRANSITION');
       const outgoingSlug = meta(ctx.db, 'focus') || null;
       if (outgoingSlug === slug) {
         const packet = await writeFeatureContext(ctx, destination);
@@ -1291,7 +1291,7 @@ export async function switchFeature({ workspace_path, feature, accept_unverified
         from: outgoing ? summarizeFeature(ctx, featureBySlug(ctx.db, outgoing.slug)) : null,
         focus: slug,
         feature: summarizeFeature(ctx, current),
-        contextPath: contained(root, '.theater', 'features', slug, 'context.md'),
+        contextPath: contained(root, STATE_DIR, 'features', slug, 'context.md'),
         git: packet.snapshot,
         checkoutFreshness,
         compactFeatureThreadId: outgoing?.thread_id ?? null,
@@ -1306,16 +1306,16 @@ export async function switchFeature({ workspace_path, feature, accept_unverified
 
 // Validates a lifecycle transition before anything acts on it, such as stopping a worker.
 export function featureStatusInput({ status, blocker, disposition }) {
-  if (!FEATURE_STATUSES.has(status)) throw new TheaterError(`Unknown feature status: ${status}`, 'INVALID_INPUT');
+  if (!FEATURE_STATUSES.has(status)) throw new OverdriveError(`Unknown feature status: ${status}`, 'INVALID_INPUT');
   const cleanBlocker = optionalText(blocker, 'blocker', { max: 20_000 }) || '';
   const cleanDisposition = optionalText(disposition, 'disposition', { max: 20_000 }) || '';
-  if (status === 'blocked' && !cleanBlocker) throw new TheaterError('A blocked feature requires a blocker.', 'INVALID_INPUT');
-  if (status === 'archived' && !cleanDisposition) throw new TheaterError('Archiving requires a disposition.', 'INVALID_INPUT');
+  if (status === 'blocked' && !cleanBlocker) throw new OverdriveError('A blocked feature requires a blocker.', 'INVALID_INPUT');
+  if (status === 'archived' && !cleanDisposition) throw new OverdriveError('Archiving requires a disposition.', 'INVALID_INPUT');
   return { cleanBlocker, cleanDisposition };
 }
 
 export async function setFeatureStatus(args) {
-  if (!FEATURE_STATUSES.has(args.status)) throw new TheaterError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
+  if (!FEATURE_STATUSES.has(args.status)) throw new OverdriveError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
   const root = await resolveWorkspace(args.workspace_path);
   const slug = safeSlug(args.feature);
   return await withCheckoutLock(root, slug, () => applyFeatureStatus(root, slug, args));
@@ -1325,7 +1325,7 @@ export async function setFeatureStatus(args) {
 // control lock and has stopped its worker. The write itself refuses a lane whose worker may still
 // be live, so the new status can never claim a stop that did not happen.
 export async function setStoppedFeatureStatus(args) {
-  if (!FEATURE_STATUSES.has(args.status)) throw new TheaterError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
+  if (!FEATURE_STATUSES.has(args.status)) throw new OverdriveError(`Unknown feature status: ${args.status}`, 'INVALID_INPUT');
   const root = await resolveWorkspace(args.workspace_path);
   const slug = safeSlug(args.feature);
   return await withWorkspaceLock(root, 'features', () => applyFeatureStatus(root, slug, args, { requireStopped: true }));
@@ -1343,11 +1343,11 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
       assertAgentIdle(row);
       assertWorkersStopped(ctx.db, row);
       const progress = progressFor(ctx.db, row.id);
-      if (progress.open > 0) throw new TheaterError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
+      if (progress.open > 0) throw new OverdriveError(`Feature still has ${progress.open} open work item(s).`, 'COMPLETION_NOT_PROVEN');
       completionCandidate = ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status IN ('ready','accepted') ORDER BY rowid DESC LIMIT 1").get(row.id);
-      if (!completionCandidate) throw new TheaterError('Feature completion requires a ready integration candidate.', 'COMPLETION_NOT_PROVEN');
+      if (!completionCandidate) throw new OverdriveError('Feature completion requires a ready integration candidate.', 'COMPLETION_NOT_PROVEN');
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-      if (!snapshot.clean || snapshot.head !== completionCandidate.revision) throw new TheaterError('The ready candidate must still be the clean checkout HEAD.', 'STALE_CANDIDATE');
+      if (!snapshot.clean || snapshot.head !== completionCandidate.revision) throw new OverdriveError('The ready candidate must still be the clean checkout HEAD.', 'STALE_CANDIDATE');
       assertVerified(ctx, row, completionCandidate.revision, completionCandidate);
       if (row.status === status) return { feature: summarizeFeature(ctx, row), unchanged: true };
     }
@@ -1379,7 +1379,7 @@ async function applyFeatureStatus(root, slug, args, { requireStopped = false } =
         assertAgentIdle(current);
         assertWorkersStopped(ctx.db, current);
       }
-      if (!changed.changes) throw new TheaterError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
+      if (!changed.changes) throw new OverdriveError(`The ${slug} worker may still be running, so the lane was not marked ${status}.`, 'STOP_UNCONFIRMED');
       if (completionCandidate) ctx.db.prepare("UPDATE candidates SET status = 'accepted' WHERE id = ?").run(completionCandidate.id);
       const saved = ctx.db.prepare('SELECT status, blocker, summary, next_action FROM features WHERE id = ?').get(row.id);
       if (completionCandidate || Object.keys(saved).some(field => saved[field] !== previous[field])) bumpSemanticGeneration(ctx.db, row.id);
@@ -1404,7 +1404,7 @@ export async function recordEvidence({ workspace_path, feature, work_item, kind,
   const slug = safeSlug(feature);
   const evidenceKind = requiredText(kind, 'kind', { max: 100 });
   const cleanSummary = requiredText(summary, 'summary', { max: 50_000 });
-  if (passed !== undefined && typeof passed !== 'boolean') throw new TheaterError('passed must be true or false.', 'INVALID_INPUT');
+  if (passed !== undefined && typeof passed !== 'boolean') throw new OverdriveError('passed must be true or false.', 'INVALID_INPUT');
   return await withWorkspaceLock(root, 'features', async () => {
     const ctx = await loadWorkspace(root);
     try {
@@ -1412,7 +1412,7 @@ export async function recordEvidence({ workspace_path, feature, work_item, kind,
       let work = null;
       if (work_item) {
         work = ctx.db.prepare('SELECT * FROM work_items WHERE feature_id = ? AND item_key = ?').get(row.id, workKey(work_item));
-        if (!work) throw new TheaterError(`Unknown work item: ${work_item}`, 'WORK_ITEM_NOT_FOUND');
+        if (!work) throw new OverdriveError(`Unknown work item: ${work_item}`, 'WORK_ITEM_NOT_FOUND');
       }
       let resolved = optionalText(revision, 'revision', { max: 200 });
       if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
@@ -1439,15 +1439,15 @@ export async function recordCandidate({ workspace_path, feature, revision = 'HEA
     try {
       const row = featureBySlug(ctx.db, slug);
       // Recording moves the lane to review, so an archived lane must be reactivated explicitly first.
-      if (row.status === 'archived') throw new TheaterError(`Feature ${slug} is archived; reactivate it with theater_feature_status before recording a candidate.`, 'INVALID_TRANSITION');
+      if (row.status === 'archived') throw new OverdriveError(`Feature ${slug} is archived; reactivate it with feature_status before recording a candidate.`, 'INVALID_TRANSITION');
       // Likewise a paused lane stays paused until it is explicitly resumed.
-      if (row.status === 'paused') throw new TheaterError(`Feature ${slug} is paused; resume it with theater_feature_status before recording a candidate.`, 'INVALID_TRANSITION');
+      if (row.status === 'paused') throw new OverdriveError(`Feature ${slug} is paused; resume it with feature_status before recording a candidate.`, 'INVALID_TRANSITION');
       assertAgentIdle(row);
       assertWorkersStopped(ctx.db, row);
       const resolved = await verifyCheckoutRevision(row.checkout_path, revision);
       const snapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
-      if (snapshot.head !== resolved) throw new TheaterError(`Candidate ${resolved.slice(0, 12)} is not the checkout HEAD ${snapshot.head.slice(0, 12)}.`, 'STALE_CANDIDATE');
-      if (allow_dirty || !snapshot.clean) throw new TheaterError('Candidates require a clean committed checkout.', 'DIRTY_CANDIDATE');
+      if (snapshot.head !== resolved) throw new OverdriveError(`Candidate ${resolved.slice(0, 12)} is not the checkout HEAD ${snapshot.head.slice(0, 12)}.`, 'STALE_CANDIDATE');
+      if (allow_dirty || !snapshot.clean) throw new OverdriveError('Candidates require a clean committed checkout.', 'DIRTY_CANDIDATE');
       const verification = assertVerified(ctx, row, resolved);
       const derived = receiptChecks(verification);
       const executed = derived.map(check => check.text);
@@ -1498,44 +1498,44 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
     try {
       const managed = ctx.config.managedProject;
       if (!managed) {
-        throw new TheaterError('Candidate promotion is built in only for projects created by OVERDRIVE. Use the repository\'s normal review and integration flow for an adopted repository.', 'NOT_MANAGED_PROJECT');
+        throw new OverdriveError('Candidate promotion is built in only for projects created by OVERDRIVE. Use the repository\'s normal review and integration flow for an adopted repository.', 'NOT_MANAGED_PROJECT');
       }
       const project = await ensureManagedPath(root, contained(root, 'project'));
-      if (path.resolve(managed.path) !== project) throw new TheaterError('Managed project path does not match this workspace.', 'INVALID_STATE');
+      if (path.resolve(managed.path) !== project) throw new OverdriveError('Managed project path does not match this workspace.', 'INVALID_STATE');
       const row = featureBySlug(ctx.db, slug);
-      if (row.status !== 'done') throw new TheaterError('Complete the feature evidence and candidate gates before promotion.', 'PROMOTION_NOT_READY');
+      if (row.status !== 'done') throw new OverdriveError('Complete the feature evidence and candidate gates before promotion.', 'PROMOTION_NOT_READY');
       assertAgentIdle(row);
       let resolved = optionalText(revision, 'revision', { max: 200 });
       if (resolved) resolved = await verifyCheckoutRevision(row.checkout_path, resolved);
       const candidate = resolved
         ? ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND revision = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id, resolved)
         : ctx.db.prepare("SELECT * FROM candidates WHERE feature_id = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(row.id);
-      if (!candidate) throw new TheaterError('No accepted candidate matches this promotion request.', 'PROMOTION_NOT_READY');
+      if (!candidate) throw new OverdriveError('No accepted candidate matches this promotion request.', 'PROMOTION_NOT_READY');
       assertVerified(ctx, row, candidate.revision, candidate);
       const featureSnapshot = await repositorySnapshot(row.checkout_path, row.base_revision);
       if (!featureSnapshot.clean || featureSnapshot.head !== candidate.revision) {
-        throw new TheaterError('The accepted candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
+        throw new OverdriveError('The accepted candidate must still be the clean feature checkout HEAD.', 'STALE_CANDIDATE');
       }
       const projectSnapshot = await repositorySnapshot(project);
-      if (!projectSnapshot.clean) throw new TheaterError('The managed project has uncommitted changes; preserve or resolve them before promotion.', 'DIRTY_MANAGED_PROJECT');
+      if (!projectSnapshot.clean) throw new OverdriveError('The managed project has uncommitted changes; preserve or resolve them before promotion.', 'DIRTY_MANAGED_PROJECT');
       if (projectSnapshot.branch !== managed.defaultBranch) {
-        throw new TheaterError(`Managed project must be on ${managed.defaultBranch}, not ${projectSnapshot.branch || 'a detached HEAD'}.`, 'WRONG_MANAGED_BRANCH');
+        throw new OverdriveError(`Managed project must be on ${managed.defaultBranch}, not ${projectSnapshot.branch || 'a detached HEAD'}.`, 'WRONG_MANAGED_BRANCH');
       }
-      const candidateRef = `refs/feature-theater/candidates/${slug}/${candidate.revision}`;
+      const candidateRef = `refs/overdrive/candidates/${slug}/${candidate.revision}`;
       await run(['git', 'fetch', '--no-tags', row.checkout_path, `${candidate.revision}:${candidateRef}`], { cwd: project });
       const fetched = await verifyCheckoutRevision(project, candidateRef);
-      if (fetched !== candidate.revision) throw new TheaterError('Fetched candidate revision does not match the accepted candidate.', 'STALE_CANDIDATE');
+      if (fetched !== candidate.revision) throw new OverdriveError('Fetched candidate revision does not match the accepted candidate.', 'STALE_CANDIDATE');
       const alreadyIncluded = await isGitAncestor(project, candidate.revision, projectSnapshot.head);
       if (!alreadyIncluded) {
         const canFastForward = await isGitAncestor(project, projectSnapshot.head, candidate.revision);
         if (!canFastForward) {
-          throw new TheaterError('The managed project and candidate have diverged. Rebase or repair the feature lane; OVERDRIVE will not synthesize or resolve a merge silently.', 'PROMOTION_NOT_FAST_FORWARD');
+          throw new OverdriveError('The managed project and candidate have diverged. Rebase or repair the feature lane; OVERDRIVE will not synthesize or resolve a merge silently.', 'PROMOTION_NOT_FAST_FORWARD');
         }
-        await run(['git', '-c', `core.hooksPath=${contained(root, '.theater', 'disabled-hooks')}`, 'merge', '--ff-only', candidateRef], { cwd: project });
+        await run(['git', '-c', `core.hooksPath=${contained(root, STATE_DIR, 'disabled-hooks')}`, 'merge', '--ff-only', candidateRef], { cwd: project });
       }
       const promotedSnapshot = await repositorySnapshot(project);
       if (!promotedSnapshot.clean || !await isGitAncestor(project, candidate.revision, promotedSnapshot.head)) {
-        throw new TheaterError('Managed project verification failed after promotion.', 'PROMOTION_FAILED');
+        throw new OverdriveError('Managed project verification failed after promotion.', 'PROMOTION_FAILED');
       }
       const refreshed = await refreshMirror(root);
       const profile = await profileRepository(root, refreshed.defaultRevision);
@@ -1552,7 +1552,7 @@ export async function promoteManagedCandidate({ workspace_path, feature, revisio
           bumpSemanticGeneration(ctx.db, row.id);
         }
       });
-      await writeJson(root, contained(root, 'theater.json'), ctx.config);
+      await writeJson(root, contained(root, CONFIG_FILE), ctx.config);
       if (!alreadyIncluded) {
         await addEvent(ctx, {
           featureId: row.id,
@@ -1592,14 +1592,14 @@ export async function readTimeline({ workspace_path, feature, limit = 30 }) {
 export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
-    if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new TheaterError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
+    if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new OverdriveError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
     const packet = await writeFeatureContext(ctx, row);
     await writeFeatureAgentFile(ctx, row);
     return {
       root: ctx.root,
       feature: row,
-      contextPath: contained(ctx.root, '.theater', 'features', row.slug, 'context.md'),
-      specPath: contained(ctx.root, '.theater', 'features', row.slug, 'spec.md'),
+      contextPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md'),
+      specPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'),
       agentFile: contained(ctx.root, 'features', row.slug, 'AGENTS.md'),
       work: packet.work,
       developerInstructions: featureAgentInstructions(ctx.root, row),
@@ -1611,15 +1611,15 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
 // Binds the lane to a session it just created, recording the owning harness. The replaced
 // binding is kept in the timeline so its conversation stays reachable in its own backend.
 export async function bindAgentSession({ workspace_path, feature, thread_id, harness, expected_thread_id = null, compacted = false, owner_token }) {
-  if (!HARNESSES.has(harness)) throw new TheaterError('A native session must record its owning harness.', 'SESSION_OWNER_UNKNOWN');
+  if (!HARNESSES.has(harness)) throw new OverdriveError('A native session must record its owning harness.', 'SESSION_OWNER_UNKNOWN');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
     const ctx = await loadWorkspace(root);
     try {
       const row = featureBySlug(ctx.db, slug);
-      if (!ownsAgent(ctx.db, row.id, owner_token)) throw new TheaterError('Another controller took this lane before its new session could be saved.', 'AGENT_OWNED');
-      if ((row.thread_id ?? null) !== expected_thread_id || row.active_turn_id) throw new TheaterError('The lane session changed before its replacement could be saved; inspect it and retry.', 'SESSION_CHANGED');
+      if (!ownsAgent(ctx.db, row.id, owner_token)) throw new OverdriveError('Another controller took this lane before its new session could be saved.', 'AGENT_OWNED');
+      if ((row.thread_id ?? null) !== expected_thread_id || row.active_turn_id) throw new OverdriveError('The lane session changed before its replacement could be saved; inspect it and retry.', 'SESSION_CHANGED');
       const stamp = now();
       transaction(ctx.db, () => {
         ctx.db.prepare(`UPDATE features SET thread_id = ?, thread_harness = ?, active_turn_id = NULL, agent_status = 'starting', compaction_pending = CASE WHEN ? THEN 0 ELSE compaction_pending END, updated_at = ? WHERE id = ?`)
@@ -1845,13 +1845,13 @@ export async function pendingAgentRequest({ workspace_path, feature, request_id 
   return await withContext(workspace_path, async ctx => {
     const row = featureBySlug(ctx.db, safeSlug(feature));
     const request = ctx.db.prepare("SELECT * FROM pending_agent_requests WHERE feature_id = ? AND request_id = ? AND status = 'pending'").get(row.id, String(request_id));
-    if (!request) throw new TheaterError(`No pending request ${request_id} for ${row.slug}.`, 'REQUEST_NOT_FOUND');
+    if (!request) throw new OverdriveError(`No pending request ${request_id} for ${row.slug}.`, 'REQUEST_NOT_FOUND');
     return { ...request, payload: parseJson(request.payload_json, {}) };
   });
 }
 
 export async function resolveAgentRequestRecord({ workspace_path, feature, request_id, summary, status = 'resolved', owner_token, thread_id, ignore_missing = false }) {
-  if (!['resolved', 'orphaned'].includes(status)) throw new TheaterError('Request resolution status is invalid.', 'INVALID_INPUT');
+  if (!['resolved', 'orphaned'].includes(status)) throw new OverdriveError('Request resolution status is invalid.', 'INVALID_INPUT');
   const root = await resolveWorkspace(workspace_path);
   const slug = safeSlug(feature);
   return await withWorkspaceLock(root, 'agent-state', async () => {
@@ -1861,7 +1861,7 @@ export async function resolveAgentRequestRecord({ workspace_path, feature, reque
       if (!ownsAgent(ctx.db, row.id, owner_token)) return { ignored: true };
       const result = ctx.db.prepare("UPDATE pending_agent_requests SET status = ?, resolved_at = ? WHERE feature_id = ? AND request_id = ? AND status = 'pending' AND (? IS NULL OR thread_id = ?)").run(status, now(), row.id, String(request_id), thread_id ?? null, thread_id ?? null);
       if (!result.changes && ignore_missing) return { ignored: true };
-      if (!result.changes) throw new TheaterError(`No pending request ${request_id} for ${slug}.`, 'REQUEST_NOT_FOUND');
+      if (!result.changes) throw new OverdriveError(`No pending request ${request_id} for ${slug}.`, 'REQUEST_NOT_FOUND');
       ctx.db.prepare(`UPDATE features SET agent_status = CASE
         WHEN active_turn_id IS NULL AND agent_status <> 'waiting_for_user' THEN agent_status
         WHEN EXISTS (SELECT 1 FROM pending_agent_requests WHERE feature_id = features.id AND status = 'pending') THEN 'waiting_for_user'

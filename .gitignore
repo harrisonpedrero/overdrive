@@ -4,8 +4,8 @@ node_modules/
 
 # Ready-workspace runtime state
 workspace/features/
-workspace/.theater/
-workspace/theater.json
+workspace/.overdrive/
+workspace/overdrive.json
 workspace/project/
 
 # Local test artifacts

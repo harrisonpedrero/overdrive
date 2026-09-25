@@ -66,12 +66,12 @@ const state = {
 };
 
 export const TOOLS = [
-  tool('theater_agents_wait', 'Receive the next feature handoff', 'Wait on up to eight unreconciled feature workers together. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
+  tool('agents_wait', 'Receive the next feature handoff', 'Wait on up to eight unreconciled feature workers together. Completion or input on any lane returns promptly for coordinator review; an unrelated running lane does not hold the handoff. This only drives active coordination, not host wakeups after a turn ends.', object({
     ...workspace,
     features: { type: 'array', minItems: 1, maxItems: 8, uniqueItems: true, items: string('Feature slug still awaiting reconciliation; omit already handled idle lanes.') },
     timeout_seconds: integer('Bounded wait, defaults to 30 seconds.', 1, 60),
   }, ['workspace_path', 'features']), { readOnlyHint: true, openWorldHint: true }),
-  tool('theater_checks_enqueue', 'Queue authorized verification', 'Bind reviewed configured checks to their current clean commit and full contract. One check per job; stable keys make identical enqueue requests idempotent. Dependencies stop on failure; the same clone and named shared resources serialize. The queue keeps up to 500 jobs; beyond that the oldest unreferenced passed or cancelled jobs are retired to the event log, keeping their receipts.', object({
+  tool('checks_enqueue', 'Queue authorized verification', 'Bind reviewed configured checks to their current clean commit and full contract. One check per job; stable keys make identical enqueue requests idempotent. Dependencies stop on failure; the same clone and named shared resources serialize. The queue keeps up to 500 jobs; beyond that the oldest unreferenced passed or cancelled jobs are retired to the event log, keeping their receipts.', object({
     ...workspace,
     jobs: { type: 'array', minItems: 1, maxItems: 50, items: object({
       key: string('Unique durable job key. Use a new key for a changed revision or plan.'), ...feature,
@@ -80,26 +80,26 @@ export const TOOLS = [
       resources: { type: 'array', maxItems: 20, uniqueItems: true, items: string('Shared exclusive resource key, such as port-4200 or gpu-benchmark. External commands must be coordinated separately.') },
     }, ['key', 'feature', 'check_key']) },
   }, ['workspace_path', 'jobs']), { destructiveHint: false, idempotentHint: true }),
-  tool('theater_checks_queue', 'Inspect verification queue', 'Read durable jobs, timings, receipts and blockers; reconcile a dead controller with exact completed receipts or quarantine uncertain execution. Does not execute checks.', object(workspace, ['workspace_path']), { destructiveHint: false, idempotentHint: true }),
-  tool('theater_checks_drain', 'Advance ready verification', 'Execute eligible jobs and immediately release successors. Failures stop dependents, while disjoint ready jobs continue. Returns completion and decision handoffs for prompt coordinator reconciliation; never launches feature workers or accepts candidates.', object({
+  tool('checks_queue', 'Inspect verification queue', 'Read durable jobs, timings, receipts and blockers; reconcile a dead controller with exact completed receipts or quarantine uncertain execution. Does not execute checks.', object(workspace, ['workspace_path']), { destructiveHint: false, idempotentHint: true }),
+  tool('checks_drain', 'Advance ready verification', 'Execute eligible jobs and immediately release successors. Failures stop dependents, while disjoint ready jobs continue. Returns completion and decision handoffs for prompt coordinator reconciliation; never launches feature workers or accepts candidates.', object({
     ...workspace,
     max_parallel: integer('Concurrent jobs; defaults to 2. Same-clone and shared-resource exclusion always applies.', 1, 4),
     max_checks: integer('Maximum admissions in this call; defaults to 10.', 1, 50),
     admission_seconds: integer('Stop admitting new jobs after this many seconds, default 60. Already admitted checks finish under their configured deadlines; this is not a call timeout.', 1, 300),
   }, ['workspace_path']), { destructiveHint: false, openWorldHint: true }),
-  tool('theater_checks_resolve', 'Resolve stopped verification', 'After inspecting a failure or interrupted command, explicitly retry its unchanged binding or cancel it. Changed commits/contracts require new jobs. Interrupted execution, including a direct theater_checks_run job whose command was not confirmed stopped, retains resources until command termination is established.', object({
+  tool('checks_resolve', 'Resolve stopped verification', 'After inspecting a failure or interrupted command, explicitly retry its unchanged binding or cancel it. Changed commits/contracts require new jobs. Interrupted execution, including a direct checks_run job whose command was not confirmed stopped, retains resources until command termination is established.', object({
     ...workspace, job_key: string('Queue job key.'), action: string('Resolution.', { enum: ['retry', 'cancel'] }),
     reason: string('Observed cause and resolution; for interruption, include how command and child-process termination was established.'),
     execution_stopped: boolean('Required true for interrupted jobs, only after verifying the old command and children stopped.'),
   }, ['workspace_path', 'job_key', 'action', 'reason']), { destructiveHint: false }),
-  tool('theater_view_catalog', 'Work graph pattern', 'Describe the built-in work graph. Other state is answered in normal conversation, not separate panels or controls.', object({}), { readOnlyHint: true, idempotentHint: true }),
-  tool('theater_state', 'Observe scoped feature state', 'Read a versioned, bounded data snapshot for a normal conversational reply. Only load selected sections; an overview never loads other specifications or raw logs.', object(state, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
-  tool('theater_view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
+  tool('view_catalog', 'Work graph pattern', 'Describe the built-in work graph. Other state is answered in normal conversation, not separate panels or controls.', object({}), { readOnlyHint: true, idempotentHint: true }),
+  tool('state', 'Observe scoped feature state', 'Read a versioned, bounded data snapshot for a normal conversational reply. Only load selected sections; an overview never loads other specifications or raw logs.', object(state, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('view', 'Show the work graph', 'Render one feature’s actual work dependencies and statuses as a native Mermaid diagram. No embedded chat, forms, navigation, or action buttons. Returns Markdown to include directly in the reply.', object({
     ...workspace, ...feature,
     work_items: { type: 'array', minItems: 1, maxItems: 24, uniqueItems: true, items: string('Exact work key.'), description: 'Optional focused subset for a large graph. Dependencies outside the view remain labeled. Without this, show all work when there are at most 24 items; larger graphs show 24 at a time, running, blocked, failed, review and ready work first, then their prerequisites, then the rest.' },
     page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
   }, ['workspace_path']), { destructiveHint: false }),
-  tool('theater_checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Commands execute in the submitted order, so list setup before dependent checks; reordering changes the contract. Changes invalidate earlier candidates; execute through theater_checks_run or the verification queue.', object({
+  tool('checks_update', 'Configure feature checks', 'Save the required and optional verification commands for a feature. Commands execute in the submitted order, so list setup before dependent checks; reordering changes the contract. Changes invalidate earlier candidates; execute through checks_run or the verification queue.', object({
     ...workspace, ...feature,
     checks: { type: 'array', maxItems: 50, items: object({
       key: string('Stable check key.'), purpose: string('Behavior this command verifies.'),
@@ -113,32 +113,32 @@ export const TOOLS = [
     }, ['key', 'purpose', 'argv']) },
   }, ['workspace_path', 'feature', 'checks']), { destructiveHint: false }),
 
-  tool('theater_checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature, stopping at the first failure for inspection. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract. A timed-out command whose process tree cannot be confirmed stopped fails with COMMAND_TERMINATION_UNCERTAIN and no receipt; its interrupted job then reserves the clone until theater_checks_resolve.', object({
+  tool('checks_run', 'Execute feature checks', 'Run configured commands against a clean committed idle feature, stopping at the first failure for inspection. An optional selection controls execution only; readiness still requires current passing receipts for every required check in the saved contract. A timed-out command whose process tree cannot be confirmed stopped fails with COMMAND_TERMINATION_UNCERTAIN and no receipt; its interrupted job then reserves the clone until checks_resolve.', object({
     ...workspace, ...feature,
     check_keys: { type: 'array', minItems: 1, maxItems: 50, uniqueItems: true, items: string('Exact configured check key.'), description: 'Optional nonempty selection of known checks, executed in saved order. Omit to run all. Does not edit the contract or create receipts for omitted checks.' },
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('theater_evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks, context, or state views.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
+  tool('evidence_get', 'Inspect an evidence receipt', 'Read one feature-scoped evidence record including actual command output and exit status. Use on demand; do not preload logs into the coordinator.', object({ ...workspace, ...feature, evidence_id: string('Evidence id from checks, context, or state views.') }, ['workspace_path', 'feature', 'evidence_id']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('theater_agent_wait', 'Wait for a feature result', 'Wait up to 60 seconds for a feature completion or input request and return compact progress. Use after dispatch when the coordinator is continuing the work; no repeated model polling is needed.', object({ ...workspace, ...feature, timeout_seconds: integer('Bounded wait; defaults to 30 seconds.', 1, 60) }, ['workspace_path', 'feature']), { readOnlyHint: true, openWorldHint: true }),
+  tool('agent_wait', 'Wait for a feature result', 'Wait up to 60 seconds for a feature completion or input request and return compact progress. Use after dispatch when the coordinator is continuing the work; no repeated model polling is needed.', object({ ...workspace, ...feature, timeout_seconds: integer('Bounded wait; defaults to 30 seconds.', 1, 60) }, ['workspace_path', 'feature']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('theater_initialize', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
+  tool('workspace_init', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
-    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
+    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in overdrive.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'repository']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize OVERDRIVE against it.', object({
+  tool('project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize OVERDRIVE against it.', object({
     ...workspace,
     project_name: string('Human-readable project name.'),
     description: string('Concrete product brief for the new project.'),
     default_branch: string('Initial branch name; defaults to main.'),
-    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in theater.json.', { enum: ['codex', 'claude'] }),
+    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in overdrive.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'project_name', 'description']), { destructiveHint: false, idempotentHint: true }),
 
-  tool('theater_doctor', 'Check OVERDRIVE', 'Check the local Git, Node, configured worker harness CLI (Codex or Claude Code), state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('doctor', 'Check OVERDRIVE', 'Check the local Git, Node, configured worker harness CLI (Codex or Claude Code), state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('theater_feature_create', 'Create feature lane', 'Create an independent full repository clone at an exact commit and initialize its isolated spec/context packet.', object({
+  tool('feature_create', 'Create feature lane', 'Create an independent full repository clone at an exact commit and initialize its isolated spec/context packet.', object({
     ...workspace,
     ...feature,
     title: string('Human-readable feature title.'),
@@ -149,26 +149,26 @@ export const TOOLS = [
     spec: string('Optional complete initial Markdown specification.'),
   }, ['workspace_path', 'feature', 'title', 'outcome']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('theater_feature_list', 'List feature lanes', 'Return a compact cross-feature progress view without loading every feature specification.', object({
+  tool('feature_list', 'List feature lanes', 'Return a compact cross-feature progress view without loading every feature specification.', object({
     ...workspace,
     include_archived: boolean('Include archived lanes.'),
     refresh_git: boolean('Refresh Git status for each clone; slower on many features.'),
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('theater_feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, checkpoint, safe timeline, Git facts, evidence, candidate, and pending agent requests.', object({
+  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, checkpoint, safe timeline, Git facts, evidence, candidate, and pending agent requests.', object({
     ...workspace,
     ...feature,
     timeline_limit: integer('Number of recent safe events.', 1, 200),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('theater_spec_update', 'Save feature spec revision', 'Save a complete new Markdown spec revision and report its logical line delta. Use after iterating on behavior, constraints, acceptance criteria, and scope with the user.', object({
+  tool('spec_update', 'Save feature spec revision', 'Save a complete new Markdown spec revision and report its logical line delta. Use after iterating on behavior, constraints, acceptance criteria, and scope with the user.', object({
     ...workspace,
     ...feature,
     content: string('Complete Markdown specification for the new revision.'),
     rationale: string('Concise reason this revision changed.'),
   }, ['workspace_path', 'feature', 'content']), { destructiveHint: false }),
 
-  tool('theater_work_plan', 'Reconcile feature work graph', 'Upsert bounded work items and their dependencies. Returns only submitted work items with current feature progress and next action; use theater_feature_get for all work or theater_view for the graph. Existing completed work cannot be silently reopened; represent regressions or follow-up as repair work.', object({
+  tool('work_plan', 'Reconcile feature work graph', 'Upsert bounded work items and their dependencies. Returns only submitted work items with current feature progress and next action; use feature_get for all work or view for the graph. Existing completed work cannot be silently reopened; represent regressions or follow-up as repair work.', object({
     ...workspace,
     ...feature,
     items: {
@@ -185,7 +185,7 @@ export const TOOLS = [
     },
   }, ['workspace_path', 'feature', 'items']), { destructiveHint: false }),
 
-  tool('theater_work_update', 'Update work item', 'Change one work item state, enforce ownership leases, and record result or blocker details. A paused, done or archived lane refuses new running claims; while paused, its current owner may still renew and non-running outcomes can still be recorded.', object({
+  tool('work_update', 'Update work item', 'Change one work item state, enforce ownership leases, and record result or blocker details. A paused, done or archived lane refuses new running claims; while paused, its current owner may still renew and non-running outcomes can still be recorded.', object({
     ...workspace,
     ...feature,
     key: string('Stable work item key.'),
@@ -197,7 +197,7 @@ export const TOOLS = [
     lease_seconds: integer('Running ownership lease duration.', 60, 86400),
   }, ['workspace_path', 'feature', 'key', 'status']), { destructiveHint: false }),
 
-  tool('theater_checkpoint', 'Checkpoint feature context', 'Write a compact semantic checkpoint plus exact Git facts. Call before switching features and at major milestones.', object({
+  tool('checkpoint', 'Checkpoint feature context', 'Write a compact semantic checkpoint plus exact Git facts. Call before switching features and at major milestones.', object({
     ...workspace,
     ...feature,
     summary: string('What is now true and why it matters; no private reasoning.'),
@@ -205,13 +205,13 @@ export const TOOLS = [
     unresolved: { type: 'array', items: string('Open decision, risk, or blocker.'), maxItems: 100 },
   }, ['workspace_path', 'feature', 'summary', 'next_action']), { destructiveHint: false }),
 
-  tool('theater_feature_switch', 'Switch feature focus', 'Switch coordinator focus after an outgoing checkpoint. Queues feature-session compaction, returns the destination recovery packet, and signals a high-value coordinator compaction boundary. The outgoing checkout is compared with its checkpoint fingerprint: an idle lane whose checkout changed (CHECKPOINT_REQUIRED, reason checkout_changed) or whose checkpoint has no fingerprint (checkout_unverified) must be checkpointed again; a lane with a possibly running worker switches with a checkoutFreshness caveat. The comparison is a best-effort observation, not an atomic proof.', object({
+  tool('feature_switch', 'Switch feature focus', 'Switch coordinator focus after an outgoing checkpoint. Queues feature-session compaction, returns the destination recovery packet, and signals a high-value coordinator compaction boundary. The outgoing checkout is compared with its checkpoint fingerprint: an idle lane whose checkout changed (CHECKPOINT_REQUIRED, reason checkout_changed) or whose checkpoint has no fingerprint (checkout_unverified) must be checkpointed again; a lane with a possibly running worker switches with a checkoutFreshness caveat. The comparison is a best-effort observation, not an atomic proof.', object({
     ...workspace,
     ...feature,
     accept_unverified_checkout: boolean('Switch an idle lane whose checkout comparison is indeterminate (CHECKOUT_INDETERMINATE: oversized, unreadable or unstable state) and record an explicit unverified-checkout caveat. Never overrides definite drift.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_feature_status', 'Set feature lifecycle state', 'Pause, resume, block, review, complete, or archive a lane without moving its checkout. Completion requires closed work and passing evidence. Pausing or archiving first stops the lane worker and records the status only once no turn is running; if the stop cannot be confirmed the status is unchanged and STOP_UNCONFIRMED explains what is still running. A paused lane dispatches nothing until it is made active again.', object({
+  tool('feature_status', 'Set feature lifecycle state', 'Pause, resume, block, review, complete, or archive a lane without moving its checkout. Completion requires closed work and passing evidence. Pausing or archiving first stops the lane worker and records the status only once no turn is running; if the stop cannot be confirmed the status is unchanged and STOP_UNCONFIRMED explains what is still running. A paused lane dispatches nothing until it is made active again.', object({
     ...workspace,
     ...feature,
     status: string('Lifecycle state.', { enum: ['planned', 'active', 'paused', 'blocked', 'review', 'done', 'archived'] }),
@@ -220,7 +220,7 @@ export const TOOLS = [
     prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot be paused or archived.'),
   }, ['workspace_path', 'feature', 'status']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('theater_evidence_record', 'Record feature evidence', 'Record an actually executed check, artifact inspection, review, or other evidence at an exact revision when available.', object({
+  tool('evidence_record', 'Record feature evidence', 'Record an actually executed check, artifact inspection, review, or other evidence at an exact revision when available.', object({
     ...workspace,
     ...feature,
     work_item: string('Optional associated work item key.'),
@@ -232,7 +232,7 @@ export const TOOLS = [
     passed: boolean('Whether this is passing or failing evidence; omit for a neutral note.'),
   }, ['workspace_path', 'feature', 'kind', 'summary']), { destructiveHint: false }),
 
-  tool('theater_candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate. Its checks are derived only from the executed receipts for that revision and current contract, one "key: outcome · receipt id" string each; caller text is never counted or shown as an executed check. A paused or archived lane is refused until it is made active again. Does not push, open a PR, or merge.', object({
+  tool('candidate_record', 'Record integration candidate', 'Verify and record the exact current HEAD as a reviewable candidate. Its checks are derived only from the executed receipts for that revision and current contract, one "key: outcome · receipt id" string each; caller text is never counted or shown as an executed check. A paused or archived lane is refused until it is made active again. Does not push, open a PR, or merge.', object({
     ...workspace,
     ...feature,
     revision: string('Candidate commit; defaults to HEAD.'),
@@ -241,14 +241,14 @@ export const TOOLS = [
     allow_dirty: boolean('Deprecated: true is refused because evidence must describe a clean commit.'),
   }, ['workspace_path', 'feature', 'summary']), { destructiveHint: false }),
 
-  tool('theater_candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
+  tool('candidate_promote', 'Promote managed-project candidate', 'Fast-forward an OVERDRIVE-created canonical project to an accepted feature candidate. Refuses dirty, stale, unproven, or divergent state and never pushes remotely.', object({
     ...workspace,
     ...feature,
     revision: string('Accepted candidate revision; defaults to the latest accepted candidate.'),
     summary: string('Optional concise promotion disposition.'),
   }, ['workspace_path', 'feature']), { destructiveHint: true, idempotentHint: true }),
 
-  tool('theater_agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when theater.json sets harness to claude) with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call theater_work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
+  tool('agent_start', 'Start feature agent', 'Start or resume the lane-specific worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only that feature context and the repository instructions. This does not claim work items. For an existing bounded work item, first call work_update with its exact key, status running and a stable owner, then include that key and outcome in instruction. Claim only the assigned item; workers cannot maintain work-item leases.', object({
     ...workspace,
     ...feature,
     instruction: string('Optional immediate direction; otherwise the checkpoint next action is used.'),
@@ -257,24 +257,24 @@ export const TOOLS = [
     prior_turn_attestation: priorTurnAttestation('without an attestation such a lane cannot dispatch.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('theater_agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
+  tool('agent_inspect', 'Inspect feature agent', 'Refresh and return safe native-task progress plus Git/evidence state. Private reasoning items are filtered.', object({
     ...workspace,
     ...feature,
     include_thread: boolean('Read the persisted native worker task as well as local OVERDRIVE state.'),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. This does not claim work items. Before dispatching or resuming an existing bounded item, claim its exact key as running under a stable owner with theater_work_update, then include its key and outcome in instruction; do not claim unrelated ready items.', object({
+  tool('agent_steer', 'Steer feature agent', 'Deliver a revision to the active turn, or start a follow-up turn when the lane task is idle. This does not claim work items. Before dispatching or resuming an existing bounded item, claim its exact key as running under a stable owner with work_update, then include its key and outcome in instruction; do not claim unrelated ready items.', object({
     ...workspace,
     ...feature,
     instruction: string('Clear replacement, correction, constraint, or follow-up direction.'),
     effort: string('Reasoning effort for a new follow-up turn.', { enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] }),
   }, ['workspace_path', 'feature', 'instruction']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('theater_agent_compact', 'Compact feature agent', 'Compact an idle feature task at its durable checkpoint. If a turn is active, leave compaction queued.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
+  tool('agent_compact', 'Compact feature agent', 'Compact an idle feature task at its durable checkpoint. If a turn is active, leave compaction queued.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
-  tool('theater_agent_interrupt', 'Interrupt feature agent', 'Interrupt an active feature turn while preserving the task and checkout.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: true, openWorldHint: true }),
+  tool('agent_interrupt', 'Interrupt feature agent', 'Interrupt an active feature turn while preserving the task and checkout.', object({ ...workspace, ...feature }, ['workspace_path', 'feature']), { destructiveHint: true, openWorldHint: true }),
 
-  tool('theater_agent_request_resolve', 'Resolve feature agent request', 'Relay the user-approved answer to a pending command, permission, elicitation, or input request from the feature task.', object({
+  tool('agent_request_resolve', 'Resolve feature agent request', 'Relay the user-approved answer to a pending command, permission, elicitation, or input request from the feature task.', object({
     ...workspace,
     ...feature,
     request_id: string('Opaque pending request identifier returned by inspection.'),
@@ -283,7 +283,7 @@ export const TOOLS = [
     scope: string('Permission grant scope.', { enum: ['turn', 'session'] }),
   }, ['workspace_path', 'feature', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('theater_timeline', 'Read safe feature timeline', 'Read the append-only user-visible activity timeline for one feature. It never contains private chain-of-thought.', object({
+  tool('timeline', 'Read safe feature timeline', 'Read the append-only user-visible activity timeline for one feature. It never contains private chain-of-thought.', object({
     ...workspace,
     ...feature,
     limit: integer('Number of recent events.', 1, 200),
@@ -291,42 +291,42 @@ export const TOOLS = [
 ];
 
 const handlers = {
-  theater_view_catalog: () => ({ schemaVersion: 2, components: { work: 'Native dependency graph with actual task states and blockers. Arrows run from prerequisite to dependent work.' }, interaction: 'Use the existing conversation. No embedded controls.', stateSections: Object.keys(STATE_SECTIONS) }),
-  theater_state: snapshotState,
-  theater_view: composeView,
-  theater_checks_update: updateChecks,
-  theater_checks_run: runChecks,
-  theater_checks_enqueue: enqueueChecks,
-  theater_checks_queue: inspectCheckQueue,
-  theater_checks_drain: drainCheckQueue,
-  theater_checks_resolve: resolveCheckJob,
-  theater_evidence_get: readEvidence,
-  theater_agent_wait: waitFeatureAgent,
-  theater_agents_wait: waitFeatureAgents,
-  theater_initialize: initializeWorkspace,
-  theater_project_create: initializeManagedProject,
-  theater_doctor: doctorWorkspace,
-  theater_feature_create: createFeature,
-  theater_feature_list: listFeatures,
-  theater_feature_get: getFeatureContext,
-  theater_spec_update: updateSpec,
-  theater_work_plan: planWork,
-  theater_work_update: updateWork,
-  theater_checkpoint: checkpointFeature,
-  async theater_feature_status(args) {
+  view_catalog: () => ({ schemaVersion: 2, components: { work: 'Native dependency graph with actual task states and blockers. Arrows run from prerequisite to dependent work.' }, interaction: 'Use the existing conversation. No embedded controls.', stateSections: Object.keys(STATE_SECTIONS) }),
+  state: snapshotState,
+  view: composeView,
+  checks_update: updateChecks,
+  checks_run: runChecks,
+  checks_enqueue: enqueueChecks,
+  checks_queue: inspectCheckQueue,
+  checks_drain: drainCheckQueue,
+  checks_resolve: resolveCheckJob,
+  evidence_get: readEvidence,
+  agent_wait: waitFeatureAgent,
+  agents_wait: waitFeatureAgents,
+  workspace_init: initializeWorkspace,
+  project_create: initializeManagedProject,
+  doctor: doctorWorkspace,
+  feature_create: createFeature,
+  feature_list: listFeatures,
+  feature_get: getFeatureContext,
+  spec_update: updateSpec,
+  work_plan: planWork,
+  work_update: updateWork,
+  checkpoint: checkpointFeature,
+  async feature_status(args) {
     return await (['paused', 'archived'].includes(args.status) ? stopFeatureLane(args) : setFeatureStatus(args));
   },
-  theater_evidence_record: recordEvidence,
-  theater_candidate_record: recordCandidate,
-  theater_candidate_promote: promoteManagedCandidate,
-  theater_agent_start: startFeatureAgent,
-  theater_agent_inspect: inspectFeatureAgent,
-  theater_agent_steer: steerFeatureAgent,
-  theater_agent_compact: compactFeatureAgent,
-  theater_agent_interrupt: interruptFeatureAgent,
-  theater_agent_request_resolve: resolveFeatureAgentRequest,
-  theater_timeline: readTimeline,
-  async theater_feature_switch(args) {
+  evidence_record: recordEvidence,
+  candidate_record: recordCandidate,
+  candidate_promote: promoteManagedCandidate,
+  agent_start: startFeatureAgent,
+  agent_inspect: inspectFeatureAgent,
+  agent_steer: steerFeatureAgent,
+  agent_compact: compactFeatureAgent,
+  agent_interrupt: interruptFeatureAgent,
+  agent_request_resolve: resolveFeatureAgentRequest,
+  timeline: readTimeline,
+  async feature_switch(args) {
     const result = await switchFeature(args);
     if (result.compactFeatureThreadId) {
       try { result.featureSessionCompaction = await compactOutgoingAfterSwitch(result, args.workspace_path); }

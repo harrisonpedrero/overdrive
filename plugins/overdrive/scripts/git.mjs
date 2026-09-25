@@ -3,17 +3,17 @@ import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  TheaterError,
+  OverdriveError,
   contained,
   ensureManagedPath,
   exists,
   git,
   now,
   run,
-  safeSlug,
+  safeSlug, STATE_DIR,
 } from './util.mjs';
 
-export const mirrorPath = root => contained(root, '.theater', 'cache', 'repository.git');
+export const mirrorPath = root => contained(root, STATE_DIR, 'cache', 'repository.git');
 export const featureRoot = (root, slug) => contained(root, 'features', safeSlug(slug));
 export const checkoutPath = (root, slug) => contained(featureRoot(root, slug), 'repo');
 
@@ -21,20 +21,20 @@ async function assertFullRepository(repository) {
   for (const [target, label] of [[repository, 'repository'], [path.join(repository, '.git'), '.git directory']]) {
     let stat;
     try { stat = await fs.lstat(target); }
-    catch { throw new TheaterError(`Repository ${label} is missing: ${target}`, 'INVALID_CHECKOUT'); }
+    catch { throw new OverdriveError(`Repository ${label} is missing: ${target}`, 'INVALID_CHECKOUT'); }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
-      throw new TheaterError(`Repository ${label} must be a real directory: ${target}`, 'UNSAFE_CHECKOUT');
+      throw new OverdriveError(`Repository ${label} must be a real directory: ${target}`, 'UNSAFE_CHECKOUT');
     }
   }
 }
 
 export async function initializeMirror(root, repository) {
   const mirror = await ensureManagedPath(root, mirrorPath(root));
-  if (await exists(mirror)) throw new TheaterError('Repository cache already exists.', 'ALREADY_INITIALIZED');
+  if (await exists(mirror)) throw new OverdriveError('Repository cache already exists.', 'ALREADY_INITIALIZED');
   await fs.mkdir(path.dirname(mirror), { recursive: true });
   await run(['git', 'clone', '--mirror', '--', repository, mirror], { cwd: root });
   const info = await inspectMirror(root);
-  if (!info.defaultRevision) throw new TheaterError('Repository has no committed default revision.', 'EMPTY_REPOSITORY');
+  if (!info.defaultRevision) throw new OverdriveError('Repository has no committed default revision.', 'EMPTY_REPOSITORY');
   return info;
 }
 
@@ -58,11 +58,11 @@ export async function inspectMirror(root) {
 
 export async function resolveMirrorRevision(root, revision) {
   const candidate = revision?.trim() || 'HEAD';
-  if (candidate.includes('\0') || candidate.startsWith('-')) throw new TheaterError('Invalid base revision.', 'INVALID_REVISION');
+  if (candidate.includes('\0') || candidate.startsWith('-')) throw new OverdriveError('Invalid base revision.', 'INVALID_REVISION');
   try {
     return (await run(['git', '--git-dir', mirrorPath(root), 'rev-parse', '--verify', `${candidate}^{commit}`], { cwd: root })).stdout;
   } catch {
-    throw new TheaterError(`Base revision does not resolve to a commit: ${candidate}`, 'INVALID_REVISION');
+    throw new OverdriveError(`Base revision does not resolve to a commit: ${candidate}`, 'INVALID_REVISION');
   }
 }
 
@@ -252,7 +252,7 @@ async function configureCommitIdentity(destination, config) {
 export async function createFeatureCheckout(root, config, slug, baseRevision, baseRepository = mirrorPath(root)) {
   const destinationRoot = await ensureManagedPath(root, featureRoot(root, slug));
   const destination = await ensureManagedPath(root, checkoutPath(root, slug));
-  if (await exists(destinationRoot)) throw new TheaterError(`Feature directory is occupied: ${destinationRoot}`, 'FEATURE_PATH_OCCUPIED');
+  if (await exists(destinationRoot)) throw new OverdriveError(`Feature directory is occupied: ${destinationRoot}`, 'FEATURE_PATH_OCCUPIED');
   await fs.mkdir(destinationRoot, { recursive: true });
   try {
     // --no-local makes every feature self-contained instead of depending on the cache's object store.
@@ -264,11 +264,11 @@ export async function createFeatureCheckout(root, config, slug, baseRevision, ba
     await git(destination, 'checkout', '-b', branch, baseRevision);
     await git(destination, 'remote', 'set-url', 'origin', config.repository);
     await git(destination, 'config', 'fetch.prune', 'true');
-    await fs.appendFile(path.join(destination, '.git', 'info', 'exclude'), '\n/.theater/\n', 'utf8');
+    await fs.appendFile(path.join(destination, '.git', 'info', 'exclude'), '\n/.overdrive/\n', 'utf8');
     const commitIdentity = await configureCommitIdentity(destination, config);
     return { destination, branch, commitIdentity };
   } catch (error) {
-    throw new TheaterError(error.message, error.code || 'CHECKOUT_FAILED', {
+    throw new OverdriveError(error.message, error.code || 'CHECKOUT_FAILED', {
       checkoutPath: destination, featurePath: destinationRoot, baseRevision,
       recovery: 'Checkout creation stopped before feature registration. Preserve and inspect this partial directory before an authorized recovery; an occupied path is never overwritten automatically.',
     });
@@ -571,10 +571,10 @@ export function fingerprintSummary(fingerprint) {
 
 export async function verifyCheckoutRevision(repository, revision) {
   await assertFullRepository(repository);
-  if (!revision || revision.startsWith('-') || revision.includes('\0')) throw new TheaterError('Candidate revision is invalid.', 'INVALID_REVISION');
+  if (!revision || revision.startsWith('-') || revision.includes('\0')) throw new OverdriveError('Candidate revision is invalid.', 'INVALID_REVISION');
   let resolved;
   try { resolved = (await git(repository, 'rev-parse', '--verify', `${revision}^{commit}`)).stdout; }
-  catch { throw new TheaterError(`Candidate revision does not resolve: ${revision}`, 'INVALID_REVISION'); }
+  catch { throw new OverdriveError(`Candidate revision does not resolve: ${revision}`, 'INVALID_REVISION'); }
   return resolved;
 }
 

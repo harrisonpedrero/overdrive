@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CodexAppServer, finalVisibleMessage, isolatedMcpConfigArgs } from '../plugins/feature-theater/scripts/app-server.mjs';
+import { CodexAppServer, finalVisibleMessage, isolatedMcpConfigArgs } from '../plugins/overdrive/scripts/app-server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,8 +43,8 @@ test('app-server client initializes and filters final visible output', async t =
   assert.equal(finalVisibleMessage({ items: [{ type: 'reasoning', summary: ['private'] }, { type: 'agentMessage', text: 'public handoff' }] }), 'public handoff');
 });
 
-test('MCP server advertises the native Feature Theater command surface', async t => {
-  const server = spawn(process.execPath, [path.join(here, '..', 'plugins', 'feature-theater', 'scripts', 'server.mjs')], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+test('MCP server advertises the native OVERDRIVE command surface', async t => {
+  const server = spawn(process.execPath, [path.join(here, '..', 'plugins', 'overdrive', 'scripts', 'server.mjs')], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   t.after(() => server.kill());
   let buffer = '';
   const pending = new Map();
@@ -71,7 +71,7 @@ test('MCP server advertises the native Feature Theater command surface', async t
   assert.equal(initialized.result.serverInfo.title, 'OVERDRIVE');
   const listed = await request(2, 'tools/list');
   const names = listed.result.tools.map(tool => tool.name);
-  for (const expected of ['theater_initialize', 'theater_project_create', 'theater_feature_create', 'theater_spec_update', 'theater_feature_switch', 'theater_agent_start', 'theater_agent_steer', 'theater_candidate_promote', 'theater_checks_update', 'theater_checks_run', 'theater_state', 'theater_view', 'theater_agent_wait']) assert.ok(names.includes(expected));
+  for (const expected of ['workspace_init', 'project_create', 'feature_create', 'spec_update', 'feature_switch', 'agent_start', 'agent_steer', 'candidate_promote', 'checks_update', 'checks_run', 'state', 'view', 'agent_wait']) assert.ok(names.includes(expected));
   assert.equal(new Set(names).size, names.length);
   server.stdin.end();
 });

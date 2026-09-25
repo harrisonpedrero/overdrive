@@ -6,10 +6,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
-export class TheaterError extends Error {
-  constructor(message, code = 'THEATER_ERROR', details = undefined) {
+export class OverdriveError extends Error {
+  constructor(message, code = 'OVERDRIVE_ERROR', details = undefined) {
     super(message);
-    this.name = 'TheaterError';
+    this.name = 'OverdriveError';
     this.code = code;
     this.details = details;
   }
@@ -23,13 +23,16 @@ export function refusedRequest(error) {
   return error;
 }
 
+export const STATE_DIR = '.overdrive';
+export const CONFIG_FILE = 'overdrive.json';
+
 export const now = () => new Date().toISOString();
 export const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 export function requiredText(value, name, { max = 200_000 } = {}) {
-  if (typeof value !== 'string' || !value.trim()) throw new TheaterError(`${name} is required.`, 'INVALID_INPUT');
-  if (value.length > max) throw new TheaterError(`${name} is too long.`, 'INVALID_INPUT');
-  if (value.includes('\0')) throw new TheaterError(`${name} contains a null byte.`, 'INVALID_INPUT');
+  if (typeof value !== 'string' || !value.trim()) throw new OverdriveError(`${name} is required.`, 'INVALID_INPUT');
+  if (value.length > max) throw new OverdriveError(`${name} is too long.`, 'INVALID_INPUT');
+  if (value.includes('\0')) throw new OverdriveError(`${name} contains a null byte.`, 'INVALID_INPUT');
   return value.trim();
 }
 
@@ -41,13 +44,13 @@ export function optionalText(value, name, options) {
 const RESERVED_NAMES = new Set([
   'archive', 'aux', 'cache', 'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
   'con', 'features', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9', 'nul',
-  'paused', 'prn', 'runtime', 'theater', 'tmp',
+  'paused', 'prn', 'runtime', 'overdrive', 'tmp',
 ]);
 
 export function safeSlug(value, name = 'feature') {
   const slug = requiredText(value, name, { max: 63 }).toLowerCase();
   if (!/^[a-z][a-z0-9-]{0,62}$/.test(slug) || slug.includes('--') || RESERVED_NAMES.has(slug)) {
-    throw new TheaterError(`${name} must start with a letter and use lowercase letters, digits, or single hyphens.`, 'INVALID_SLUG');
+    throw new OverdriveError(`${name} must start with a letter and use lowercase letters, digits, or single hyphens.`, 'INVALID_SLUG');
   }
   return slug;
 }
@@ -57,9 +60,53 @@ export function contained(root, ...parts) {
   const target = path.resolve(base, ...parts);
   const relative = path.relative(base, target);
   if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new TheaterError('A managed path would escape the workspace.', 'PATH_ESCAPE');
+    throw new OverdriveError('A managed path would escape the workspace.', 'PATH_ESCAPE');
   }
   return target;
+}
+
+const LEGACY_STATE_DIR = '.theater';
+const LEGACY_CONFIG_FILE = 'theater.json';
+const LEGACY_TEXT = [[/\.theater\//g, `${STATE_DIR}/`], [/\btheater\.json\b/g, CONFIG_FILE], [/feature-theater skill/g, 'overdrive skill'], [/# Feature Theater coordinator/g, '# OVERDRIVE coordinator']];
+
+async function pathExists(file) {
+  try { await fs.lstat(file); return true; } catch (error) { if (error?.code === 'ENOENT') return false; throw error; }
+}
+
+async function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fs.rename(from, to); } catch (error) {
+      // Another opener finished the same move first.
+      if (error?.code === 'ENOENT' && await pathExists(to)) return;
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(error?.code) || attempt >= 8) {
+        throw new OverdriveError(`Could not move ${from} to ${to}: ${error.message}. Close other sessions using this workspace and retry.`, 'WORKSPACE_BUSY');
+      }
+      await sleep(100 * (attempt + 1));
+    }
+  }
+}
+
+// Workspaces created before the rename keep their state: the state directory moves first and the
+// configuration last, because configuration presence marks an initialized workspace.
+export async function migrateLegacyWorkspace(root) {
+  const [legacyState, state, legacyConfig, config] = [LEGACY_STATE_DIR, STATE_DIR, LEGACY_CONFIG_FILE, CONFIG_FILE].map(name => path.join(root, name));
+  const [hasLegacyState, hasLegacyConfig] = await Promise.all([pathExists(legacyState), pathExists(legacyConfig)]);
+  if (!hasLegacyState && !hasLegacyConfig) return false;
+  for (const [legacy, current, present] of [[legacyState, state, hasLegacyState], [legacyConfig, config, hasLegacyConfig]]) {
+    if (present && await pathExists(current)) {
+      throw new OverdriveError(`Both ${path.basename(legacy)} and ${path.basename(current)} exist in ${root}. Keep the one holding current state and move the other aside.`, 'MIGRATION_CONFLICT');
+    }
+  }
+  if (hasLegacyState) await renameWithRetry(legacyState, state);
+  if (hasLegacyConfig) await renameWithRetry(legacyConfig, config);
+  for (const name of ['.gitignore', 'AGENTS.md']) {
+    const file = path.join(root, name);
+    let text;
+    try { text = await fs.readFile(file, 'utf8'); } catch (error) { if (error?.code === 'ENOENT') continue; throw error; }
+    const updated = LEGACY_TEXT.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), text);
+    if (updated !== text) await fs.writeFile(file, updated, 'utf8');
+  }
+  return true;
 }
 
 export async function resolveWorkspace(value) {
@@ -69,11 +116,12 @@ export async function resolveWorkspace(value) {
   try {
     root = await fs.realpath(absolute);
   } catch (error) {
-    if (error?.code === 'ENOENT') throw new TheaterError(`Workspace does not exist: ${absolute}`, 'WORKSPACE_NOT_FOUND');
+    if (error?.code === 'ENOENT') throw new OverdriveError(`Workspace does not exist: ${absolute}`, 'WORKSPACE_NOT_FOUND');
     throw error;
   }
   const stat = await fs.stat(root);
-  if (!stat.isDirectory()) throw new TheaterError('workspace_path must be a directory.', 'INVALID_WORKSPACE');
+  if (!stat.isDirectory()) throw new OverdriveError('workspace_path must be a directory.', 'INVALID_WORKSPACE');
+  await migrateLegacyWorkspace(root);
   return root;
 }
 
@@ -85,7 +133,7 @@ export async function ensureManagedPath(root, target) {
     cursor = path.join(cursor, part);
     try {
       const stat = await fs.lstat(cursor);
-      if (stat.isSymbolicLink()) throw new TheaterError(`Managed path contains a symlink or junction: ${cursor}`, 'UNSAFE_PATH');
+      if (stat.isSymbolicLink()) throw new OverdriveError(`Managed path contains a symlink or junction: ${cursor}`, 'UNSAFE_PATH');
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
@@ -97,7 +145,7 @@ export async function readJson(file) {
   try {
     return JSON.parse(await fs.readFile(file, 'utf8'));
   } catch (error) {
-    if (error instanceof SyntaxError) throw new TheaterError(`Invalid JSON in ${file}.`, 'INVALID_STATE');
+    if (error instanceof SyntaxError) throw new OverdriveError(`Invalid JSON in ${file}.`, 'INVALID_STATE');
     throw error;
   }
 }
@@ -152,7 +200,7 @@ function commandDescription(argv) {
 // is ever targeted, and never after it has exited.
 export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, binary = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
-    throw new TheaterError('Command arguments are invalid.', 'INVALID_COMMAND');
+    throw new OverdriveError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
   if (process.platform === 'win32' && /^(npm|npx|pnpm|yarn)(\.cmd)?$/i.test(argv[0])) {
     const manager = argv[0].replace(/\.cmd$/i, '').toLowerCase();
@@ -208,7 +256,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
     let settled = false;
     let closeDeadline = null;
     const exited = () => child.exitCode !== null || child.signalCode !== null;
-    const uncertain = reason => new TheaterError(`${commandDescription(argv)} passed its deadline and ${reason}; processes it started may still be running.`, 'COMMAND_TERMINATION_UNCERTAIN',
+    const uncertain = reason => new OverdriveError(`${commandDescription(argv)} passed its deadline and ${reason}; processes it started may still be running.`, 'COMMAND_TERMINATION_UNCERTAIN',
       { pid: child.pid, commandExited: exited(), output: `${binary ? '' : stdout}\n${stderr}`.trim().slice(-4_000) });
     const stopDirectly = reason => {
       unconfirmed ??= reason;
@@ -237,7 +285,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       settled = true;
       clearTimeout(timer);
       clearTimeout(closeDeadline);
-      reject(new TheaterError(`Unable to launch ${argv[0]}: ${error.message}`, 'COMMAND_LAUNCH_FAILED'));
+      reject(new OverdriveError(`Unable to launch ${argv[0]}: ${error.message}`, 'COMMAND_LAUNCH_FAILED'));
     });
     child.once('close', code => {
       clearTimeout(timer);
@@ -260,7 +308,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       if (allowFailure) return resolve({ stdout: binary ? stdout : stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs, argv, ...(terminationUncertain ? { terminationUncertain } : {}) });
       if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput || binary ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
       const detail = stderr.trim().slice(-4_000) || (binary ? '' : stdout.trim().slice(-4_000)) || 'No output';
-      reject(new TheaterError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}${terminationUncertain ? ` (${terminationUncertain})` : ''}: ${detail}`, 'COMMAND_FAILED'));
+      reject(new OverdriveError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}${terminationUncertain ? ` (${terminationUncertain})` : ''}: ${detail}`, 'COMMAND_FAILED'));
     }
   });
 }
@@ -277,18 +325,18 @@ export function redactString(value) {
 
 export async function normalizeRepositorySource(value) {
   const source = requiredText(value, 'repository', { max: 4_096 });
-  if (/[\r\n]/.test(source)) throw new TheaterError('Repository contains a newline.', 'INVALID_REPOSITORY');
+  if (/[\r\n]/.test(source)) throw new OverdriveError('Repository contains a newline.', 'INVALID_REPOSITORY');
   if (/^https?:\/\//i.test(source) || /^ssh:\/\//i.test(source) || /^git:\/\//i.test(source)) {
     let parsed;
-    try { parsed = new URL(source); } catch { throw new TheaterError('Repository URL is invalid.', 'INVALID_REPOSITORY'); }
-    if (parsed.username || parsed.password) throw new TheaterError('Repository URLs with embedded credentials are not stored. Use configured Git credentials instead.', 'CREDENTIAL_IN_URL');
+    try { parsed = new URL(source); } catch { throw new OverdriveError('Repository URL is invalid.', 'INVALID_REPOSITORY'); }
+    if (parsed.username || parsed.password) throw new OverdriveError('Repository URLs with embedded credentials are not stored. Use configured Git credentials instead.', 'CREDENTIAL_IN_URL');
     return { source, kind: 'url' };
   }
   if (/^[^/\\\s@:]+@[^/\\\s:]+:[^\s]+$/.test(source)) return { source, kind: 'ssh' };
   const local = path.resolve(source);
   let real;
-  try { real = await fs.realpath(local); } catch { throw new TheaterError(`Local repository does not exist: ${local}`, 'INVALID_REPOSITORY'); }
-  if (!(await fs.stat(real)).isDirectory()) throw new TheaterError('Local repository source must be a directory.', 'INVALID_REPOSITORY');
+  try { real = await fs.realpath(local); } catch { throw new OverdriveError(`Local repository does not exist: ${local}`, 'INVALID_REPOSITORY'); }
+  if (!(await fs.stat(real)).isDirectory()) throw new OverdriveError('Local repository source must be a directory.', 'INVALID_REPOSITORY');
   return { source: real, kind: 'local' };
 }
 
@@ -328,7 +376,7 @@ async function publishLock(lockFile, operation, record) {
       return true;
     } catch (error) {
       if (error?.code === 'EEXIST') return false;
-      throw new TheaterError(`Could not publish the ${operation} workspace lock: ${error?.message ?? error}`, 'LOCK_PUBLISH_FAILED', { code: error?.code });
+      throw new OverdriveError(`Could not publish the ${operation} workspace lock: ${error?.message ?? error}`, 'LOCK_PUBLISH_FAILED', { code: error?.code });
     }
   } finally {
     await fs.rm(pending, { force: true });
@@ -339,9 +387,9 @@ async function publishLock(lockFile, operation, record) {
 // slug. The prefix sits outside the 63-character body so every accepted slug keeps a distinct lock.
 export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_000 } = {}) {
   if (typeof operation !== 'string' || !/^(?:control-)?[a-z][a-z0-9-]{0,62}$/.test(operation)) {
-    throw new TheaterError('Workspace lock name is invalid.', 'INVALID_LOCK');
+    throw new OverdriveError('Workspace lock name is invalid.', 'INVALID_LOCK');
   }
-  const lockDirectory = await ensureManagedPath(root, contained(root, '.theater', 'locks'));
+  const lockDirectory = await ensureManagedPath(root, contained(root, STATE_DIR, 'locks'));
   await fs.mkdir(lockDirectory, { recursive: true });
   const lockFile = await ensureManagedPath(root, path.join(lockDirectory, `${operation}.lock`));
   const token = randomUUID();
@@ -354,7 +402,7 @@ export async function withWorkspaceLock(root, operation, fn, { timeoutMs = 120_0
     } catch (statError) {
       if (!(statError instanceof SyntaxError) && !['ENOENT', 'EACCES'].includes(statError?.code)) throw statError;
     }
-    if (Date.now() >= deadline) throw new TheaterError(`Timed out waiting for the ${operation} workspace lock.`, 'WORKSPACE_BUSY');
+    if (Date.now() >= deadline) throw new OverdriveError(`Timed out waiting for the ${operation} workspace lock.`, 'WORKSPACE_BUSY');
     await sleep(150);
   }
   try {
@@ -401,9 +449,9 @@ export function summarizePatch(patch = '') {
 export function parseJsonObject(value, name = 'value') {
   if (value === undefined || value === null) return undefined;
   if (typeof value === 'object' && !Array.isArray(value)) return value;
-  if (typeof value !== 'string') throw new TheaterError(`${name} must be an object or JSON object string.`, 'INVALID_INPUT');
+  if (typeof value !== 'string') throw new OverdriveError(`${name} must be an object or JSON object string.`, 'INVALID_INPUT');
   let parsed;
-  try { parsed = JSON.parse(value); } catch { throw new TheaterError(`${name} is not valid JSON.`, 'INVALID_INPUT'); }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TheaterError(`${name} must be a JSON object.`, 'INVALID_INPUT');
+  try { parsed = JSON.parse(value); } catch { throw new OverdriveError(`${name} is not valid JSON.`, 'INVALID_INPUT'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new OverdriveError(`${name} must be a JSON object.`, 'INVALID_INPUT');
   return parsed;
 }

@@ -3,7 +3,7 @@ import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, project
 import { repositorySnapshot } from './git.mjs';
 import { verificationStatus } from './verification.mjs';
 import { recoverAgentState } from './ownership.mjs';
-import { atomicWrite, contained, now, redactString, resolveWorkspace, safeSlug, TheaterError, writeJson } from './util.mjs';
+import { atomicWrite, contained, now, redactString, resolveWorkspace, safeSlug, OverdriveError, writeJson, STATE_DIR } from './util.mjs';
 
 export const STATE_SECTIONS = {
   features: 'Compare feature lifecycle, agent activity, work counts, and next actions without loading specifications.',
@@ -16,7 +16,7 @@ export const STATE_SECTIONS = {
 
 function chooseComponents(value = ['features']) {
   if (!Array.isArray(value) || !value.length || value.length > 6 || new Set(value).size !== value.length || value.some(key => !Object.hasOwn(STATE_SECTIONS, key))) {
-    throw new TheaterError(`Choose 1–6 distinct state sections: ${Object.keys(STATE_SECTIONS).join(', ')}.`, 'INVALID_INPUT');
+    throw new OverdriveError(`Choose 1–6 distinct state sections: ${Object.keys(STATE_SECTIONS).join(', ')}.`, 'INVALID_INPUT');
   }
   return value;
 }
@@ -56,7 +56,7 @@ function graphPages(work) {
 function graphScope(work, work_items, page) {
   if (work_items) return { scoped: work.filter(item => work_items.includes(item.item_key)), view: { mode: 'selected', page: null, pages: null } };
   const pages = Math.max(1, Math.ceil(work.length / GRAPH_LIMIT));
-  if (page > pages) throw new TheaterError(`This work graph has ${pages} page${pages === 1 ? '' : 's'}.`, 'INVALID_INPUT');
+  if (page > pages) throw new OverdriveError(`This work graph has ${pages} page${pages === 1 ? '' : 's'}.`, 'INVALID_INPUT');
   if (pages === 1) return { scoped: work, view: { mode: 'all', page, pages } };
   return { scoped: graphPages(work)[page - 1], view: { mode: 'attention', page, pages } };
 }
@@ -92,12 +92,12 @@ export async function snapshotState({ workspace_path, feature, components, inclu
       }
       if (chosen.some(key => key !== 'features')) {
         const slug = feature ? safeSlug(feature) : focus;
-        if (!slug) throw new TheaterError('Select a feature for these components.', 'FEATURE_REQUIRED');
+        if (!slug) throw new OverdriveError('Select a feature for these components.', 'FEATURE_REQUIRED');
         const row = featureBySlug(ctx.db, slug);
         const selected = { slug, title: clip(row.title, 200), state: row.status, specRevision: row.spec_revision, checkoutPath: row.checkout_path, agent: { state: row.agent_status, threadId: row.thread_id, activeTurnId: row.active_turn_id }, compactionPending: row.compaction_pending };
         if (chosen.includes('work')) {
           const work = workItems(ctx.db, row.id);
-          if (work_items?.some(key => !work.some(item => item.item_key === key))) throw new TheaterError('A selected work item does not belong to this feature.', 'WORK_NOT_FOUND');
+          if (work_items?.some(key => !work.some(item => item.item_key === key))) throw new OverdriveError('A selected work item does not belong to this feature.', 'WORK_NOT_FOUND');
           const graph = graph_page === undefined ? null : graphScope(work, work_items, graph_page);
           const scoped = graph ? graph.scoped : work_items ? work.filter(item => work_items.includes(item.item_key)) : work;
           selected.work = scoped.slice(0, 100).map(item => ({ key: item.item_key, title: clip(item.title, 500), state: item.status, kind: item.kind, dependencies: item.dependencies, acceptance: clip(item.acceptance), result: clip(item.result_summary), blocker: clip(item.blocker) }));
@@ -177,8 +177,8 @@ function graphKey(value) {
 
 export function renderWorkGraph(snapshot) {
   const work = snapshot.selected?.work;
-  if (!work) throw new TheaterError('Load the selected feature work before rendering its graph.', 'WORK_REQUIRED');
-  if (work.length > GRAPH_LIMIT) throw new TheaterError('This graph has more than 24 tasks. Select the relevant work_items for a readable subgraph.', 'GRAPH_TOO_LARGE', { items: work.map(({ key, title, state }) => ({ key, title, state })) });
+  if (!work) throw new OverdriveError('Load the selected feature work before rendering its graph.', 'WORK_REQUIRED');
+  if (work.length > GRAPH_LIMIT) throw new OverdriveError('This graph has more than 24 tasks. Select the relevant work_items for a readable subgraph.', 'GRAPH_TOO_LARGE', { items: work.map(({ key, title, state }) => ({ key, title, state })) });
   if (!work.length) return null;
   const view = snapshot.selected.view;
   const ids = new Map(work.map((item, index) => [item.key, 'n' + index]));
@@ -232,16 +232,16 @@ export function renderWorkGraph(snapshot) {
 
 export async function composeView(args) {
   if (args.components && (args.components.length !== 1 || args.components[0] !== 'work')) {
-    throw new TheaterError('The work graph is the only built-in visual. Read other state with theater_state and answer in the conversation.', 'UNSUPPORTED_VIEW');
+    throw new OverdriveError('The work graph is the only built-in visual. Read other state with state and answer in the conversation.', 'UNSUPPORTED_VIEW');
   }
   if (args.work_items !== undefined && (!Array.isArray(args.work_items) || !args.work_items.length || args.work_items.length > 24 || new Set(args.work_items).size !== args.work_items.length || args.work_items.some(key => typeof key !== 'string'))) {
-    throw new TheaterError('work_items must contain 1–24 distinct work keys.', 'INVALID_INPUT');
+    throw new OverdriveError('work_items must contain 1–24 distinct work keys.', 'INVALID_INPUT');
   }
   if (args.page !== undefined && (!Number.isInteger(args.page) || args.page < 1 || args.work_items !== undefined)) {
-    throw new TheaterError('page must be a positive integer and cannot be combined with work_items.', 'INVALID_INPUT');
+    throw new OverdriveError('page must be a positive integer and cannot be combined with work_items.', 'INVALID_INPUT');
   }
   const snapshot = await snapshotState({ workspace_path: args.workspace_path, feature: args.feature, work_items: args.work_items, graph_page: args.page ?? 1, components: ['work'] });
-  const base = contained(snapshot.workspace.path, '.theater', 'views', snapshot.id);
+  const base = contained(snapshot.workspace.path, STATE_DIR, 'views', snapshot.id);
   const mermaid = renderWorkGraph(snapshot);
   const snapshotPath = base + '.json';
   const graphPath = mermaid ? base + '.mmd' : null;

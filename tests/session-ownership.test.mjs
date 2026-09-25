@@ -7,10 +7,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
-import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { TheaterError, refusedRequest } from '../plugins/feature-theater/scripts/util.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, setFeatureStatus } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
+import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
+import { OverdriveError, refusedRequest } from '../plugins/overdrive/scripts/util.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, markCompacted, markDescendantsUnconfirmed, readUnconfirmedDescendants, readWorkerGuards, recordAgentEvent, saveAgentSession, savePendingAgentRequest, setFeatureStatus } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,7 +38,7 @@ class NativeBackend extends EventEmitter {
     const fault = this.faults[this.harness];
     if (method === 'turn/start') {
       if (fault === 'turn/start') throw refusedRequest(new Error(`${this.harness} could not start a turn`));
-      const timeout = new TheaterError(`${this.harness} request timed out: turn/start`, 'CODEX_TIMEOUT');
+      const timeout = new OverdriveError(`${this.harness} request timed out: turn/start`, 'CODEX_TIMEOUT');
       if (fault === 'lost-unstarted') throw timeout;
       const turn = { id: `${thread.id}-turn-${thread.turns.length + 1}`, status: 'inProgress', items: [] };
       Object.defineProperty(turn, 'guardId', { value: params.guardId ?? null });
@@ -50,7 +50,7 @@ class NativeBackend extends EventEmitter {
     // Interrupt faults: 'interrupt-fails' is a backend error; 'interrupt-silent' acknowledges but the
     // turn keeps running; faults.interruptGate holds any interrupt until its gate opens.
     if (method === 'turn/interrupt') {
-      if (fault === 'interrupt-fails') throw new TheaterError(`${this.harness} interrupt failed`, 'CODEX_TIMEOUT');
+      if (fault === 'interrupt-fails') throw new OverdriveError(`${this.harness} interrupt failed`, 'CODEX_TIMEOUT');
       if (fault === 'interrupt-silent') return { interrupted: true };
       if (this.faults.interruptGate) {
         this.faults.interruptGate.reached();
@@ -84,7 +84,7 @@ class NativeBackend extends EventEmitter {
 }
 
 async function fixture(t, harness = 'claude', runtimeOptions = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-ownership-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-ownership-'));
   await initializeManagedProject({ workspace_path: root, project_name: 'Ownership', description: 'Session routing.', harness });
   const args = { workspace_path: root, feature: 'alpha' };
   await createFeature({ ...args, title: 'Alpha', outcome: 'Preserve conversations.', spec: '# Ownership' });
@@ -99,11 +99,11 @@ async function fixture(t, harness = 'claude', runtimeOptions = {}) {
     await fs.rm(root, { recursive: true, force: true, maxRetries: 5 });
   });
   const configure = async changes => {
-    const file = path.join(root, 'theater.json');
+    const file = path.join(root, 'overdrive.json');
     await fs.writeFile(file, JSON.stringify({ ...JSON.parse(await fs.readFile(file, 'utf8')), ...changes }, null, 2));
   };
   const sql = (statement, ...values) => {
-    const db = new DatabaseSync(path.join(root, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(root, '.overdrive', 'state.sqlite3'));
     try { return db.prepare(statement).run(...values); } finally { db.close(); }
   };
   return { root, args, bridge, runtime, stores, calls, faults, configure, sql };
@@ -247,7 +247,7 @@ test('a controller savePendingAgentRequest from an unbound session is ignored', 
 });
 
 test('a loaded Claude session adopts a changed model before its next turn and reports it truthfully', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-model-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-model-'));
   await initializeManagedProject({ workspace_path: root, project_name: 'Model', description: 'Session settings.', harness: 'claude' });
   const args = { workspace_path: root, feature: 'alpha' };
   await createFeature({ ...args, title: 'Alpha', outcome: 'Change models.', spec: '# Alpha' });
@@ -260,7 +260,7 @@ test('a loaded Claude session adopts a changed model before its next turn and re
     await fs.rm(root, { recursive: true, force: true, maxRetries: 5 });
   });
   const configure = async claude => {
-    const file = path.join(root, 'theater.json');
+    const file = path.join(root, 'overdrive.json');
     await fs.writeFile(file, JSON.stringify({ ...JSON.parse(await fs.readFile(file, 'utf8')), claude }, null, 2));
   };
   const launchedModel = async () => {
@@ -533,7 +533,7 @@ test('a late completion cannot recreate an attested descendant marker', async t 
   const started = await f.runtime.startFeatureAgent(f.args);
   f.bridge.backend('codex').finish(started.threadId);
   await eventually(async () => (await agent(f.args)).status === 'idle');
-  const db = new DatabaseSync(path.join(f.root, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(f.root, '.overdrive', 'state.sqlite3'));
   const ownerToken = JSON.parse(db.prepare("SELECT value FROM meta WHERE key LIKE 'agent-owner:%'").get().value).token;
   db.close();
   const marker = { ...f.args, thread_id: started.threadId, turn_id: started.turnId, owner_token: ownerToken, summary: 'Worker descendants may still run.' };
@@ -554,7 +554,7 @@ test('an invalid steer leaves lane ownership, agent state and the native task un
   const f = await fixture(t, 'codex');
   // Raw rows: reading feature context would itself recover a dead owner's lane.
   const read = statement => {
-    const db = new DatabaseSync(path.join(f.root, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(f.root, '.overdrive', 'state.sqlite3'));
     try { return db.prepare(statement).all().map(row => ({ ...row })); } finally { db.close(); }
   };
   const owners = () => read("SELECT key, value FROM meta WHERE key LIKE 'agent-owner:%' ORDER BY key");

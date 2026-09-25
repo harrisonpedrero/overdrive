@@ -5,10 +5,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { run } from '../plugins/feature-theater/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
-import { drainCheckQueue, enqueueChecks, inspectCheckQueue, resolveCheckJob } from '../plugins/feature-theater/scripts/check-queue.mjs';
-import { createFeature, getFeatureContext, initializeManagedProject, recordCandidate, setFeatureStatus } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { run } from '../plugins/overdrive/scripts/util.mjs';
+import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
+import { drainCheckQueue, enqueueChecks, inspectCheckQueue, resolveCheckJob } from '../plugins/overdrive/scripts/check-queue.mjs';
+import { createFeature, getFeatureContext, initializeManagedProject, recordCandidate, setFeatureStatus } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'taskkill applies only on Windows' };
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -28,7 +28,7 @@ const parentOf = (pidFile, childPidFile) => `require('node:child_process').spawn
 // under that name, whose preload exits for it and does nothing in any other node process. Every PID
 // recorded through pidFile is killed if still running, and the shim is removed afterwards.
 async function failingTaskkill(t, { delayMs = 0 } = {}) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-taskkill-'));
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-taskkill-'));
   const pidFiles = [];
   const previous = { PATH: process.env.PATH, NODE_OPTIONS: process.env.NODE_OPTIONS };
   t.after(async () => {
@@ -52,7 +52,7 @@ async function failingTaskkill(t, { delayMs = 0 } = {}) {
 }
 
 test('ordinary command results and a confirmed tree kill are unchanged by confirmTermination', async t => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-tree-kill-'));
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-tree-kill-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true, maxRetries: 5 }));
   for (const confirmTermination of [false, true]) {
     assert.equal((await run([process.execPath, '-e', "console.log('ok')"], { confirmTermination })).stdout, 'ok');
@@ -108,7 +108,7 @@ test('a command that closes before taskkill reports failure is still unconfirmed
 });
 
 test('every timed-out Windows command settles within its close deadline while a descendant holds its output', windowsOnly, async t => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-open-output-'));
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-open-output-'));
   const pidFiles = [];
   const pidFile = name => { const file = path.join(directory, `${name}.pid`); pidFiles.push(file); return file; };
   t.after(async () => {
@@ -148,7 +148,7 @@ test('every timed-out Windows command settles within its close deadline while a 
 // A lane with a passing receipt and a ready candidate whose check, while .hang names a PID file,
 // records its PID there and outlives its one-second deadline.
 async function verifiedLane(t, feature) {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-uncertain-check-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-uncertain-check-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 }));
   const args = { workspace_path: workspace, feature };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Hanging', description: 'A check can outlive its deadline.' });
@@ -158,7 +158,7 @@ async function verifiedLane(t, feature) {
     "const fs = require('node:fs'); fs.readFileSync('README.md'); if (fs.existsSync('.hang')) { fs.writeFileSync(fs.readFileSync('.hang', 'utf8'), String(process.pid)); setTimeout(() => {}, 30000); }"] }] });
   assert.equal((await runChecks(args)).verification.ready, true);
   await recordCandidate({ ...args, summary: 'Ready.', checks: ['README receipt'] });
-  const database = () => new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const database = () => new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   const executedReceipts = () => {
     const db = database();
     try { return db.prepare("SELECT id, passed FROM evidence WHERE source = 'executed' ORDER BY rowid").all().map(row => ({ ...row })); }
@@ -211,7 +211,7 @@ test('a direct check reservation fails closed on the lane when the queue cannot 
   const { workspace, args, repo, executedReceipts, hang } = await verifiedLane(t, 'unqueued');
   const receipts = executedReceipts();
   // A directory where the queue lock file belongs makes the interrupted job impossible to write.
-  const queueLock = path.join(workspace, '.theater', 'locks', 'verification-queue.lock');
+  const queueLock = path.join(workspace, '.overdrive', 'locks', 'verification-queue.lock');
   await fs.mkdir(queueLock, { recursive: true });
   await hang(shim.pidFile('direct'));
   let reservedBy;

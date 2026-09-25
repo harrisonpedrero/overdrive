@@ -1,7 +1,7 @@
 features/
-.theater/cache/
-.theater/locks/
-.theater/state.sqlite3*
-.theater/events.ndjson
-theater.json
+.overdrive/cache/
+.overdrive/locks/
+.overdrive/state.sqlite3*
+.overdrive/events.ndjson
+overdrive.json
 project/

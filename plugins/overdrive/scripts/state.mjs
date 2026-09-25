@@ -4,9 +4,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { checkoutPath } from './git.mjs';
-import { TheaterError, contained, ensureManagedPath, now, readJson } from './util.mjs';
+import { OverdriveError, contained, ensureManagedPath, now, readJson, STATE_DIR, CONFIG_FILE } from './util.mjs';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 export const CHECK_QUEUE_META = 'checks:queue';
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
@@ -18,14 +18,14 @@ export const uncertainCheckKey = featureId => `checks-uncertain:${featureId}`;
 
 export function assertCheckReservation(db, featureId, receiptId = null) {
   const marker = parseJson(meta(db, uncertainCheckKey(featureId)), null);
-  if (marker) throw new TheaterError(`Verification job ${marker.jobKey} reserves this clone because its check command may still be running. Confirm it and its children stopped, then resolve the job with execution_stopped.`, 'CHECK_EXECUTION_RESERVED');
+  if (marker) throw new OverdriveError(`Verification job ${marker.jobKey} reserves this clone because its check command may still be running. Confirm it and its children stopped, then resolve the job with execution_stopped.`, 'CHECK_EXECUTION_RESERVED');
   const raw = meta(db, CHECK_QUEUE_META);
   if (!raw) return;
   const queue = JSON.parse(raw);
-  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new TheaterError('Unsupported verification queue state.', 'INVALID_STATE');
+  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new OverdriveError('Unsupported verification queue state.', 'INVALID_STATE');
   const reserved = queue.jobs.find(job => job.featureId === featureId && ['running', 'interrupted'].includes(job.status)
     && !(job.status === 'running' && receiptId && job.attempts.at(-1)?.receiptId === receiptId));
-  if (reserved) throw new TheaterError(`Verification job ${reserved.key} reserves this clone. Inspect the queue and resolve uncertain execution before reusing it.`, 'CHECK_EXECUTION_RESERVED');
+  if (reserved) throw new OverdriveError(`Verification job ${reserved.key} reserves this clone. Inspect the queue and resolve uncertain execution before reusing it.`, 'CHECK_EXECUTION_RESERVED');
 }
 
 // Records a directly run check whose command may still be running as an interrupted queue job, so
@@ -34,7 +34,7 @@ export function assertCheckReservation(db, featureId, receiptId = null) {
 export function reserveInterruptedCheck(db, job) {
   const raw = meta(db, CHECK_QUEUE_META);
   const queue = raw ? JSON.parse(raw) : { version: 1, runner: null, jobs: [] };
-  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new TheaterError('Unsupported verification queue state.', 'INVALID_STATE');
+  if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new OverdriveError('Unsupported verification queue state.', 'INVALID_STATE');
   queue.jobs.push(job);
   meta(db, CHECK_QUEUE_META, JSON.stringify(queue));
 }
@@ -237,6 +237,10 @@ function migrate(db, currentVersion) {
         UPDATE candidates SET status = 'superseded' WHERE contract_hash = '' AND status IN ('ready','accepted');
       `);
     }
+    // Artifact paths recorded before the state directory was renamed.
+    if (currentVersion < 7) {
+      db.exec(String.raw`UPDATE evidence SET artifact = replace(replace(artifact, '.theater/', '.overdrive/'), '.theater\', '.overdrive\') WHERE artifact LIKE '%.theater%'`);
+    }
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
@@ -245,7 +249,7 @@ function migrate(db, currentVersion) {
 }
 
 export function openDatabase(root) {
-  const file = contained(root, '.theater', 'state.sqlite3');
+  const file = contained(root, STATE_DIR, 'state.sqlite3');
   const db = new DatabaseSync(file);
   databaseRoots.set(db, path.resolve(root));
   // A damaged or foreign file fails here; the handle is released so the file can be repaired.
@@ -253,7 +257,7 @@ export function openDatabase(root) {
     schema(db);
     const current = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     if (current && Number(current.value) > SCHEMA_VERSION) {
-      throw new TheaterError('This workspace was created by a newer OVERDRIVE version.', 'NEWER_SCHEMA');
+      throw new OverdriveError('This workspace was created by a newer OVERDRIVE version.', 'NEWER_SCHEMA');
     }
     migrate(db, current ? Number(current.value) : 2);
     db.prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -291,28 +295,28 @@ export function initializeDatabase(root, config) {
 }
 
 export async function readWorkspaceConfig(root) {
-  const configFile = await ensureManagedPath(root, contained(root, 'theater.json'));
+  const configFile = await ensureManagedPath(root, contained(root, CONFIG_FILE));
   let config;
   try { config = await readJson(configFile); } catch (error) {
-    if (error?.code === 'ENOENT') throw new TheaterError('OVERDRIVE is not initialized in this workspace.', 'NOT_INITIALIZED');
+    if (error?.code === 'ENOENT') throw new OverdriveError('OVERDRIVE is not initialized in this workspace.', 'NOT_INITIALIZED');
     throw error;
   }
   if (config?.formatVersion !== 1 || typeof config.workspaceId !== 'string' || typeof config.repository !== 'string') {
-    throw new TheaterError('theater.json is invalid.', 'INVALID_STATE');
+    throw new OverdriveError('overdrive.json is invalid.', 'INVALID_STATE');
   }
   return config;
 }
 
 export async function loadWorkspace(root) {
   const config = await readWorkspaceConfig(root);
-  const databaseFile = await ensureManagedPath(root, contained(root, '.theater', 'state.sqlite3'));
+  const databaseFile = await ensureManagedPath(root, contained(root, STATE_DIR, 'state.sqlite3'));
   try { await fs.access(databaseFile); } catch {
-    throw new TheaterError('OVERDRIVE state database is missing.', 'INVALID_STATE');
+    throw new OverdriveError('OVERDRIVE state database is missing.', 'INVALID_STATE');
   }
   const db = openDatabase(root);
   if (meta(db, 'workspace_id') !== config.workspaceId) {
     db.close();
-    throw new TheaterError('Workspace configuration and database identities disagree.', 'INVALID_STATE');
+    throw new OverdriveError('Workspace configuration and database identities disagree.', 'INVALID_STATE');
   }
   return { root, config, db };
 }
@@ -369,7 +373,7 @@ export function assertBoundCheckout(feature) {
   const detail = location.reason === 'linked_path'
     ? `its managed path passes through a symlink or junction (${location.link})`
     : `it was registered at ${location.recorded}`;
-  throw new TheaterError(
+  throw new OverdriveError(
     `Feature ${feature.slug} is not bound to this workspace: ${detail}, not ${location.expected}. Refusing to inspect, verify or run a worker outside this workspace.`,
     'CHECKOUT_LOCATION_MISMATCH',
     { feature: feature.slug, expectedCheckout: location.expected, recordedCheckout: location.recorded, recovery: 'This control workspace appears to be a copy or relocation of another. Operate the lane from the workspace that owns its checkout, or create a new lane here; recorded paths are never rewritten automatically.' },
@@ -379,7 +383,7 @@ export function assertBoundCheckout(feature) {
 export const CANDIDATE_REVIEW_ACTION = 'Review or integrate the exact recorded candidate.';
 export const COMPLETED_ACTION = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
 export const ARCHIVED_ACTION = 'None. The lane is archived; its disposition records what shipped or remains.';
-export const PAUSED_ACTION = 'Paused. Resume the lane with theater_feature_status (status active) before claiming or dispatching work.';
+export const PAUSED_ACTION = 'Paused. Resume the lane with feature_status (status active) before claiming or dispatching work.';
 
 // Whether an explicit checkpoint saved the lane's stored direction, word for word, since the latest
 // candidate, archive or completion, each of which regenerates or settles candidate direction.
@@ -404,7 +408,7 @@ CASE WHEN status = 'paused' AND next_action IN ('${CANDIDATE_REVIEW_ACTION}', '$
 
 export function readFeatureRow(db, slug) {
   const row = db.prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE slug = ?`).get(slug);
-  if (!row) throw new TheaterError(`Unknown feature: ${slug}`, 'FEATURE_NOT_FOUND');
+  if (!row) throw new OverdriveError(`Unknown feature: ${slug}`, 'FEATURE_NOT_FOUND');
   return normalizeFeature(row, databaseRoots.get(db));
 }
 

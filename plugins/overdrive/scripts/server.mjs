@@ -44,7 +44,7 @@ async function handle(message) {
       return toolResult(id, value);
     } catch (error) {
       return toolResult(id, {
-        error: error?.code || 'THEATER_ERROR',
+        error: error?.code || 'OVERDRIVE_ERROR',
         message: error?.message || String(error),
         ...(error?.details === undefined ? {} : { details: error.details }),
       }, true);

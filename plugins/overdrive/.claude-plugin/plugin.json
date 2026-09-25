@@ -1,15 +1,23 @@
 {
-  "name": "feature-theater",
+  "name": "overdrive",
   "version": "0.1.0",
   "description": "OVERDRIVE: run each feature in an isolated repository clone and orchestrate its worker from Claude Code, with durable specs, live steering and executed verification.",
   "author": {
     "name": "Harrison Pedrero"
   },
-  "keywords": ["overdrive", "orchestration", "feature-clones", "feature-lanes", "verification"],
+  "keywords": [
+    "overdrive",
+    "orchestration",
+    "feature-clones",
+    "feature-lanes",
+    "verification"
+  ],
   "mcpServers": {
-    "feature_theater": {
+    "overdrive": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/../feature-theater/scripts/server.mjs"]
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/server.mjs"
+      ]
     }
   }
 }

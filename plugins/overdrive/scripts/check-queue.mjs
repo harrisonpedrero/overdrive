@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { CHECK_QUEUE_META, featureBySlug, loadWorkspace, meta, newId, recordEvent } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { assertAgentIdle, featureChecks, featureContract, runChecks, verificationStatus } from './verification.mjs';
-import { TheaterError, now, requiredText, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
+import { OverdriveError, now, requiredText, resolveWorkspace, safeSlug, withWorkspaceLock } from './util.mjs';
 
 const activeRunners = new Set();
 const HISTORY_LIMIT = 500;
@@ -53,7 +53,7 @@ async function access(root, operation) {
     try {
       const raw = meta(ctx.db, CHECK_QUEUE_META);
       const queue = raw ? JSON.parse(raw) : { version: 1, runner: null, jobs: [] };
-      if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new TheaterError('Unsupported verification queue state.', 'INVALID_STATE');
+      if (queue.version !== 1 || !Array.isArray(queue.jobs)) throw new OverdriveError('Unsupported verification queue state.', 'INVALID_STATE');
       recover(ctx, queue);
       const result = await operation(ctx, queue);
       meta(ctx.db, CHECK_QUEUE_META, JSON.stringify(queue));
@@ -64,7 +64,7 @@ async function access(root, operation) {
 
 function keys(value, label, maximum = 50) {
   if (!Array.isArray(value) || value.length > maximum || value.some(key => typeof key !== 'string' || safeSlug(key, label) !== key) || new Set(value).size !== value.length) {
-    throw new TheaterError(`${label} must contain unique lowercase keys (at most ${maximum}).`, 'INVALID_INPUT');
+    throw new OverdriveError(`${label} must contain unique lowercase keys (at most ${maximum}).`, 'INVALID_INPUT');
   }
   return [...value].sort();
 }
@@ -73,7 +73,7 @@ async function binding(ctx, job) {
   const feature = featureBySlug(ctx.db, job.feature);
   const snapshot = await repositorySnapshot(feature.checkout_path);
   if (feature.id !== job.featureId || !snapshot.clean || snapshot.head !== job.revision || featureContract(ctx.db, feature) !== job.contractHash) {
-    throw new TheaterError('Commit, clean checkout, or full verification contract changed; replan this action.', 'STALE_QUEUE_JOB');
+    throw new OverdriveError('Commit, clean checkout, or full verification contract changed; replan this action.', 'STALE_QUEUE_JOB');
   }
   return feature;
 }
@@ -89,7 +89,7 @@ async function whileLanesIdle(root, slugs, fn) {
     return await withWorkspaceLock(root, `control-${slug}`, () => { held = true; return whileLanesIdle(root, rest, fn); }, { timeoutMs: 0 });
   } catch (error) {
     if (held || error?.code !== 'WORKSPACE_BUSY') throw error;
-    throw new TheaterError(`Waiting for a direct check or control operation on ${slug} to finish before judging its clone.`, 'LANE_BUSY');
+    throw new OverdriveError(`Waiting for a direct check or control operation on ${slug} to finish before judging its clone.`, 'LANE_BUSY');
   }
 }
 
@@ -119,18 +119,18 @@ function retirable(queue, jobs, keep, excess) {
 }
 
 export async function enqueueChecks(args) {
-  if (!Array.isArray(args.jobs) || !args.jobs.length || args.jobs.length > 50) throw new TheaterError('Supply 1–50 verification jobs.', 'INVALID_INPUT');
+  if (!Array.isArray(args.jobs) || !args.jobs.length || args.jobs.length > 50) throw new OverdriveError('Supply 1–50 verification jobs.', 'INVALID_INPUT');
   const root = await resolveWorkspace(args.workspace_path);
   return access(root, async (ctx, queue) => {
     const additions = [];
     for (const input of args.jobs) {
       const key = safeSlug(input.key, 'job key');
-      if (additions.some(job => job.key === key)) throw new TheaterError('Job keys must be unique.', 'INVALID_INPUT');
+      if (additions.some(job => job.key === key)) throw new OverdriveError('Job keys must be unique.', 'INVALID_INPUT');
       const feature = featureBySlug(ctx.db, safeSlug(input.feature));
       assertAgentIdle(feature);
-      if (!featureChecks(ctx.db, feature.id).some(check => check.key === input.check_key)) throw new TheaterError('Unknown configured check key.', 'INVALID_INPUT');
+      if (!featureChecks(ctx.db, feature.id).some(check => check.key === input.check_key)) throw new OverdriveError('Unknown configured check key.', 'INVALID_INPUT');
       const snapshot = await repositorySnapshot(feature.checkout_path);
-      if (!snapshot.clean) throw new TheaterError('Commit reviewed changes before queueing verification.', 'DIRTY_CANDIDATE');
+      if (!snapshot.clean) throw new OverdriveError('Commit reviewed changes before queueing verification.', 'DIRTY_CANDIDATE');
       const job = {
         key, feature: feature.slug, featureId: feature.id, checkKey: input.check_key,
         revision: snapshot.head, contractHash: featureContract(ctx.db, feature),
@@ -139,7 +139,7 @@ export async function enqueueChecks(args) {
       const live = queue.jobs.find(item => item.key === key);
       const existing = live ?? retiredJob(ctx.db, key);
       if (existing && Object.keys(job).some(field => JSON.stringify(existing[field]) !== JSON.stringify(job[field]))) {
-        throw new TheaterError('Job key already binds a different action; use a new key for a new revision or plan.', 'QUEUE_KEY_CONFLICT');
+        throw new OverdriveError('Job key already binds a different action; use a new key for a new revision or plan.', 'QUEUE_KEY_CONFLICT');
       }
       additions.push(live ?? (existing ? { ...existing, retired: true } : { ...job, status: 'queued', queuedAt: now(), eligibleAt: null, reason: null, attempts: [] }));
     }
@@ -147,17 +147,17 @@ export async function enqueueChecks(args) {
     const retiring = combined.length > HISTORY_LIMIT ? retirable(queue, combined, new Set(additions), combined.length - HISTORY_LIMIT) : new Set();
     combined = combined.filter(job => !retiring.has(job));
     if (combined.length > HISTORY_LIMIT) {
-      throw new TheaterError(`The queue retains at most ${HISTORY_LIMIT} jobs and none of the excess is settled, unreferenced history. Review failed, stale or interrupted jobs and retry or cancel them before queueing more.`, 'QUEUE_LIMIT');
+      throw new OverdriveError(`The queue retains at most ${HISTORY_LIMIT} jobs and none of the excess is settled, unreferenced history. Review failed, stale or interrupted jobs and retry or cancel them before queueing more.`, 'QUEUE_LIMIT');
     }
     const visiting = new Set(), visited = new Set();
     function visit(job) {
-      if (visiting.has(job.key)) throw new TheaterError('Queue dependencies must be acyclic.', 'INVALID_INPUT');
+      if (visiting.has(job.key)) throw new OverdriveError('Queue dependencies must be acyclic.', 'INVALID_INPUT');
       if (visited.has(job.key)) return;
       visiting.add(job.key);
       for (const key of job.dependsOn) {
         const dependency = combined.find(item => item.key === key);
         if (!dependency) {
-          throw new TheaterError(retiredJob(ctx.db, key) ? `Dependency ${key} settled and was retired from queue history; depend on a fresh job instead.` : `Unknown dependency: ${key}`, 'INVALID_INPUT');
+          throw new OverdriveError(retiredJob(ctx.db, key) ? `Dependency ${key} settled and was retired from queue history; depend on a fresh job instead.` : `Unknown dependency: ${key}`, 'INVALID_INPUT');
         }
         visit(dependency);
       }
@@ -178,7 +178,7 @@ export async function inspectCheckQueue(args) {
 
 function bounded(value, fallback, maximum, name) {
   const actual = value ?? fallback;
-  if (!Number.isInteger(actual) || actual < 1 || actual > maximum) throw new TheaterError(`${name} must be 1–${maximum}.`, 'INVALID_INPUT');
+  if (!Number.isInteger(actual) || actual < 1 || actual > maximum) throw new OverdriveError(`${name} must be 1–${maximum}.`, 'INVALID_INPUT');
   return actual;
 }
 
@@ -194,7 +194,7 @@ export async function drainCheckQueue(args) {
   const deadline = Date.now() + seconds * 1000;
   try {
     await access(root, (_ctx, queue) => {
-      if (queue.runner) throw new TheaterError('A live controller already owns this verification drain.', 'QUEUE_OWNED');
+      if (queue.runner) throw new OverdriveError('A live controller already owns this verification drain.', 'QUEUE_OWNED');
       queue.runner = { token, pid: process.pid, startedAt: now() };
     });
     async function execute(job) {
@@ -223,7 +223,7 @@ export async function drainCheckQueue(args) {
     }
     while (true) {
       const admitted = await access(root, async (ctx, queue) => {
-        if (queue.runner?.token !== token) throw new TheaterError('Queue ownership changed.', 'QUEUE_OWNED');
+        if (queue.runner?.token !== token) throw new OverdriveError('Queue ownership changed.', 'QUEUE_OWNED');
         const selected = [];
         for (const job of queue.jobs) {
           if (job.status !== 'queued' || deferred.has(job.key)) continue;
@@ -242,7 +242,7 @@ export async function drainCheckQueue(args) {
               for (const dependency of dependencies) {
                 const dependencyFeature = await binding(ctx, dependency);
                 const latest = verificationStatus(ctx, dependencyFeature, dependency.revision).checks.find(check => check.key === dependency.checkKey);
-                if (latest?.status !== 'passed') throw new TheaterError(`Dependency lacks current passing evidence: ${dependency.key}; review and replan.`, 'STALE_QUEUE_JOB');
+                if (latest?.status !== 'passed') throw new OverdriveError(`Dependency lacks current passing evidence: ${dependency.key}; review and replan.`, 'STALE_QUEUE_JOB');
               }
               assertAgentIdle(await binding(ctx, job));
             });
@@ -286,15 +286,15 @@ export async function drainCheckQueue(args) {
 export async function resolveCheckJob(args) {
   const key = safeSlug(args.job_key, 'job key');
   const reason = requiredText(args.reason, 'reason', { max: 2000 });
-  if (!['retry', 'cancel'].includes(args.action)) throw new TheaterError('Action must be retry or cancel.', 'INVALID_INPUT');
+  if (!['retry', 'cancel'].includes(args.action)) throw new OverdriveError('Action must be retry or cancel.', 'INVALID_INPUT');
   return access(await resolveWorkspace(args.workspace_path), async (ctx, queue) => {
     const job = queue.jobs.find(item => item.key === key);
     // A direct run's lane marker names its job, and may be all that was recorded if the queue could not be written.
     const marker = ctx.db.prepare("SELECT key FROM meta WHERE key LIKE 'checks-uncertain:%' AND json_extract(value, '$.jobKey') = ?").get(key);
-    if (!job && !marker) throw new TheaterError('Queue job not found.', 'INVALID_INPUT');
-    if (job?.status === 'running' || job?.status === 'passed') throw new TheaterError('Running or passing jobs cannot be resolved or rerun.', 'INVALID_INPUT');
-    if ((marker || job.status === 'interrupted') && args.execution_stopped !== true) throw new TheaterError('First establish that the previous command and its children stopped, then confirm execution_stopped.', 'EXECUTION_UNCERTAIN');
-    if (!job && args.action === 'retry') throw new TheaterError('This reservation has no queue job to retry; cancel it, then run or queue the check again.', 'INVALID_INPUT');
+    if (!job && !marker) throw new OverdriveError('Queue job not found.', 'INVALID_INPUT');
+    if (job?.status === 'running' || job?.status === 'passed') throw new OverdriveError('Running or passing jobs cannot be resolved or rerun.', 'INVALID_INPUT');
+    if ((marker || job.status === 'interrupted') && args.execution_stopped !== true) throw new OverdriveError('First establish that the previous command and its children stopped, then confirm execution_stopped.', 'EXECUTION_UNCERTAIN');
+    if (!job && args.action === 'retry') throw new OverdriveError('This reservation has no queue job to retry; cancel it, then run or queue the check again.', 'INVALID_INPUT');
     if (job && args.action === 'retry') {
       assertAgentIdle(await binding(ctx, job));
       job.queuedAt = now(); job.eligibleAt = null;

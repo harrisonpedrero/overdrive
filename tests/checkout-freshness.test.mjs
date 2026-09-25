@@ -4,9 +4,9 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { git } from '../plugins/feature-theater/scripts/util.mjs';
-import { FINGERPRINT_LIMITS, checkoutFingerprint, compareCheckoutFingerprints, repositorySnapshot } from '../plugins/feature-theater/scripts/git.mjs';
-import { checkpointFeature, createFeature, getFeatureContext, initializeWorkspace, switchFeature, updateSpec } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { git } from '../plugins/overdrive/scripts/util.mjs';
+import { FINGERPRINT_LIMITS, checkoutFingerprint, compareCheckoutFingerprints, repositorySnapshot } from '../plugins/overdrive/scripts/git.mjs';
+import { checkpointFeature, createFeature, getFeatureContext, initializeWorkspace, switchFeature, updateSpec } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const commit = (repo, message) => git(repo, '-c', 'user.name=Checkout Test', '-c', 'user.email=checkout@example.invalid', 'commit', '-q', '-m', message);
 
@@ -107,7 +107,7 @@ async function lanes(t) {
   await createFeature({ ...alpha, title: 'Alpha', outcome: 'Alpha outcome.' });
   await createFeature({ ...beta, title: 'Beta', outcome: 'Beta outcome.' });
   const checkout = path.join(workspace, 'features', 'alpha', 'repo');
-  const database = path.join(workspace, '.theater', 'state.sqlite3');
+  const database = path.join(workspace, '.overdrive', 'state.sqlite3');
   const sql = (statement, ...params) => {
     const db = new DatabaseSync(database);
     try { return db.prepare(statement).run(...params); } finally { db.close(); }
@@ -154,7 +154,7 @@ test('an idle lane cannot switch after same-count checkout drift; an active work
   assert.equal(switched.focus, 'beta');
   assert.deepEqual([switched.checkoutFreshness.status, switched.checkoutFreshness.worker, switched.checkoutFreshness.changed], ['changed', 'active', ['contents']]);
   assert.match(switched.checkoutFreshness.caveat, /worker was active/);
-  const packet = await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8');
+  const packet = await fs.readFile(path.join(workspace, '.overdrive', 'features', 'alpha', 'context.md'), 'utf8');
   assert.match(packet, /CHECKOUT FRESHNESS CAVEAT: Checkout changed after checkpoint/);
   assert.match((await getFeatureContext(alpha)).checkoutCaveat.message, /contents/);
 
@@ -162,7 +162,7 @@ test('an idle lane cannot switch after same-count checkout drift; an active work
   sql("UPDATE features SET active_turn_id = NULL WHERE slug = 'alpha'");
   await checkpointFeature({ ...alpha, summary: 'Alpha work settled.', next_action: 'Continue.' });
   assert.equal((await getFeatureContext(alpha)).checkoutCaveat, null);
-  assert.doesNotMatch(await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8'), /CAVEAT/);
+  assert.doesNotMatch(await fs.readFile(path.join(workspace, '.overdrive', 'features', 'alpha', 'context.md'), 'utf8'), /CAVEAT/);
 });
 
 // Worker state is read inside the switch transaction, after the Git scan, so a worker that became
@@ -182,7 +182,7 @@ test('an active worker keeps a visible caveat even when its checkout matched the
   assert.match(matched.checkoutFreshness.caveat, /matched checkpoint .*worker was active/);
   const caveat = (await getFeatureContext(alpha)).checkoutCaveat;
   assert.deepEqual([caveat?.status, caveat?.worker], ['fresh', 'active']);
-  assert.match(await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8'), /CHECKOUT FRESHNESS CAVEAT: Checkout matched checkpoint/);
+  assert.match(await fs.readFile(path.join(workspace, '.overdrive', 'features', 'alpha', 'context.md'), 'utf8'), /CHECKOUT FRESHNESS CAVEAT: Checkout matched checkpoint/);
 
   // Once the worker is idle, a fresh comparison clears it.
   await switchFeature(alpha);
@@ -226,7 +226,7 @@ test('checkpoints saved before checkout fingerprints must be renewed after the s
 
   await rejectsWith(switchFeature(beta), 'CHECKPOINT_REQUIRED', 'checkout_unverified');
   const upgraded = new DatabaseSync(database);
-  assert.equal(upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '6');
+  assert.equal(upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '7');
   upgraded.close();
   // An active worker may still switch from an unverified checkpoint, with a caveat.
   sql("UPDATE features SET agent_status = 'uncertain' WHERE slug = 'alpha'");

@@ -5,9 +5,9 @@ import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { TREE_MARK, defaultContainment } from './process-tree.mjs';
-import { TheaterError, now, redactString, refusedRequest, run } from './util.mjs';
+import { OverdriveError, now, redactString, refusedRequest, run } from './util.mjs';
 
-// Workers get no MCP servers, hooks, skills, plugins or browser integration; the Theater
+// Workers get no MCP servers, hooks, skills, plugins or browser integration; the OVERDRIVE
 // coordinator therefore cannot be called recursively from a lane.
 export const ISOLATION_ARGS = ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--disable-slash-commands', '--no-chrome'];
 const NESTED_SESSION_ENV = /^(?:CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(?:CHILD_SESSION|SESSION_ID|HOST_SESSION_ID|MESSAGING_SOCKET|MESSAGING_TOKEN|ENTRYPOINT|SESSION_ATTENDED))$/;
@@ -33,14 +33,14 @@ const uncontainedNote = reason => `This worker ran without process-tree containm
 function toolList(value, name) {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.trim() || /[\r\n]/.test(item))) {
-    throw new TheaterError(`theater.json claude.${name} must be a list of tool patterns.`, 'INVALID_STATE');
+    throw new OverdriveError(`overdrive.json claude.${name} must be a list of tool patterns.`, 'INVALID_STATE');
   }
   return value.map(item => item.trim());
 }
 
 export function normalizeWorkerOptions(raw = {}) {
   const permissionMode = raw.permissionMode ?? DEFAULT_OPTIONS.permissionMode;
-  if (!PERMISSION_MODES.has(permissionMode)) throw new TheaterError(`theater.json claude.permissionMode must be one of ${[...PERMISSION_MODES].join(', ')}.`, 'INVALID_STATE');
+  if (!PERMISSION_MODES.has(permissionMode)) throw new OverdriveError(`overdrive.json claude.permissionMode must be one of ${[...PERMISSION_MODES].join(', ')}.`, 'INVALID_STATE');
   return {
     permissionMode,
     allowedTools: toolList(raw.allowedTools, 'allowedTools') ?? DEFAULT_OPTIONS.allowedTools,
@@ -64,7 +64,7 @@ export function workerLaunchArgs(meta, effort) {
   return args;
 }
 
-// Auto-memory lives outside Theater state and would carry notes across replaced sessions or
+// Auto-memory lives outside OVERDRIVE state and would carry notes across replaced sessions or
 // reused checkouts, so it is forced off regardless of any inherited value or key casing.
 export function workerEnvironment(env = process.env) {
   const inherited = Object.entries(env).filter(([key]) => !NESTED_SESSION_ENV.test(key) && key.toUpperCase() !== 'CLAUDE_CODE_DISABLE_AUTO_MEMORY');
@@ -206,12 +206,12 @@ export class ClaudeWorkerBridge extends EventEmitter {
   async ensureStarted() {
     if (this.launch) return;
     this.launch = launchSpec(this.launchOverride);
-    if (!this.launch) throw new TheaterError('Claude Code CLI not found. Install it or set CLAUDE_CLI_PATH.', 'CLAUDE_NOT_FOUND');
+    if (!this.launch) throw new OverdriveError('Claude Code CLI not found. Install it or set CLAUDE_CLI_PATH.', 'CLAUDE_NOT_FOUND');
   }
 
   #thread(threadId) {
     const meta = this.threads.get(threadId);
-    if (!meta) throw refusedRequest(new TheaterError(`Claude worker session ${threadId} is not loaded; resume it first.`, 'THREAD_UNKNOWN'));
+    if (!meta) throw refusedRequest(new OverdriveError(`Claude worker session ${threadId} is not loaded; resume it first.`, 'THREAD_UNKNOWN'));
     return meta;
   }
 
@@ -272,14 +272,14 @@ export class ClaudeWorkerBridge extends EventEmitter {
       case 'thread/read': return this.#read(params);
       case 'thread/compact/start': return this.#compact(params);
       case 'thread/name/set': this.#thread(params.threadId).name = String(params.name ?? '').slice(0, 120); return {};
-      default: throw new TheaterError(`Claude workers do not support ${method}.`, 'UNSUPPORTED');
+      default: throw new OverdriveError(`Claude workers do not support ${method}.`, 'UNSUPPORTED');
     }
   }
 
   liveRequest() { return null; }
 
   respondToServer(requestId) {
-    throw new TheaterError(`Claude workers answer permission prompts by policy; request ${requestId} is not live.`, 'REQUEST_ORPHANED');
+    throw new OverdriveError(`Claude workers answer permission prompts by policy; request ${requestId} is not live.`, 'REQUEST_ORPHANED');
   }
 
   // Stops every worker process this bridge still holds. Callers may ignore the result; it
@@ -298,10 +298,10 @@ export class ClaudeWorkerBridge extends EventEmitter {
       stop(turn.process, this.#stop(turn));
     }
     this.threads.clear();
-    if (affected.length) this.emit('exit', new TheaterError('Claude worker bridge closed.', 'CLAUDE_CLOSED'), affected);
+    if (affected.length) this.emit('exit', new OverdriveError('Claude worker bridge closed.', 'CLAUDE_CLOSED'), affected);
     return Promise.all(stopping).then(pids => {
       const unstopped = pids.filter(pid => pid !== null);
-      if (unstopped.length) process.stderr.write(`[feature-theater] Claude worker process(es) ${unstopped.join(', ')} did not exit on shutdown.\n`);
+      if (unstopped.length) process.stderr.write(`[overdrive] Claude worker process(es) ${unstopped.join(', ')} did not exit on shutdown.\n`);
       return { unstopped };
     });
   }
@@ -342,7 +342,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   // launched may still be running; otherwise null or the guard its confirmed stop cleared.
   async #settlePrevious(threadId) {
     const meta = this.#thread(threadId);
-    if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
+    if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     const previous = meta.lingering;
     const turn = meta.lingeringTurn;
     if (!previous) return null;
@@ -350,7 +350,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (await settledWithin(turn, this.terminationTimeoutMs)) return null;
     const { stopped, confirmed } = await this.#terminate(previous, turn);
     if (stopped) return confirmed ? { treeStoppedGuardId: turn.guardId } : { orphaned: { pid: previous.pid, turnId: turn.id } };
-    throw refusedRequest(new TheaterError(`Claude worker process ${previous.pid} from an earlier turn is still running in ${meta.cwd} and could not be stopped; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING'));
+    throw refusedRequest(new OverdriveError(`Claude worker process ${previous.pid} from an earlier turn is still running in ${meta.cwd} and could not be stopped; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING'));
   }
 
   // For a lifecycle stop, a process an ended turn left running must end together with the tools
@@ -361,7 +361,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     const meta = this.#thread(threadId);
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
     const unconfirmed = meta.unconfirmedDescendants;
-    if (unconfirmed) throw new TheaterError(`Claude worker process ${unconfirmed.pid} from an earlier turn was stopped, but its process tree could not be ended, so tools it launched may still be running.`, 'CLAUDE_DESCENDANTS_UNCONFIRMED', { turnId: unconfirmed.turnId });
+    if (unconfirmed) throw new OverdriveError(`Claude worker process ${unconfirmed.pid} from an earlier turn was stopped, but its process tree could not be ended, so tools it launched may still be running.`, 'CLAUDE_DESCENDANTS_UNCONFIRMED', { turnId: unconfirmed.turnId });
     return { treeStoppedGuardId: settled?.treeStoppedGuardId ?? null };
   }
 
@@ -381,7 +381,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     const settled = await this.#settlePrevious(threadId);
     const meta = this.#thread(threadId);
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
-    if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
+    if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     meta.lingering = null;
     const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
     turn.settled = new Promise(resolve => { turn.resolveSettled = resolve; });
@@ -416,10 +416,10 @@ export class ClaudeWorkerBridge extends EventEmitter {
         return;
       }
       // Not a refusal: a warden still running may yet start the CLI, so its guard must stay.
-      if (!(await waitForExit(warden, this.terminationTimeoutMs))) throw new TheaterError(`The Claude worker warden ${warden.pid} did not exit after failing to start; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING');
-      if (started.launchFailed) throw refusedRequest(new TheaterError(`Unable to launch the Claude worker: ${boundedHead(started.launchFailed)}`, 'CLAUDE_LAUNCH_FAILED'));
+      if (!(await waitForExit(warden, this.terminationTimeoutMs))) throw new OverdriveError(`The Claude worker warden ${warden.pid} did not exit after failing to start; stop it before starting another turn.`, 'CLAUDE_STILL_RUNNING');
+      if (started.launchFailed) throw refusedRequest(new OverdriveError(`Unable to launch the Claude worker: ${boundedHead(started.launchFailed)}`, 'CLAUDE_LAUNCH_FAILED'));
       this.containmentUnavailable = boundedHead(started.unavailable);
-      process.stderr.write(`[feature-theater] Claude worker process-tree containment is unavailable: ${this.containmentUnavailable}\n`);
+      process.stderr.write(`[overdrive] Claude worker process-tree containment is unavailable: ${this.containmentUnavailable}\n`);
     }
     turn.uncontained = this.containmentUnavailable
       ?? (this.containment ? `${path.basename(cli.command)} is not a native executable` : 'no process-tree containment is available on this platform');
@@ -549,14 +549,14 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   #send(turn, text) {
-    if (!turn.child?.stdin?.writable) throw new TheaterError('The Claude worker process is not accepting input.', 'CLAUDE_NOT_RUNNING');
+    if (!turn.child?.stdin?.writable) throw new OverdriveError('The Claude worker process is not accepting input.', 'CLAUDE_NOT_RUNNING');
     turn.child.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`);
   }
 
   #steer({ threadId, expectedTurnId, input }) {
     const meta = this.#thread(threadId);
     const turn = meta.active;
-    if (!turn || turn.id !== expectedTurnId || turn.interrupted || turn.failedResult) throw new TheaterError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
+    if (!turn || turn.id !== expectedTurnId || turn.interrupted || turn.failedResult) throw new OverdriveError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
     turn.pendingResults += 1;
     clearTimeout(turn.graceTimer);
     this.#send(turn, textOf(input));
@@ -573,7 +573,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (await this.#stop(turn)) return { interrupted: true, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}), ...(turn.treeStoppedGuardId ? { treeStoppedGuardId: turn.treeStoppedGuardId } : {}) };
     const message = `Interrupt could not stop Claude worker process ${pid}; it may still be running in ${meta.cwd}. The next turn start retries stopping it.`;
     await this.#finish(meta, turn, 'failed', message);
-    throw new TheaterError(message, 'CLAUDE_TERMINATION_FAILED');
+    throw new OverdriveError(message, 'CLAUDE_TERMINATION_FAILED');
   }
 
   #read({ threadId }) {
@@ -593,11 +593,11 @@ export class ClaudeWorkerBridge extends EventEmitter {
     };
   }
 
-  // Claude Code compacts its own context; the Theater checkpoint is the durable boundary,
+  // Claude Code compacts its own context; the OVERDRIVE checkpoint is the durable boundary,
   // so a compaction request is acknowledged without a model call.
   #compact({ threadId }) {
     const meta = this.#thread(threadId);
-    if (meta.active) throw new TheaterError(`Turn ${meta.active.id} is active; compaction must wait.`, 'TURN_ACTIVE');
+    if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is active; compaction must wait.`, 'TURN_ACTIVE');
     const turnId = `compact_${randomUUID()}`;
     setImmediate(() => {
       this.emit('notification', { method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress' } } });

@@ -4,8 +4,8 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { initializeManagedProject, createFeature, getFeatureContext, checkpointFeature } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
+import { initializeManagedProject, createFeature, getFeatureContext, checkpointFeature } from '../plugins/overdrive/scripts/workspace.mjs';
 
 class Bridge extends EventEmitter {
   constructor() { super(); this.turns = []; this.starts = 0; this.compactions = 0; this.quick = false; this.requests = []; }
@@ -42,7 +42,7 @@ class Bridge extends EventEmitter {
 }
 
 async function fixture(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-runtime-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-runtime-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   await initializeManagedProject({ workspace_path: root, project_name: 'Runtime fixture', description: 'Exercise session state.' });
   await createFeature({ workspace_path: root, feature: 'alpha', title: 'Alpha', outcome: 'Complete one bounded turn.', spec: '# Alpha\n\nComplete the fixture.' });
@@ -65,7 +65,7 @@ for (const [name, codex, expectedModel] of [
   test(`Codex ${name} reaches thread and turn dispatch`, async t => {
     const args = await fixture(t);
     if (codex) {
-      const configPath = path.join(args.workspace_path, 'theater.json');
+      const configPath = path.join(args.workspace_path, 'overdrive.json');
       const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
       config.codex = codex;
       await fs.writeFile(configPath, JSON.stringify(config));

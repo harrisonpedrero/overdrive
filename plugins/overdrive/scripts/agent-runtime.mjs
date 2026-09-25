@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
-import { summarizePatch, TheaterError, parseJsonObject, requiredText, redactString } from './util.mjs';
+import { summarizePatch, OverdriveError, parseJsonObject, requiredText, redactString } from './util.mjs';
 import { adoptAgentObservation, withAgentControl, withLaneStop } from './ownership.mjs';
 import { workerJobState } from './process-tree.mjs';
 import {
@@ -205,7 +205,7 @@ async function onNotification({ method, params }) {
         if (waiter) {
           clearTimeout(waiter.timer);
           compactionWaiters.delete(params.threadId);
-          waiter.reject(new TheaterError(`Thread compaction ${turn.status}: ${params.threadId}`, 'COMPACTION_FAILED'));
+          waiter.reject(new OverdriveError(`Thread compaction ${turn.status}: ${params.threadId}`, 'COMPACTION_FAILED'));
         }
       } else {
         const waiter = compactionWaiters.get(params.threadId);
@@ -293,14 +293,14 @@ function runPrompt(runtime, instruction) {
 
 async function compactThreadAndWait(runtime) {
   const threadId = runtime.feature.thread_id;
-  if (compactionWaiters.has(threadId)) throw new TheaterError(`Compaction is already running for ${threadId}.`, 'COMPACTION_ACTIVE');
+  if (compactionWaiters.has(threadId)) throw new OverdriveError(`Compaction is already running for ${threadId}.`, 'COMPACTION_ACTIVE');
   let resolve;
   let reject;
   const completion = new Promise((onResolve, onReject) => {
     resolve = onResolve;
     reject = onReject;
   });
-  const timer = setTimeout(() => reject(new TheaterError(`Timed out waiting for thread compaction: ${threadId}`, 'CODEX_TIMEOUT')), 180_000);
+  const timer = setTimeout(() => reject(new OverdriveError(`Timed out waiting for thread compaction: ${threadId}`, 'CODEX_TIMEOUT')), 180_000);
   compactionWaiters.set(threadId, { resolve, reject, timer, compacted: false, turnCompleted: false });
   try {
     await Promise.all([bridge.request('thread/compact/start', { threadId, harness: runtime.harness }), completion]);
@@ -315,7 +315,7 @@ async function compactThreadAndWait(runtime) {
 // predates recorded ownership and is never guessed onto the configured harness.
 function requireSessionOwner(runtime) {
   if (runtime.harness) return;
-  throw new TheaterError(`Native session ${runtime.feature.thread_id} of ${runtime.feature.slug} was saved before its backend was recorded, and its owner cannot be proven, so it was not sent to the configured harness. Start a replacement with theater_agent_start and force_new_session: true; the old conversation remains in its original backend.`, 'SESSION_OWNER_UNKNOWN');
+  throw new OverdriveError(`Native session ${runtime.feature.thread_id} of ${runtime.feature.slug} was saved before its backend was recorded, and its owner cannot be proven, so it was not sent to the configured harness. Start a replacement with agent_start and force_new_session: true; the old conversation remains in its original backend.`, 'SESSION_OWNER_UNKNOWN');
 }
 
 function sessionParams(runtime) {
@@ -380,11 +380,11 @@ async function settleUncertain(runtime, thread, attestation = null) {
 
 function priorTurnAttestation(value) {
   if (value === undefined || value === null) return null;
-  if (typeof value !== 'object' || Array.isArray(value)) throw new TheaterError('prior_turn_attestation must be an object whose evidence states the process or backend facts you verified.', 'INVALID_INPUT');
+  if (typeof value !== 'object' || Array.isArray(value)) throw new OverdriveError('prior_turn_attestation must be an object whose evidence states the process or backend facts you verified.', 'INVALID_INPUT');
   return { evidence: redactString(requiredText(value.evidence, 'prior_turn_attestation.evidence', { max: 4_000 })) };
 }
 
-const UNCERTAIN_NEXT = 'Inspect the lane. If you can verify under your existing authority that no worker from that request is still running for this lane (for example by checking the worker processes for its checkout), call theater_agent_start with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline. Until then no turn is dispatched.';
+const UNCERTAIN_NEXT = 'Inspect the lane. If you can verify under your existing authority that no worker from that request is still running for this lane (for example by checking the worker processes for its checkout), call agent_start with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline. Until then no turn is dispatched.';
 
 // A turn request without a confirmed outcome may have started a turn, so no new work is
 // dispatched until the owning native session shows whether it did. This also holds after the
@@ -409,7 +409,7 @@ async function reconcileDispatch(runtime, attestation = null) {
   await settleUncertain(runtime, thread, attestation);
   if (runtime.feature.agent_status !== 'uncertain') return;
   const reason = unreadable ? `its native session could not be read (${unreadable})` : 'its native history is not available in this controller';
-  throw new TheaterError(`The last turn request for ${runtime.feature.slug} has no confirmed outcome and ${reason}, so no new turn was started. ${UNCERTAIN_NEXT}`, 'DISPATCH_UNCERTAIN');
+  throw new OverdriveError(`The last turn request for ${runtime.feature.slug} has no confirmed outcome and ${reason}, so no new turn was started. ${UNCERTAIN_NEXT}`, 'DISPATCH_UNCERTAIN');
 }
 
 // Clears durable worker guards whose containment job no longer exists or holds no process: once
@@ -454,7 +454,7 @@ async function assertWorkersSettled(runtime, attestation) {
   }
   if (!marker && !guards.length) return;
   const reason = marker ? marker.summary : `${guards.length} worker process tree(s) from earlier turns of this lane have no confirmed exit, so tools they launched may still be running.`;
-  throw new TheaterError(`No turn was started for ${runtime.feature.slug}: ${reason} ${WORKERS_NEXT}`, 'WORKERS_UNCONFIRMED', { workerGuards: guards.length, descendantsUnconfirmed: Boolean(marker) });
+  throw new OverdriveError(`No turn was started for ${runtime.feature.slug}: ${reason} ${WORKERS_NEXT}`, 'WORKERS_UNCONFIRMED', { workerGuards: guards.length, descendantsUnconfirmed: Boolean(marker) });
 }
 
 async function dispatchTurn(runtime, threadId, instruction, effort, created = false) {
@@ -465,7 +465,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
     ? bindAgentSession({ ...base, harness: runtime.harness, expected_thread_id: previous.thread_id ?? null, compacted: previous.compaction_pending })
     : saveAgentSession({ ...base, status: 'starting' }));
   try {
-    if (guardId && (await registerWorkerGuard({ ...base, guard_id: guardId })).ignored) throw new TheaterError('The Claude worker guard could not be recorded for this session.', 'AGENT_OWNED');
+    if (guardId && (await registerWorkerGuard({ ...base, guard_id: guardId })).ignored) throw new OverdriveError('The Claude worker guard could not be recorded for this session.', 'AGENT_OWNED');
     const result = await bridge.request('turn/start', {
       harness: runtime.harness, threadId, input: textInput(runPrompt(runtime, instruction)), cwd: runtime.feature.checkout_path,
       runtimeWorkspaceRoots: runtimeRoots(runtime), model: runtime.workerModel, effort, summary: 'concise', guardId,
@@ -500,12 +500,12 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
 }
 
 async function startOwned({ workspace_path, feature, effort = 'high', force_new_session = false, prior_turn_attestation = undefined }, direction) {
-  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new TheaterError('Unsupported reasoning effort.', 'INVALID_INPUT');
+  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new OverdriveError('Unsupported reasoning effort.', 'INVALID_INPUT');
   const attestation = priorTurnAttestation(prior_turn_attestation);
   const runtime = await featureRuntime({ workspace_path, feature, force_new_session });
-  if (!runtime.feature.spec_revision) throw new TheaterError('Save a concrete feature specification before starting its agent.', 'SPEC_REQUIRED');
+  if (!runtime.feature.spec_revision) throw new OverdriveError('Save a concrete feature specification before starting its agent.', 'SPEC_REQUIRED');
   await reconcileDispatch(runtime, attestation);
-  if (runtime.feature.active_turn_id) throw new TheaterError(`Feature already has active turn ${runtime.feature.active_turn_id}; steer it instead.`, 'TURN_ACTIVE');
+  if (runtime.feature.active_turn_id) throw new OverdriveError(`Feature already has active turn ${runtime.feature.active_turn_id}; steer it instead.`, 'TURN_ACTIVE');
   await assertWorkersSettled(runtime, attestation);
   await bridge.ensureStarted();
   let threadId = runtime.feature.thread_id;
@@ -538,13 +538,13 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
     model: runtime.workerModel ?? 'harness-default',
     effort,
     checkoutPath: runtime.feature.checkout_path,
-    next: 'The feature task is running. Use theater_agent_inspect for safe progress or theater_agent_steer to revise direction mid-turn.',
+    next: 'The feature task is running. Use agent_inspect for safe progress or agent_steer to revise direction mid-turn.',
   };
 }
 
 async function steerOwned({ workspace_path, feature, effort = 'high' }, direction) {
   const runtime = await featureRuntime({ workspace_path, feature });
-  if (!runtime.feature.thread_id) throw new TheaterError('This feature has no agent session. Start it first.', 'AGENT_NOT_STARTED');
+  if (!runtime.feature.thread_id) throw new OverdriveError('This feature has no agent session. Start it first.', 'AGENT_NOT_STARTED');
   await bridge.ensureStarted();
   await resume(runtime);
   await reconcileDispatch(runtime);
@@ -593,7 +593,7 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   let thread = null;
   let warning = null;
   if (include_thread && runtime.feature.thread_id && !runtime.harness) {
-    warning = `Native session ${runtime.feature.thread_id} has no recorded owning backend, so it was not read. Replace it with theater_agent_start and force_new_session: true.`;
+    warning = `Native session ${runtime.feature.thread_id} has no recorded owning backend, so it was not read. Replace it with agent_start and force_new_session: true.`;
   } else if (include_thread && runtime.feature.thread_id) {
     try {
       await bridge.ensureStarted();
@@ -634,8 +634,8 @@ async function waitFeatureAgent({ workspace_path, feature, timeout_seconds = 30 
 }
 
 async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 30 }) {
-  if (!Number.isInteger(timeout_seconds) || timeout_seconds < 1 || timeout_seconds > 60) throw new TheaterError('Wait duration must be 1–60 seconds.', 'INVALID_INPUT');
-  if (!Array.isArray(features) || !features.length || features.length > 8 || features.some(feature => typeof feature !== 'string') || new Set(features).size !== features.length) throw new TheaterError('Supply 1–8 unique feature slugs.', 'INVALID_INPUT');
+  if (!Number.isInteger(timeout_seconds) || timeout_seconds < 1 || timeout_seconds > 60) throw new OverdriveError('Wait duration must be 1–60 seconds.', 'INVALID_INPUT');
+  if (!Array.isArray(features) || !features.length || features.length > 8 || features.some(feature => typeof feature !== 'string') || new Set(features).size !== features.length) throw new OverdriveError('Supply 1–8 unique feature slugs.', 'INVALID_INPUT');
   const runtimes = await Promise.all(features.map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true })));
   const signalled = new Set();
   let timer;
@@ -762,7 +762,7 @@ async function settleEndedTurn(runtime, turnId) {
 async function stopUnconfirmed({ workspace_path, feature, lifecycle }, status, reason, details = {}) {
   const message = `${feature} was not marked ${status} because its worker may still be running: ${reason} The lane stays ${lifecycle}.`;
   await recordAgentEvent({ workspace_path, feature, kind: 'feature.stop_unconfirmed', summary: message, details: { requestedStatus: status, ...details } });
-  return new TheaterError(message, 'STOP_UNCONFIRMED', details);
+  return new OverdriveError(message, 'STOP_UNCONFIRMED', details);
 }
 
 const ATTEST_NEXT = 'If you can verify under your existing authority that no worker process for this lane is running (for example by checking the processes whose working directory is its checkout), retry with prior_turn_attestation: { evidence } describing what you checked; it is recorded in the timeline.';
@@ -865,24 +865,24 @@ async function stopForStatus({ prior_turn_attestation = undefined, ...args }, ro
   return interruption ? { ...result, interruption } : result;
 }
 async function resolveRequestOwned({ workspace_path, feature, request_id, action, response, scope = 'turn' }) {
-  if (!['accept', 'accept_session', 'decline', 'cancel', 'respond'].includes(action)) throw new TheaterError('Unknown request action.', 'INVALID_INPUT');
-  if (!['turn', 'session'].includes(scope)) throw new TheaterError('scope must be turn or session.', 'INVALID_INPUT');
+  if (!['accept', 'accept_session', 'decline', 'cancel', 'respond'].includes(action)) throw new OverdriveError('Unknown request action.', 'INVALID_INPUT');
+  if (!['turn', 'session'].includes(scope)) throw new OverdriveError('scope must be turn or session.', 'INVALID_INPUT');
   const request = await pendingAgentRequest({ workspace_path, feature, request_id });
   await bridge.ensureStarted();
   const liveRequest = bridge.liveRequest(request_id);
   if (!liveRequest || liveRequest.params?.threadId !== request.thread_id) {
     await resolveAgentRequestRecord({ workspace_path, feature, request_id, status: 'orphaned', summary: `${request.method} belongs to an earlier app-server process and must be requested again.` });
-    throw new TheaterError('This request belongs to an earlier server process and can no longer be answered. Inspect the feature task and retry the blocked operation.', 'REQUEST_ORPHANED');
+    throw new OverdriveError('This request belongs to an earlier server process and can no longer be answered. Inspect the feature task and retry the blocked operation.', 'REQUEST_ORPHANED');
   }
   let result;
   if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/fileChange/requestApproval') {
-    if (action === 'respond') throw new TheaterError('Use accept, accept_session, decline, or cancel for this request.', 'INVALID_INPUT');
+    if (action === 'respond') throw new OverdriveError('Use accept, accept_session, decline, or cancel for this request.', 'INVALID_INPUT');
     result = { decision: action === 'accept_session' ? 'acceptForSession' : action };
   } else if (request.method === 'item/permissions/requestApproval') {
     if (action === 'accept' || action === 'accept_session') result = { permissions: request.payload.permissions || {}, scope: action === 'accept_session' ? 'session' : scope };
     else result = { permissions: {}, scope: 'turn' };
   } else {
-    if (action !== 'respond') throw new TheaterError('This request requires a structured response object.', 'INVALID_INPUT');
+    if (action !== 'respond') throw new OverdriveError('This request requires a structured response object.', 'INVALID_INPUT');
     result = parseJsonObject(response, 'response') || {};
   }
   bridge.respondToServer(request_id, result);
@@ -915,7 +915,7 @@ const startFeatureAgent = async args => {
 // dead owner and mark its running turn uncertain.
 const steerFeatureAgent = async args => {
   const { effort = 'high' } = args;
-  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new TheaterError('Unsupported reasoning effort.', 'INVALID_INPUT');
+  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new OverdriveError('Unsupported reasoning effort.', 'INVALID_INPUT');
   const direction = requiredText(args.instruction, 'instruction', { max: 100_000 });
   return await withAgentControl(args, ownerToken, () => steerOwned(args, direction));
 };
@@ -925,7 +925,7 @@ const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, ()
 // Pausing or archiving holds the lane's control lock from stopping its worker through recording
 // the status, so no turn can start in between and the status is written only after the stop.
 const stopFeatureLane = async args => {
-  if (!['paused', 'archived'].includes(args.status)) throw new TheaterError('Only pausing or archiving stops a lane.', 'INVALID_INPUT');
+  if (!['paused', 'archived'].includes(args.status)) throw new OverdriveError('Only pausing or archiving stops a lane.', 'INVALID_INPUT');
   return await withLaneStop(args, ownerToken, (row, busy, foreignOwner) => stopForStatus(args, row, busy, foreignOwner));
 };
 return { startFeatureAgent, steerFeatureAgent, inspectFeatureAgent, waitFeatureAgent, waitFeatureAgents, compactFeatureAgent, interruptFeatureAgent, resolveFeatureAgentRequest, stopFeatureLane, compactOutgoingAfterSwitch, shutdownAgentRuntime };

@@ -4,8 +4,8 @@ import { test } from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { git } from '../plugins/feature-theater/scripts/util.mjs';
-import { doctorWorkspace, initializeWorkspace } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { git } from '../plugins/overdrive/scripts/util.mjs';
+import { doctorWorkspace, initializeWorkspace } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const windows = process.platform === 'win32';
 
@@ -49,15 +49,15 @@ async function isolatedEnvironment(t, parent, { bin, codex, claude } = {}) {
 }
 
 async function fixture(t, harness) {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-doctor-'));
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-doctor-'));
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
   const source = path.join(parent, 'source');
   const workspace = path.join(parent, 'workspace');
   await fs.mkdir(source);
   await fs.mkdir(workspace);
   await git(source, 'init', '-b', 'main');
-  await git(source, 'config', 'user.name', 'Feature Theater Test');
-  await git(source, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(source, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(source, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(source, 'README.md'), 'doctor\n');
   await git(source, 'add', '.');
   await git(source, 'commit', '-m', 'base');
@@ -147,7 +147,7 @@ test('Doctor reports an invalid configuration and keeps independent diagnostics'
     const claude = await fakeCli(path.join(parent, 'bin'), 'claude');
     const codex = await fakeCli(path.join(parent, 'bin'), 'codex');
     await isolatedEnvironment(t, parent, { bin: path.dirname(claude), codex });
-    const configFile = path.join(workspace, 'theater.json');
+    const configFile = path.join(workspace, 'overdrive.json');
     await fs.writeFile(configFile, JSON.stringify({ ...JSON.parse(await fs.readFile(configFile, 'utf8')), harness: 'gemini' }, null, 2));
     const report = await doctorWorkspace({ workspace_path: workspace });
     const checks = byName(report);
@@ -158,11 +158,11 @@ test('Doctor reports an invalid configuration and keeps independent diagnostics'
     assert.equal(checks['Claude Code'], undefined);
     for (const name of ['Git', 'Node', 'State database', 'Repository cache', 'Feature paths']) assert.equal(checks[name].ok, true, name);
   });
-  await t.test('unreadable theater.json', async t => {
+  await t.test('unreadable overdrive.json', async t => {
     const { parent, workspace } = await fixture(t, 'claude');
     const claude = await fakeCli(path.join(parent, 'bin'), 'claude');
     await isolatedEnvironment(t, parent, { bin: path.dirname(claude) });
-    await fs.writeFile(path.join(workspace, 'theater.json'), '{ not json');
+    await fs.writeFile(path.join(workspace, 'overdrive.json'), '{ not json');
     const report = await doctorWorkspace({ workspace_path: workspace });
     const checks = byName(report);
     assert.equal(report.ok, false);
@@ -176,7 +176,7 @@ test('Doctor still probes the selected CLI and repository cache when the databas
   const { parent, workspace } = await fixture(t, 'claude');
   const claude = await fakeCli(path.join(parent, 'bin'), 'claude');
   await isolatedEnvironment(t, parent, { bin: path.dirname(claude) });
-  const database = path.join(workspace, '.theater', 'state.sqlite3');
+  const database = path.join(workspace, '.overdrive', 'state.sqlite3');
   for (const suffix of ['-wal', '-shm']) await fs.rm(`${database}${suffix}`, { force: true });
   await fs.writeFile(database, 'this is not a SQLite database'.repeat(200));
   const report = await doctorWorkspace({ workspace_path: workspace });

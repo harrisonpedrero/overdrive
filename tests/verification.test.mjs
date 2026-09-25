@@ -5,33 +5,33 @@ import path from 'node:path';
 import os from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { createAgentRuntime } from '../plugins/feature-theater/scripts/agent-runtime.mjs';
-import { WorkerBridge } from '../plugins/feature-theater/scripts/app-server.mjs';
-import { callTool } from '../plugins/feature-theater/scripts/tools.mjs';
-import { git, withWorkspaceLock } from '../plugins/feature-theater/scripts/util.mjs';
-import { readEvidence, runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
-import { drainCheckQueue, enqueueChecks } from '../plugins/feature-theater/scripts/check-queue.mjs';
-import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards, markDescendantsUnconfirmed, readUnconfirmedDescendants, attestDescendantsStopped } from '../plugins/feature-theater/scripts/workspace.mjs';
+import { createAgentRuntime } from '../plugins/overdrive/scripts/agent-runtime.mjs';
+import { WorkerBridge } from '../plugins/overdrive/scripts/app-server.mjs';
+import { callTool } from '../plugins/overdrive/scripts/tools.mjs';
+import { git, withWorkspaceLock } from '../plugins/overdrive/scripts/util.mjs';
+import { readEvidence, runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
+import { drainCheckQueue, enqueueChecks } from '../plugins/overdrive/scripts/check-queue.mjs';
+import { initializeManagedProject, createFeature, recordCandidate, setFeatureStatus, updateSpec, getFeatureContext, listFeatures, bindAgentSession, saveAgentSession, registerWorkerGuard, readWorkerGuards, clearWorkerGuards, markDescendantsUnconfirmed, readUnconfirmedDescendants, attestDescendantsStopped } from '../plugins/overdrive/scripts/workspace.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 test('every accepted slug length acquires its own control lock for checks, candidates and agent turns', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-long-slug-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-long-slug-'));
   const runtime = createAgentRuntime(new WorkerBridge({ claude: { launch: { command: process.execPath, args: [path.join(here, 'fixtures', 'fake-claude-cli.mjs')] } } }));
   t.after(async () => {
     await runtime.shutdownAgentRuntime();
     await fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 });
   });
-  await callTool('theater_project_create', { workspace_path: workspace, project_name: 'Long slugs', description: 'Exercise slug boundaries.', harness: 'claude' });
+  await callTool('project_create', { workspace_path: workspace, project_name: 'Long slugs', description: 'Exercise slug boundaries.', harness: 'claude' });
   const slug = (length, lead = 'l') => `${lead}${'a'.repeat(length - 1)}`;
   const slugs = [slug(55), slug(56), slug(63), slug(63, 'm')];
   assert.deepEqual(slugs.map(value => value.length), [55, 56, 63, 63]);
   for (const feature of slugs) {
     const args = { workspace_path: workspace, feature };
-    await callTool('theater_feature_create', { ...args, title: `Length ${feature.length}`, outcome: 'Operates under its control lock.', spec: '# Long\n\nThe README exists.' });
-    await callTool('theater_checks_update', { ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
-    assert.equal((await callTool('theater_checks_run', args)).verification.ready, true);
-    await callTool('theater_candidate_record', { ...args, summary: 'Ready.', checks: ['README receipt'] });
+    await callTool('feature_create', { ...args, title: `Length ${feature.length}`, outcome: 'Operates under its control lock.', spec: '# Long\n\nThe README exists.' });
+    await callTool('checks_update', { ...args, checks: [{ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }] });
+    assert.equal((await callTool('checks_run', args)).verification.ready, true);
+    await callTool('candidate_record', { ...args, summary: 'Ready.', checks: ['README receipt'] });
     const started = await runtime.startFeatureAgent({ ...args, instruction: 'Write one file.' });
     assert.ok(started.threadId);
     for (let attempt = 0; (await getFeatureContext(args)).feature.agent.status !== 'idle'; attempt++) {
@@ -53,15 +53,15 @@ test('every accepted slug length acquires its own control lock for checks, candi
   }
   for (const [feature, code] of [[slug(64), 'INVALID_INPUT'], [`${slug(30)}--${slug(31)}`, 'INVALID_SLUG'], [`1${slug(62)}`, 'INVALID_SLUG']]) {
     const refused = { workspace_path: workspace, feature };
-    await assert.rejects(callTool('theater_feature_create', { ...refused, title: 'Refused', outcome: 'Refused.', spec: '# Refused' }), error => error.code === code, feature);
-    await assert.rejects(callTool('theater_checks_update', { ...refused, checks: [] }), error => error.code === code, feature);
-    await assert.rejects(callTool('theater_candidate_record', { ...refused, summary: 'No lane.', checks: [] }), error => error.code === code, feature);
+    await assert.rejects(callTool('feature_create', { ...refused, title: 'Refused', outcome: 'Refused.', spec: '# Refused' }), error => error.code === code, feature);
+    await assert.rejects(callTool('checks_update', { ...refused, checks: [] }), error => error.code === code, feature);
+    await assert.rejects(callTool('candidate_record', { ...refused, summary: 'No lane.', checks: [] }), error => error.code === code, feature);
     await assert.rejects(runtime.startFeatureAgent(refused), error => error.code === code, feature);
   }
 });
 
 test('latest required receipt and current specification gate delivery; dirty checks cannot pass', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-evidence-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-evidence-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'alpha' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Evidence', description: 'Exercise actual receipt gates.' });
@@ -90,7 +90,7 @@ test('latest required receipt and current specification gate delivery; dirty che
 });
 
 test('an archived lane refuses candidates until it is explicitly reactivated', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-archived-candidate-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-archived-candidate-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'shelved' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Archive', description: 'Archive stays terminal.' });
@@ -115,7 +115,7 @@ test('an archived lane refuses candidates until it is explicitly reactivated', a
 });
 
 test('a paused lane refuses candidates until it is explicitly resumed', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-paused-candidate-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-paused-candidate-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'held' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Pause', description: 'Pause stays a boundary.' });
@@ -142,7 +142,7 @@ test('a paused lane refuses candidates until it is explicitly resumed', async t 
 });
 
 test('candidate checks come only from executed receipts; caller check strings stay unverified notes', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-candidate-provenance-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-candidate-provenance-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'proven' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Provenance', description: 'Candidate checks are receipts.' });
@@ -158,7 +158,7 @@ test('candidate checks come only from executed receipts; caller check strings st
   assert.deepEqual(run.receipts.map(receipt => [receipt.key, receipt.passed]), [['readme', true], ['browser', false]]);
   const [readme, browser] = run.receipts;
   const invented = ['security audit: passed', 'browser e2e: passed'];
-  const recorded = await callTool('theater_candidate_record', { ...args, summary: 'Ready.', checks: invented });
+  const recorded = await callTool('candidate_record', { ...args, summary: 'Ready.', checks: invented });
 
   const expected = [`readme: passed · receipt ${readme.id}`, `browser (optional): failed · receipt ${browser.id}`];
   assert.deepEqual(recorded.checks, expected);
@@ -181,7 +181,7 @@ test('candidate checks come only from executed receipts; caller check strings st
     // Only the label is inspected: hex receipt ids can contain any of these letters.
     assert.equal(shown.some(entry => /security|e2e|lint/.test(entry.split(' · receipt ')[0])), false);
   }
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   try {
     assert.deepEqual(JSON.parse(db.prepare('SELECT checks_json FROM candidates WHERE id = ?').get(recorded.candidateId).checks_json), expected);
     // The runtime's provenance marker is what makes these strings executed checks.
@@ -200,7 +200,7 @@ test('candidate checks come only from executed receipts; caller check strings st
 
   // Rows written before receipt provenance stay readable, but carry no runtime marker: their strings are
   // historical caller claims, never shown as run, even when they exactly match a real receipt's text.
-  const statePath = path.join(workspace, '.theater', 'state.sqlite3');
+  const statePath = path.join(workspace, '.overdrive', 'state.sqlite3');
   const legacyClaims = ['npm test: passed', ...expected, `browser: passed · receipt ${browser.id} · reused`];
   const forgeLegacy = claims => {
     const raw = new DatabaseSync(statePath);
@@ -244,7 +244,7 @@ test('candidate checks come only from executed receipts; caller check strings st
   const projectedDetails = { candidateId: 'candidate-legacy', clean: true, checks: [], unverifiedChecks: legacyDetails.checks, checkProvenance: 'legacy-caller-reported' };
   const views = [
     (await getFeatureContext({ ...args, timeline_limit: 200 })).timeline,
-    (await callTool('theater_timeline', { ...args, limit: 200 })).events,
+    (await callTool('timeline', { ...args, limit: 200 })).events,
   ];
   for (const timeline of views) {
     const legacyEvent = timeline.find(entry => entry.id === legacyEventId);
@@ -257,7 +257,7 @@ test('candidate checks come only from executed receipts; caller check strings st
       assert.equal('unverifiedChecks' in marked.details, false);
     }
   }
-  const activity = (await callTool('theater_state', { ...args, components: ['activity'] })).selected.activity;
+  const activity = (await callTool('state', { ...args, components: ['activity'] })).selected.activity;
   assert.equal(activity.find(entry => entry.id === legacyEventId).summary, projectedSummary);
   assert.match(activity.find(entry => entry.kind === 'candidate.recorded' && entry.id !== legacyEventId).summary, /with 1 executed check receipt\(s\)\.$/);
   const stored = new DatabaseSync(statePath);
@@ -266,7 +266,7 @@ test('candidate checks come only from executed receipts; caller check strings st
 });
 
 test('marked candidate rows and events display only checks bound to the marker receipts', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-candidate-tamper-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-candidate-tamper-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'bound' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Bound', description: 'Marked checks bind to receipts.' });
@@ -276,11 +276,11 @@ test('marked candidate rows and events display only checks bound to the marker r
     { key: 'browser', purpose: 'Optional browser pass', required: false, argv: [process.execPath, '-e', 'process.exit(3)'] },
   ] });
   const [readme, browser] = (await runChecks(args)).receipts;
-  const recorded = await callTool('theater_candidate_record', { ...args, summary: 'Ready.' });
+  const recorded = await callTool('candidate_record', { ...args, summary: 'Ready.' });
   const expected = [`readme: passed · receipt ${readme.id}`, `browser (optional): failed · receipt ${browser.id}`];
   assert.deepEqual(recorded.checks, expected);
 
-  const statePath = path.join(workspace, '.theater', 'state.sqlite3');
+  const statePath = path.join(workspace, '.overdrive', 'state.sqlite3');
   const sql = (query, ...values) => {
     const db = new DatabaseSync(statePath);
     try { return db.prepare(query).run(...values); } finally { db.close(); }
@@ -298,9 +298,9 @@ test('marked candidate rows and events display only checks bound to the marker r
   const candidate = async () => (await getFeatureContext(args)).candidates.find(entry => entry.id === recorded.candidateId);
   const eventViews = async () => {
     const find = timeline => timeline.find(entry => entry.id === Number(original.event.id));
-    return [find((await getFeatureContext({ ...args, timeline_limit: 200 })).timeline), find((await callTool('theater_timeline', { ...args, limit: 200 })).events)];
+    return [find((await getFeatureContext({ ...args, timeline_limit: 200 })).timeline), find((await callTool('timeline', { ...args, limit: 200 })).events)];
   };
-  const activitySummary = async () => (await callTool('theater_state', { ...args, components: ['activity'] })).selected.activity.find(entry => entry.id === Number(original.event.id)).summary;
+  const activitySummary = async () => (await callTool('state', { ...args, components: ['activity'] })).selected.activity.find(entry => entry.id === Number(original.event.id)).summary;
   const bound = value => [value.checks, value.unverifiedChecks ?? [], value.checkProvenance ?? 'executed-receipts'];
 
   // Altered saved row strings are never promoted; verified checks still come from the marker's receipts.
@@ -356,14 +356,14 @@ test('marked candidate rows and events display only checks bound to the marker r
 });
 
 test('marker receipts must be eligible under the candidate contract; stale same-revision receipts verify nothing', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-candidate-contract-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-candidate-contract-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'contracted' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Contracted', description: 'Marker receipts bind to the candidate contract.' });
   await createFeature({ ...args, title: 'Contracted', outcome: 'Only eligible receipts verify.', spec: '# Contracted\n\nThe README exists.' });
   const readmeCheck = (extra = {}) => ({ key: 'readme', purpose: 'Read the committed README', argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"], ...extra });
   const lintCheck = extra => ({ key: 'lint', purpose: 'Lint the README', argv: [process.execPath, '-e', 'process.exit(0)'], ...extra });
-  const statePath = path.join(workspace, '.theater', 'state.sqlite3');
+  const statePath = path.join(workspace, '.overdrive', 'state.sqlite3');
   const sql = (query, ...values) => {
     const db = new DatabaseSync(statePath);
     try { return db.prepare(query).get(...values); } finally { db.close(); }
@@ -442,7 +442,7 @@ test('marker receipts must be eligible under the candidate contract; stale same-
 });
 
 test('restoring an exact contract recognizes its receipt past newer passes from other contracts, but not past a newer failure', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-restore-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-restore-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'restore' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Restore', description: 'Return to an earlier check contract.' });
@@ -493,7 +493,7 @@ test('restoring an exact contract recognizes its receipt past newer passes from 
 });
 
 test('a Claude worker guard that outlives its completed turn blocks checks and candidates until it clears', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-live-worker-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-live-worker-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'lingering' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Lingering', description: 'A worker can outlive its turn.' });
@@ -505,7 +505,7 @@ test('a Claude worker guard that outlives its completed turn blocks checks and c
   await registerWorkerGuard({ ...args, thread_id: 'claude-thread', guard_id: 'live-process' });
   await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
   const executedReceipts = () => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
     try { return db.prepare("SELECT id FROM evidence WHERE source = 'executed' ORDER BY rowid").all().map(row => row.id); }
     finally { db.close(); }
   };
@@ -543,7 +543,7 @@ test('a Claude worker guard that outlives its completed turn blocks checks and c
 });
 
 test('an unconfirmed-descendants marker blocks checks and candidates until an attestation clears it', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-descendants-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-descendants-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'orphans' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Orphans', description: 'Tools can outlive their worker.' });
@@ -557,7 +557,7 @@ test('an unconfirmed-descendants marker blocks checks and candidates until an at
   await saveAgentSession({ ...args, thread_id: 'claude-thread', status: 'idle' });
   assert.deepEqual(await readWorkerGuards(args), []);
   const executedReceipts = () => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
     try { return db.prepare("SELECT id FROM evidence WHERE source = 'executed' ORDER BY rowid").all().map(row => row.id); }
     finally { db.close(); }
   };
@@ -603,7 +603,7 @@ test('an unconfirmed-descendants marker blocks checks and candidates until an at
 });
 
 test('a worker guard or unconfirmed-descendants marker blocks completion until it clears', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-completion-worker-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-completion-worker-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'finishing' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Finishing', description: 'Completion waits for stopped workers.' });
@@ -641,7 +641,7 @@ test('a worker guard or unconfirmed-descendants marker blocks completion until i
 });
 
 test('a worker guard or running status saved while completion reads the checkout still refuses it', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-completion-race-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-completion-race-'));
   const started = path.join(workspace, 'snapshot-started');
   const release = path.join(workspace, 'snapshot-release');
   t.after(async () => {
@@ -698,7 +698,7 @@ process.exit(1);
 });
 
 test('a queued check waits for a direct run in its clone and is judged once that run settles', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-direct-overlap-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-direct-overlap-'));
   const release = path.join(workspace, 'release');
   let direct;
   t.after(async () => {
@@ -755,7 +755,7 @@ test('a queued check waits for a direct run in its clone and is judged once that
 });
 
 test('checks execute in saved order and reordering changes the contract', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-order-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-order-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'order' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Order', description: 'Setup precedes dependent checks.' });
@@ -788,12 +788,12 @@ test('checks execute in saved order and reordering changes the contract', async 
 });
 
 test('version-2 data migrates without turning historical claims into current proof', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-migration-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-migration-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const args = { workspace_path: workspace, feature: 'legacy' };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Legacy', description: 'Preserve history.' });
   const lane = await createFeature({ ...args, title: 'Legacy', outcome: 'Preserve historical work.', spec: '# Legacy\n\nOriginal intent.' });
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   const feature = db.prepare('SELECT * FROM features WHERE slug = ?').get('legacy');
   db.prepare("INSERT INTO evidence(id, feature_id, kind, summary, revision, passed, created_at) VALUES ('old-evidence', ?, 'test', 'Previously reported pass', ?, 1, ?)").run(feature.id, lane.feature.baseRevision, new Date().toISOString());
   db.prepare("INSERT INTO candidates(id, feature_id, revision, base_revision, summary, checks_json, status, created_at) VALUES ('old-candidate', ?, ?, ?, 'Old accepted candidate', '[]', 'accepted', ?)").run(feature.id, lane.feature.baseRevision, lane.feature.baseRevision, new Date().toISOString());
@@ -807,7 +807,7 @@ test('version-2 data migrates without turning historical claims into current pro
   assert.equal(context.candidates[0].status, 'superseded');
   assert.equal(context.evidence[0].source, 'reported');
   assert.equal(context.verification.ready, false);
-  await fs.writeFile(path.join(workspace, '.theater', 'features', 'legacy', 'spec.md'), 'STALE PROJECTION');
+  await fs.writeFile(path.join(workspace, '.overdrive', 'features', 'legacy', 'spec.md'), 'STALE PROJECTION');
   await getFeatureContext(args);
-  assert.match(await fs.readFile(path.join(workspace, '.theater', 'features', 'legacy', 'spec.md'), 'utf8'), /Original intent/);
+  assert.match(await fs.readFile(path.join(workspace, '.overdrive', 'features', 'legacy', 'spec.md'), 'utf8'), /Original intent/);
 });

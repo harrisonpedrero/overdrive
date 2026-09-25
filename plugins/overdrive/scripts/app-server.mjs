@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import fsSync from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { TheaterError, refusedRequest } from './util.mjs';
+import { OverdriveError, refusedRequest } from './util.mjs';
 import { ClaudeWorkerBridge } from './claude-worker.mjs';
 
 const DEFAULT_REQUEST_TIMEOUT = 120_000;
@@ -29,7 +29,7 @@ function tomlKeySegment(value) {
 }
 
 export function isolatedMcpConfigArgs(servers) {
-  if (!Array.isArray(servers)) throw new TheaterError('Codex returned an unexpected MCP inventory.', 'CODEX_CONFIG_INVALID');
+  if (!Array.isArray(servers)) throw new OverdriveError('Codex returned an unexpected MCP inventory.', 'CODEX_CONFIG_INVALID');
   return servers
     .filter(server => server?.enabled && typeof server.name === 'string')
     .flatMap(server => {
@@ -49,11 +49,11 @@ function disabledMcpOverrides(executable) {
     maxBuffer: 5_000_000,
   });
   if (listed.status !== 0 || listed.error) {
-    throw new TheaterError('Unable to inventory configured MCP servers for an isolated feature task. Repair the Codex configuration and retry.', 'CODEX_CONFIG_INVALID');
+    throw new OverdriveError('Unable to inventory configured MCP servers for an isolated feature task. Repair the Codex configuration and retry.', 'CODEX_CONFIG_INVALID');
   }
   let servers;
   try { servers = JSON.parse(listed.stdout); }
-  catch { throw new TheaterError('Codex returned an invalid MCP inventory; refusing to start a feature task without tool isolation.', 'CODEX_CONFIG_INVALID'); }
+  catch { throw new OverdriveError('Codex returned an invalid MCP inventory; refusing to start a feature task without tool isolation.', 'CODEX_CONFIG_INVALID'); }
   return isolatedMcpConfigArgs(servers);
 }
 
@@ -114,8 +114,8 @@ export class CodexAppServer extends EventEmitter {
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => { if (this.child === child) this.#receive(chunk); });
     child.stderr.on('data', chunk => { this.stderrTail = (this.stderrTail + chunk).slice(-16_000); });
-    child.once('error', error => { if (this.child === child) this.#failed(new TheaterError(`Unable to launch Codex app-server: ${error.message}`, 'CODEX_LAUNCH_FAILED')); });
-    child.once('exit', code => { if (this.child === child) this.#failed(new TheaterError(`Codex app-server exited (${code}). ${this.stderrTail.trim()}`.trim(), 'CODEX_EXITED')); });
+    child.once('error', error => { if (this.child === child) this.#failed(new OverdriveError(`Unable to launch Codex app-server: ${error.message}`, 'CODEX_LAUNCH_FAILED')); });
+    child.once('exit', code => { if (this.child === child) this.#failed(new OverdriveError(`Codex app-server exited (${code}). ${this.stderrTail.trim()}`.trim(), 'CODEX_EXITED')); });
     await new Promise((resolve, reject) => {
       child.once('spawn', resolve);
       child.once('error', reject);
@@ -157,7 +157,7 @@ export class CodexAppServer extends EventEmitter {
         if (!pending) continue;
         clearTimeout(pending.timer);
         this.pending.delete(String(message.id));
-        if (message.error) pending.reject(refusedRequest(new TheaterError(message.error.message || JSON.stringify(message.error), 'CODEX_RPC_ERROR', message.error)));
+        if (message.error) pending.reject(refusedRequest(new OverdriveError(message.error.message || JSON.stringify(message.error), 'CODEX_RPC_ERROR', message.error)));
         else pending.resolve(message.result);
         continue;
       }
@@ -175,18 +175,18 @@ export class CodexAppServer extends EventEmitter {
   }
 
   notify(method, params) {
-    if (!this.child?.stdin?.writable) throw new TheaterError('Codex app-server is not running.', 'CODEX_NOT_RUNNING');
+    if (!this.child?.stdin?.writable) throw new OverdriveError('Codex app-server is not running.', 'CODEX_NOT_RUNNING');
     this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
   }
 
   async request(method, params, timeoutMs = this.requestTimeoutMs, skipEnsure = false) {
     if (!skipEnsure) await this.ensureStarted().catch(error => { throw refusedRequest(error); });
-    if (!this.child?.stdin?.writable) throw refusedRequest(new TheaterError('Codex app-server is not running.', 'CODEX_NOT_RUNNING'));
+    if (!this.child?.stdin?.writable) throw refusedRequest(new OverdriveError('Codex app-server is not running.', 'CODEX_NOT_RUNNING'));
     const id = this.nextId++;
     const response = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(String(id));
-        reject(new TheaterError(`Codex request timed out: ${method}`, 'CODEX_TIMEOUT'));
+        reject(new OverdriveError(`Codex request timed out: ${method}`, 'CODEX_TIMEOUT'));
       }, timeoutMs);
       this.pending.set(String(id), { resolve, reject, timer, method });
     });
@@ -197,8 +197,8 @@ export class CodexAppServer extends EventEmitter {
   respondToServer(requestId, result, error = undefined) {
     const key = String(requestId);
     const request = this.serverRequests.get(key);
-    if (!request) throw new TheaterError(`App-server request is no longer live: ${key}`, 'REQUEST_ORPHANED');
-    if (!this.child?.stdin?.writable) throw new TheaterError('Codex app-server is not running.', 'CODEX_NOT_RUNNING');
+    if (!request) throw new OverdriveError(`App-server request is no longer live: ${key}`, 'REQUEST_ORPHANED');
+    if (!this.child?.stdin?.writable) throw new OverdriveError('Codex app-server is not running.', 'CODEX_NOT_RUNNING');
     const message = error
       ? { id: request.id, error: { code: -32000, message: String(error) } }
       : { id: request.id, result };
@@ -279,7 +279,7 @@ export class CodexAppServer extends EventEmitter {
   shutdown() {
     const child = this.child;
     if (!child) return;
-    this.#failed(new TheaterError('Codex app-server connection closed.', 'CODEX_CLOSED'));
+    this.#failed(new OverdriveError('Codex app-server connection closed.', 'CODEX_CLOSED'));
     if (!child.killed) child.kill();
   }
 }
@@ -295,7 +295,7 @@ export class WorkerBridge extends EventEmitter {
   }
 
   backend(harness = 'codex') {
-    if (!HARNESSES.has(harness)) throw refusedRequest(new TheaterError(`Unknown worker harness: ${harness}`, 'INVALID_STATE'));
+    if (!HARNESSES.has(harness)) throw refusedRequest(new OverdriveError(`Unknown worker harness: ${harness}`, 'INVALID_STATE'));
     let backend = this.backends.get(harness);
     if (backend) return backend;
     backend = this.factories[harness]();
@@ -316,9 +316,9 @@ export class WorkerBridge extends EventEmitter {
   // session confirms it and a disagreement is refused instead of silently rerouted.
   owner(threadId, harness) {
     const loaded = this.threads.get(threadId);
-    if (loaded && harness && loaded !== harness) throw refusedRequest(new TheaterError(`Native session ${threadId} belongs to the ${loaded} harness, not ${harness}.`, 'SESSION_OWNER_CONFLICT'));
+    if (loaded && harness && loaded !== harness) throw refusedRequest(new OverdriveError(`Native session ${threadId} belongs to the ${loaded} harness, not ${harness}.`, 'SESSION_OWNER_CONFLICT'));
     const owner = loaded ?? harness;
-    if (!owner) throw refusedRequest(new TheaterError(`Native session ${threadId} has no recorded owning harness.`, 'SESSION_OWNER_UNKNOWN'));
+    if (!owner) throw refusedRequest(new OverdriveError(`Native session ${threadId} has no recorded owning harness.`, 'SESSION_OWNER_UNKNOWN'));
     return owner;
   }
 
@@ -381,7 +381,7 @@ export class WorkerBridge extends EventEmitter {
     for (const backend of this.backends.values()) {
       if (backend.liveRequest(requestId)) return backend.respondToServer(requestId, result, error);
     }
-    throw new TheaterError(`Worker request is no longer live: ${requestId}`, 'REQUEST_ORPHANED');
+    throw new OverdriveError(`Worker request is no longer live: ${requestId}`, 'REQUEST_ORPHANED');
   }
 
   // Resolves once every backend has shut down, reporting processes a backend could not stop.

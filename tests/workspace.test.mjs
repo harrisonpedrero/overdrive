@@ -5,8 +5,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { git } from '../plugins/feature-theater/scripts/util.mjs';
-import { runChecks, updateChecks } from '../plugins/feature-theater/scripts/verification.mjs';
+import { git } from '../plugins/overdrive/scripts/util.mjs';
+import { runChecks, updateChecks } from '../plugins/overdrive/scripts/verification.mjs';
 import {
   checkpointFeature,
   createFeature,
@@ -26,18 +26,18 @@ import {
   switchFeature,
   updateSpec,
   updateWork,
-} from '../plugins/feature-theater/scripts/workspace.mjs';
+} from '../plugins/overdrive/scripts/workspace.mjs';
 
 async function fixture(t) {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-'));
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-'));
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
   const source = path.join(parent, 'source');
   const workspace = path.join(parent, 'workspace');
   await fs.mkdir(source);
   await fs.mkdir(workspace);
   await git(source, 'init', '-b', 'main');
-  await git(source, 'config', 'user.name', 'Feature Theater Test');
-  await git(source, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(source, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(source, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(source, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }, null, 2));
   await fs.writeFile(path.join(source, 'package-lock.json'), '{}\n');
   await fs.writeFile(path.join(source, 'app.js'), 'export const value = 1;\n');
@@ -89,8 +89,8 @@ test('an exact sibling revision seeds a lane while canonical source is unavailab
   const canonicalBase = (await git(source, 'rev-parse', 'HEAD')).stdout;
   await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Supplies a sibling base.' });
   const lane = path.join(workspace, 'features', 'lane', 'repo');
-  await git(lane, 'config', 'user.name', 'Feature Theater Test');
-  await git(lane, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(lane, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(lane, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(lane, 'app.js'), 'export const value = 2;\n');
   await git(lane, 'commit', '-am', 'selected');
   const selected = (await git(lane, 'rev-parse', 'HEAD')).stdout;
@@ -144,15 +144,15 @@ test('setup and check hints describe each lane\'s selected base while the canoni
   await git(source, 'checkout', '-q', 'main');
   const rust = { ecosystems: ['rust'], setupCandidates: [['cargo', 'fetch']], checkCandidates: [['cargo', 'test']] };
   const hints = profile => ({ ecosystems: profile.ecosystems, setupCandidates: profile.setupCandidates, checkCandidates: profile.checkCandidates });
-  const cachedProfile = async () => JSON.parse(await fs.readFile(path.join(workspace, 'theater.json'), 'utf8')).repositoryProfile;
+  const cachedProfile = async () => JSON.parse(await fs.readFile(path.join(workspace, 'overdrive.json'), 'utf8')).repositoryProfile;
 
   const initialized = await initializeWorkspace({ workspace_path: workspace, repository: source });
   assert.deepEqual(hints(initialized.repositoryProfile), rust);
   const lane = await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Supplies a sibling base.' });
   assert.deepEqual(lane.repositoryProfile, initialized.repositoryProfile);
   const laneRepo = path.join(workspace, 'features', 'lane', 'repo');
-  await git(laneRepo, 'config', 'user.name', 'Feature Theater Test');
-  await git(laneRepo, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(laneRepo, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(laneRepo, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(laneRepo, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
   await git(laneRepo, 'add', 'package.json');
   await git(laneRepo, 'commit', '-m', 'node');
@@ -198,7 +198,7 @@ test('an invalid spec is rejected before any feature clone and a corrected retry
 });
 
 test('starts from scratch and promotes an accepted candidate into the next lane base', async t => {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-scratch-'));
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-scratch-'));
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
   const workspace = path.join(parent, 'workspace');
   await fs.mkdir(workspace);
@@ -221,8 +221,8 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     spec: '# Foundation\n\napp.txt contains the working foundation.\n',
   });
   const repo = foundation.feature.checkoutPath;
-  await git(repo, 'config', 'user.name', 'Feature Theater Test');
-  await git(repo, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(repo, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(repo, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(repo, 'app.txt'), 'atlas foundation\n');
   await git(repo, 'add', 'app.txt');
   await git(repo, 'commit', '-m', 'Build foundation');
@@ -253,8 +253,8 @@ test('starts from scratch and promotes an accepted candidate into the next lane 
     outcome: 'Exercise divergent-candidate protection.',
     spec: '# Alternate\n\nalternate.txt contains the alternate foundation.\n',
   });
-  await git(stale.feature.checkoutPath, 'config', 'user.name', 'Feature Theater Test');
-  await git(stale.feature.checkoutPath, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(stale.feature.checkoutPath, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(stale.feature.checkoutPath, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(stale.feature.checkoutPath, 'alternate.txt'), 'alternate foundation\n');
   await git(stale.feature.checkoutPath, 'add', 'alternate.txt');
   await git(stale.feature.checkoutPath, 'commit', '-m', 'Build alternate foundation');
@@ -339,8 +339,8 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
 
   await updateWork({ workspace_path: workspace, feature: 'alpha', key: 'build', status: 'running', owner: 'astra' });
   const repo = path.join(workspace, 'features', 'alpha', 'repo');
-  await git(repo, 'config', 'user.name', 'Feature Theater Test');
-  await git(repo, 'config', 'user.email', 'feature-theater@example.invalid');
+  await git(repo, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(repo, 'config', 'user.email', 'overdrive@example.invalid');
   await fs.writeFile(path.join(repo, 'app.js'), 'export const value = 2;\n');
   await git(repo, 'add', 'app.js');
   await git(repo, 'commit', '-m', 'Implement alpha');
@@ -374,7 +374,7 @@ test('versions specs, enforces the work DAG and records an exact candidate', asy
     error => error.code === 'NOT_MANAGED_PROJECT',
   );
   // A done lane gains no running claim, even from a reclaimable item a legacy build left behind.
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   try { db.prepare("UPDATE work_items SET status = 'failed', blocker = 'Legacy failure.' WHERE item_key = 'validate'").run(); } finally { db.close(); }
   await assert.rejects(
     updateWork({ workspace_path: workspace, feature: 'alpha', key: 'validate', status: 'running', owner: 'astra' }),
@@ -413,7 +413,7 @@ test('checkpoints and switches focus without moving active clones', async t => {
   assert.equal(switched.coordinatorCompactionRecommended, true);
   assert.ok(await fs.stat(path.join(workspace, 'features', 'alpha', 'repo', '.git')));
   assert.ok(await fs.stat(path.join(workspace, 'features', 'beta', 'repo', '.git')));
-  const index = await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8');
+  const index = await fs.readFile(path.join(workspace, '.overdrive', 'index.md'), 'utf8');
   assert.match(index, /Focused feature: beta/);
 });
 
@@ -438,7 +438,7 @@ test('archiving the focused lane clears focus so active lanes switch without che
   const listed = await listFeatures({ workspace_path: workspace });
   assert.deepEqual(listed.features.map(item => [item.slug, item.focused]), [['beta', false]]);
   assert.deepEqual(await focusOf(), []);
-  assert.match(await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8'), /Focused feature: none/);
+  assert.match(await fs.readFile(path.join(workspace, '.overdrive', 'index.md'), 'utf8'), /Focused feature: none/);
   const history = await getFeatureContext({ ...lane('alpha'), timeline_limit: 50 });
   assert.equal(history.feature.status, 'archived');
   assert.equal(history.feature.summary, 'Shelved.');
@@ -479,7 +479,7 @@ test('a workspace that still focuses an archived lane switches without checkpoin
   await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
   await setFeatureStatus({ workspace_path: workspace, feature: 'alpha', status: 'archived', disposition: 'Shelved.' });
   // Archives recorded before focus clearing left the archived lane focused.
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   try { db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('focus', 'alpha')").run(); } finally { db.close(); }
   const switched = await switchFeature({ workspace_path: workspace, feature: 'beta' });
   assert.equal(switched.focus, 'beta');
@@ -555,7 +555,7 @@ test('keeps checkpoints fresh across focus round-trips until the lane changes, e
   // Repairing inconsistent readiness on a read is still a work-status change.
   await planWork({ ...alpha, items: [{ key: 'docs', title: 'Docs' }] });
   await checkpointFeature({ ...alpha, summary: 'Docs are planned.', next_action: 'Continue.' });
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   db.prepare("UPDATE work_items SET status = 'planned' WHERE item_key = 'docs'").run();
   db.close();
   assert.equal((await getFeatureContext(alpha)).workItems.find(item => item.item_key === 'docs').status, 'ready');
@@ -563,14 +563,14 @@ test('keeps checkpoints fresh across focus round-trips until the lane changes, e
 });
 
 test('renewing running work without new text keeps its saved progress and checkpoint', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-renewal-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-renewal-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   freezeClock(t);
   const alpha = { workspace_path: workspace, feature: 'alpha' };
   const beta = { workspace_path: workspace, feature: 'beta' };
   const build = async () => (await getFeatureContext(alpha)).workItems.find(item => item.item_key === 'build');
   const generation = () => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'), { readOnly: true });
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'), { readOnly: true });
     try { return Number(db.prepare("SELECT semantic_generation FROM features WHERE slug = 'alpha'").get().semantic_generation); } finally { db.close(); }
   };
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Renewal', description: 'Exercise lease renewal.' });
@@ -616,21 +616,21 @@ test('renewing running work without new text keeps its saved progress and checkp
 });
 
 test('paused and archived lanes refuse new running claims but keep renewal and outcome bookkeeping', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-inactive-claim-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-inactive-claim-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   freezeClock(t);
   const alpha = { workspace_path: workspace, feature: 'alpha' };
   const item = async key => (await getFeatureContext(alpha)).workItems.find(candidate => candidate.item_key === key);
   // Everything a refused claim must leave untouched, read without rewriting the packet.
   const laneState = async () => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'), { readOnly: true });
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'), { readOnly: true });
     try {
       const feature = db.prepare("SELECT id, status, next_action, semantic_generation, updated_at FROM features WHERE slug = 'alpha'").get();
       return {
         feature: { ...feature },
         work: db.prepare('SELECT item_key, status, owner, result_summary, blocker, lease_expires_at, updated_at FROM work_items WHERE feature_id = ? ORDER BY item_key').all(feature.id).map(row => ({ ...row })),
         events: Number(db.prepare('SELECT COUNT(*) AS count FROM events WHERE feature_id = ?').get(feature.id).count),
-        packet: await fs.readFile(path.join(workspace, '.theater', 'features', 'alpha', 'context.md'), 'utf8'),
+        packet: await fs.readFile(path.join(workspace, '.overdrive', 'features', 'alpha', 'context.md'), 'utf8'),
       };
     } finally { db.close(); }
   };
@@ -683,7 +683,7 @@ test('paused and archived lanes refuse new running claims but keep renewal and o
 });
 
 test('verification reopens a checkpointed lane only when it supersedes a candidate', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-freshness-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-freshness-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   freezeClock(t);
   const alpha = { workspace_path: workspace, feature: 'alpha' };
@@ -728,7 +728,7 @@ test('checkpoints saved before semantic generations must be renewed after upgrad
   await createFeature({ workspace_path: workspace, feature: 'beta', title: 'Beta', outcome: 'Beta outcome.' });
   await switchFeature(alpha);
   await checkpointFeature({ ...alpha, summary: 'Saved by schema 4.', next_action: 'Continue.' });
-  const file = path.join(workspace, '.theater', 'state.sqlite3');
+  const file = path.join(workspace, '.overdrive', 'state.sqlite3');
   let db = new DatabaseSync(file);
   const { id } = db.prepare('SELECT id FROM features WHERE slug = ?').get('alpha');
   db.exec('ALTER TABLE checkpoints DROP COLUMN semantic_generation; ALTER TABLE features DROP COLUMN semantic_generation');
@@ -740,7 +740,7 @@ test('checkpoints saved before semantic generations must be renewed after upgrad
 
   await switchRequiresCheckpoint(workspace, 'beta', 'legacy_checkpoint');
   db = new DatabaseSync(file);
-  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '6');
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '7');
   assert.deepEqual({ ...db.prepare('SELECT semantic_generation, thread_harness FROM features WHERE id = ?').get(id) }, { semantic_generation: 0, thread_harness: null });
   db.close();
   assert.equal((await checkpointFeature({ ...alpha, summary: 'Renewed after upgrade.', next_action: 'Continue.' })).semanticGeneration, 0);
@@ -751,8 +751,8 @@ const ARCHIVED = 'None. The lane is archived; its disposition records what shipp
 
 async function directions(workspace, feature) {
   const listed = (await listFeatures({ workspace_path: workspace, include_archived: true })).features.find(item => item.slug === feature);
-  const packet = await fs.readFile(path.join(workspace, '.theater', 'features', feature, 'context.md'), 'utf8');
-  const index = await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8');
+  const packet = await fs.readFile(path.join(workspace, '.overdrive', 'features', feature, 'context.md'), 'utf8');
+  const index = await fs.readFile(path.join(workspace, '.overdrive', 'index.md'), 'utf8');
   return {
     get: (await getFeatureContext({ workspace_path: workspace, feature })).feature.nextAction,
     list: listed.nextAction,
@@ -766,7 +766,7 @@ function agreeOn(observed, action) {
 }
 
 test('archiving gives unused and reviewed lanes a terminal direction that a later checkpoint can replace', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-archive-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-archive-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const unused = { workspace_path: workspace, feature: 'unused' };
   const reviewed = { workspace_path: workspace, feature: 'reviewed' };
@@ -789,7 +789,7 @@ test('archiving gives unused and reviewed lanes a terminal direction that a late
   agreeOn(await directions(workspace, 'reviewed'), ARCHIVED);
   // Older archives kept the candidate review text; it reads as archived until a checkpoint follows.
   const review = 'Review or integrate the exact recorded candidate.';
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   db.prepare("UPDATE features SET next_action = ? WHERE slug = 'reviewed'").run(review);
   db.close();
   assert.equal((await getFeatureContext(reviewed)).feature.nextAction, ARCHIVED);
@@ -803,13 +803,13 @@ test('archiving gives unused and reviewed lanes a terminal direction that a late
 });
 
 test('spec and work edits keep an archived lane archived until it is reactivated', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-archive-edit-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-archive-edit-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const lane = { workspace_path: workspace, feature: 'edited' };
   const noted = { workspace_path: workspace, feature: 'noted' };
   const plan = [{ key: 'readme', title: 'Write the README' }];
   const inspect = slug => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
     try {
       const row = db.prepare('SELECT id, spec_revision, semantic_generation FROM features WHERE slug = ?').get(slug);
       const candidates = db.prepare('SELECT status FROM candidates WHERE feature_id = ?').all(row.id).map(candidate => candidate.status);
@@ -839,7 +839,7 @@ test('spec and work edits keep an archived lane archived until it is reactivated
   const ready = 'Start or continue the highest-priority ready work.';
   const legacyArchive = async disposition => {
     await setFeatureStatus({ ...lane, status: 'archived', disposition });
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
     db.prepare("UPDATE features SET next_action = ? WHERE slug = 'edited'").run(review);
     db.close();
   };
@@ -900,19 +900,19 @@ test('spec and work edits keep an archived lane archived until it is reactivated
   await planWork({ ...noted, items: [...plan, { key: 'parser', title: 'Adopt the parser' }] });
   agreeOn(await directions(workspace, 'noted'), note);
   assert.equal((await setFeatureStatus({ ...noted, status: 'active' })).feature.nextAction, note);
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   const events = db.prepare("SELECT kind FROM events WHERE feature_id = (SELECT id FROM features WHERE slug = 'noted') ORDER BY id").all().map(event => event.kind);
   db.close();
   assert.deepEqual(events.slice(-6), ['feature.archived', 'feature.checkpointed', 'work.planned', 'spec.revised', 'work.planned', 'feature.active']);
 });
 
-const PAUSED = 'Paused. Resume the lane with theater_feature_status (status active) before claiming or dispatching work.';
+const PAUSED = 'Paused. Resume the lane with feature_status (status active) before claiming or dispatching work.';
 const READY = 'Start or continue the highest-priority ready work.';
 const REVIEW = 'Review or integrate the exact recorded candidate.';
 const pausedThen = next => `${PAUSED} Then: ${next}`;
 
 function storedDirection(workspace, slug) {
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   try {
     const row = db.prepare('SELECT id, next_action, semantic_generation FROM features WHERE slug = ?').get(slug);
     return { feature: row.next_action, checkpoint: db.prepare('SELECT next_action FROM checkpoints WHERE feature_id = ? ORDER BY rowid DESC LIMIT 1').get(row.id).next_action, generation: Number(row.semantic_generation) };
@@ -921,8 +921,8 @@ function storedDirection(workspace, slug) {
 
 // The persisted packet and index as written, read before any call that could rewrite them.
 async function persisted(workspace, feature) {
-  const packet = await fs.readFile(path.join(workspace, '.theater', 'features', feature, 'context.md'), 'utf8');
-  const index = await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8');
+  const packet = await fs.readFile(path.join(workspace, '.overdrive', 'features', feature, 'context.md'), 'utf8');
+  const index = await fs.readFile(path.join(workspace, '.overdrive', 'index.md'), 'utf8');
   return {
     context: packet.match(/^Next action: (.*)$/m)[1],
     index: index.split('\n').find(line => line.includes(`| ${feature} |`)).split('|').at(-2).trim(),
@@ -930,7 +930,7 @@ async function persisted(workspace, feature) {
 }
 
 test('a paused lane directs resuming first while its edits keep the post-resume direction', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-pause-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-pause-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const lane = { workspace_path: workspace, feature: 'held' };
   const plan = [{ key: 'readme', title: 'Write the README' }];
@@ -1001,7 +1001,7 @@ test('a paused lane directs resuming first while its edits keep the post-resume 
 });
 
 test('resuming a paused lane drops review direction only for a candidate superseded while paused', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-pause-review-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-pause-review-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }];
   await initializeManagedProject({ workspace_path: workspace, project_name: 'Pause review', description: 'Exercise paused candidate review.' });
@@ -1074,7 +1074,7 @@ test('resuming a paused lane drops review direction only for a candidate superse
 });
 
 test('superseding a candidate retires only its generated review direction on active, review, done and blocked lanes', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-superseded-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-superseded-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md'); if (require('node:fs').existsSync('.check-fails')) process.exit(7)"] }];
   const revised = check('Read the README, revised');
@@ -1092,14 +1092,14 @@ test('superseding a candidate retires only its generated review direction on act
     return lane;
   };
   const candidates = slug => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
     try { return db.prepare('SELECT c.status FROM candidates c JOIN features f ON f.id = c.feature_id WHERE f.slug = ? ORDER BY c.rowid').all(slug).map(row => row.status); }
     finally { db.close(); }
   };
   // Verification rewrites the saved packet and index itself; read them before anything else can.
   const saved = async slug => {
-    const packet = await fs.readFile(path.join(workspace, '.theater', 'features', slug, 'context.md'), 'utf8');
-    const row = (await fs.readFile(path.join(workspace, '.theater', 'index.md'), 'utf8')).split('\n').find(line => line.includes(`| ${slug} |`)).split('|');
+    const packet = await fs.readFile(path.join(workspace, '.overdrive', 'features', slug, 'context.md'), 'utf8');
+    const row = (await fs.readFile(path.join(workspace, '.overdrive', 'index.md'), 'utf8')).split('\n').find(line => line.includes(`| ${slug} |`)).split('|');
     return { ...await persisted(workspace, slug), contextStatus: packet.match(/^Status: (.*)$/m)[1], indexStatus: row[3].trim() };
   };
   const retiredTo = (next, status = 'active') => ({ context: next, index: next, contextStatus: status, indexStatus: status });
@@ -1192,7 +1192,7 @@ test('superseding a candidate retires only its generated review direction on act
 });
 
 test('reopening a completed lane directs delivery of its accepted candidate instead of reviewing it', async t => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'feature-theater-accepted-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-accepted-'));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const COMPLETED = 'The accepted candidate needs no further lane review. Complete any outstanding delivery through the repository workflow.';
   const check = purpose => [{ key: 'readme', purpose, argv: [process.execPath, '-e', "require('node:fs').readFileSync('README.md')"] }];
@@ -1214,7 +1214,7 @@ test('reopening a completed lane directs delivery of its accepted candidate inst
   };
 
   const candidates = slug => {
-    const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+    const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
     try { return db.prepare('SELECT c.status FROM candidates c JOIN features f ON f.id = c.feature_id WHERE f.slug = ? ORDER BY c.rowid').all(slug).map(row => row.status); }
     finally { db.close(); }
   };
@@ -1242,7 +1242,7 @@ test('reopening a completed lane directs delivery of its accepted candidate inst
   // A lane paused from completion that still stores the generated review text resumes the same way.
   const legacy = await completed('legacy');
   await setFeatureStatus({ ...legacy, status: 'paused' });
-  const db = new DatabaseSync(path.join(workspace, '.theater', 'state.sqlite3'));
+  const db = new DatabaseSync(path.join(workspace, '.overdrive', 'state.sqlite3'));
   db.prepare("UPDATE features SET next_action = ? WHERE slug = 'legacy'").run(REVIEW);
   db.close();
   assert.equal((await getFeatureContext(legacy)).feature.nextAction, PAUSED);
@@ -1326,7 +1326,7 @@ test('a worker given only a claimed key finds its saved details while the packet
   await planWork({ ...lane, items: [{ key: 'deliver', title: 'Deliver', description: 'Draft text.', acceptance }, other] });
   // A revision before the claim is what the worker sees, not the first draft.
   await planWork({ ...lane, items: [{ key: 'deliver', title: 'Deliver', description, acceptance }, other] });
-  const contextFile = path.join(workspace, '.theater', 'features', 'compat', 'context.md');
+  const contextFile = path.join(workspace, '.overdrive', 'features', 'compat', 'context.md');
   assert.equal(linkedDetails(await fs.readFile(contextFile, 'utf8'), 'deliver'), undefined);
 
   await updateWork({ ...lane, key: 'deliver', status: 'running', owner: 'worker' });

@@ -3,11 +3,11 @@ import { test } from 'node:test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { initializeManagedProject, createFeature, planWork, updateWork } from '../plugins/feature-theater/scripts/workspace.mjs';
-import { composeView, snapshotState, renderWorkGraph } from '../plugins/feature-theater/scripts/presentation.mjs';
+import { initializeManagedProject, createFeature, planWork, updateWork } from '../plugins/overdrive/scripts/workspace.mjs';
+import { composeView, snapshotState, renderWorkGraph } from '../plugins/overdrive/scripts/presentation.mjs';
 
 test('work graphs preserve dependencies and state without embedded controls or unrelated context', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-view-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-view-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const args = { workspace_path: root, feature: 'alpha' };
   await initializeManagedProject({ workspace_path: root, project_name: 'Views', description: 'Inspect states.' });
@@ -57,7 +57,7 @@ test('work graphs preserve dependencies and state without embedded controls or u
 });
 
 test('large graph pages keep a shared prerequisite beside its blocked dependents and cover every item once', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-view-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-view-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const args = { workspace_path: root, feature: 'wide' };
   await initializeManagedProject({ workspace_path: root, project_name: 'Views', description: 'Inspect pages.' });

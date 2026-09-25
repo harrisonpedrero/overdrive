@@ -6,7 +6,7 @@ import path from 'node:path';
 import { CANDIDATE_REVIEW_ACTION, COMPLETED_ACTION, DIRECTION_CHECKPOINTED_SQL, assertCheckReservation, bumpSemanticGeneration, contractSnapshotKey, featureBySlug, loadWorkspace, meta, newId, parseJson, recordEvent, reserveInterruptedCheck, transaction, uncertainCheckKey, workGraphAction, workItems } from './state.mjs';
 import { repositorySnapshot } from './git.mjs';
 import { unconfirmedDescendants, workersKey } from './ownership.mjs';
-import { TheaterError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock } from './util.mjs';
+import { OverdriveError, atomicWrite, contained, ensureManagedPath, now, redactString, requiredText, resolveWorkspace, run, safeSlug, withWorkspaceLock, STATE_DIR } from './util.mjs';
 
 export function featureChecks(db, featureId) {
   return parseJson(meta(db, `checks:${featureId}`), []);
@@ -42,7 +42,7 @@ function scopedWork(work, scope) {
     const key = pending.pop();
     if (selected.has(key)) continue;
     const item = byKey.get(key);
-    if (!item) throw new TheaterError(`Unknown work scope item: ${key}`, 'WORK_ITEM_NOT_FOUND');
+    if (!item) throw new OverdriveError(`Unknown work scope item: ${key}`, 'WORK_ITEM_NOT_FOUND');
     selected.add(key);
     pending.push(...item.dependencies);
   }
@@ -72,7 +72,7 @@ export function captureFeatureContract(db, feature) {
 
 export function assertAgentIdle(feature) {
   if (feature.active_turn_id || ['starting', 'uncertain', 'running', 'compacting', 'waiting_for_user'].includes(feature.agent_status)) {
-    throw new TheaterError('Wait for the feature agent to stop before changing its contract or verifying a candidate.', 'AGENT_BUSY');
+    throw new OverdriveError('Wait for the feature agent to stop before changing its contract or verifying a candidate.', 'AGENT_BUSY');
   }
 }
 
@@ -83,11 +83,11 @@ export function assertAgentIdle(feature) {
 export function assertWorkersStopped(db, feature) {
   const guards = parseJson(meta(db, workersKey(feature.id)), []);
   if (guards.length) {
-    throw new TheaterError('A worker process from this lane, or a tool it launched, has not confirmed its exit. Wait for it to stop, then inspect the lane with theater_agent_inspect, which clears a guard whose process tree is proven ended; or stop the lane, with an attestation if its exit cannot be proven, before verifying, recording or accepting a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
+    throw new OverdriveError('A worker process from this lane, or a tool it launched, has not confirmed its exit. Wait for it to stop, then inspect the lane with agent_inspect, which clears a guard whose process tree is proven ended; or stop the lane, with an attestation if its exit cannot be proven, before verifying, recording or accepting a candidate.', 'AGENT_BUSY', { workerGuards: guards.length });
   }
   const marker = unconfirmedDescendants(db, feature.id);
   if (marker) {
-    throw new TheaterError(`Tools launched by a stopped worker of this lane may still be running, so checks, candidate recording and completion must wait. Confirm no process is running in its checkout, then pause the lane with theater_feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
+    throw new OverdriveError(`Tools launched by a stopped worker of this lane may still be running, so checks, candidate recording and completion must wait. Confirm no process is running in its checkout, then pause the lane with feature_status and prior_turn_attestation: { evidence } describing what you checked, and resume it. Recorded: ${marker.summary}`, 'AGENT_BUSY', { unconfirmedDescendants: true, turnId: marker.turnId ?? null });
   }
 }
 
@@ -144,10 +144,10 @@ export function assertVerified(ctx, feature, revision, candidate = null) {
   assertCheckReservation(ctx.db, feature.id);
   const verification = verificationStatus(ctx, feature, revision);
   if (candidate && (candidate.contract_hash !== verification.contractHash || candidate.spec_revision !== feature.spec_revision)) {
-    throw new TheaterError('Candidate was verified against an older feature contract. Run current checks and record a fresh candidate.', 'STALE_CONTRACT');
+    throw new OverdriveError('Candidate was verified against an older feature contract. Run current checks and record a fresh candidate.', 'STALE_CONTRACT');
   }
   if (!verification.ready) {
-    throw new TheaterError('Completion requires a saved specification and passing runtime receipts for every current required check at this commit.', 'COMPLETION_NOT_PROVEN', verification);
+    throw new OverdriveError('Completion requires a saved specification and passing runtime receipts for every current required check at this commit.', 'COMPLETION_NOT_PROVEN', verification);
   }
   return verification;
 }
@@ -168,16 +168,16 @@ async function withFeature(args, fn, lockOptions) {
 }
 
 function artifactPaths(value = []) {
-  if (!Array.isArray(value) || value.length > 20) throw new TheaterError('artifact_paths must contain at most 20 checkout-relative paths.', 'INVALID_INPUT');
+  if (!Array.isArray(value) || value.length > 20) throw new OverdriveError('artifact_paths must contain at most 20 checkout-relative paths.', 'INVALID_INPUT');
   const paths = value.map(value => {
     const relative = requiredText(value, 'artifact path', { max: 4096 }).replaceAll('\\', '/');
     if (relative.includes('\0') || relative.includes(':') || relative.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')) {
-      throw new TheaterError('Artifact paths must name files or directories below the checkout, without traversal, Git metadata, or absolute paths.', 'INVALID_INPUT');
+      throw new OverdriveError('Artifact paths must name files or directories below the checkout, without traversal, Git metadata, or absolute paths.', 'INVALID_INPUT');
     }
     return relative;
   }).sort();
   if (paths.some((value, index) => paths.slice(0, index).some(parent => value === parent || value.startsWith(`${parent}/`)))) {
-    throw new TheaterError('Artifact paths must not duplicate or contain one another.', 'INVALID_INPUT');
+    throw new OverdriveError('Artifact paths must not duplicate or contain one another.', 'INVALID_INPUT');
   }
   return paths;
 }
@@ -209,7 +209,7 @@ async function archiveCheckArtifacts(ctx, feature, check, id, revision, before) 
   const paths = artifactPaths(check.artifact_paths);
   if (!paths.length) return null;
   const current = before && await artifactFiles(feature.checkout_path, paths).catch(() => null);
-  const directory = await ensureManagedPath(ctx.root, contained(ctx.root, '.theater', 'artifacts', id));
+  const directory = await ensureManagedPath(ctx.root, contained(ctx.root, STATE_DIR, 'artifacts', id));
   await fs.mkdir(directory, { recursive: true });
   for (const relative of paths) {
     const source = await ensureManagedPath(feature.checkout_path, contained(feature.checkout_path, relative));
@@ -218,7 +218,7 @@ async function archiveCheckArtifacts(ctx, feature, check, id, revision, before) 
       recursive: true, force: false, errorOnExist: true,
       filter: async source => {
         const stat = await fs.lstat(source);
-        if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) throw new TheaterError(`Artifact contains a symlink, junction, or special file: ${source}`, 'UNSAFE_PATH');
+        if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) throw new OverdriveError(`Artifact contains a symlink, junction, or special file: ${source}`, 'UNSAFE_PATH');
         return true;
       },
     });
@@ -234,22 +234,22 @@ async function archiveCheckArtifacts(ctx, feature, check, id, revision, before) 
 }
 
 export async function updateChecks(args) {
-  if (!Array.isArray(args.checks) || args.checks.length > 50) throw new TheaterError('checks must be an array of at most 50 commands.', 'INVALID_INPUT');
+  if (!Array.isArray(args.checks) || args.checks.length > 50) throw new OverdriveError('checks must be an array of at most 50 commands.', 'INVALID_INPUT');
   const checks = args.checks.map(check => {
     const key = safeSlug(check.key, 'check key');
     if (!Array.isArray(check.argv) || !check.argv.length || check.argv.length > 200 || check.argv.some(arg => typeof arg !== 'string' || arg.includes('\0')) || !check.argv[0].trim()) {
-      throw new TheaterError('Every check requires an executable and string argv, without a shell.', 'INVALID_INPUT');
+      throw new OverdriveError('Every check requires an executable and string argv, without a shell.', 'INVALID_INPUT');
     }
     const timeout = check.timeout_seconds ?? 300;
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1800) throw new TheaterError('Check timeout must be 1–1800 seconds.', 'INVALID_INPUT');
-    if (check.required !== undefined && typeof check.required !== 'boolean') throw new TheaterError('required must be a boolean.', 'INVALID_INPUT');
-    if (check.reuse_same_revision !== undefined && typeof check.reuse_same_revision !== 'boolean') throw new TheaterError('reuse_same_revision must be a boolean.', 'INVALID_INPUT');
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1800) throw new OverdriveError('Check timeout must be 1–1800 seconds.', 'INVALID_INPUT');
+    if (check.required !== undefined && typeof check.required !== 'boolean') throw new OverdriveError('required must be a boolean.', 'INVALID_INPUT');
+    if (check.reuse_same_revision !== undefined && typeof check.reuse_same_revision !== 'boolean') throw new OverdriveError('reuse_same_revision must be a boolean.', 'INVALID_INPUT');
     let scope;
     if (check.work_scope !== undefined) {
       if (!check.reuse_same_revision || !Array.isArray(check.work_scope) || !check.work_scope.length || check.work_scope.length > 200
         || check.work_scope.some(key => typeof key !== 'string' || !/^[A-Za-z][A-Za-z0-9._-]{0,62}$/.test(key))
         || new Set(check.work_scope).size !== check.work_scope.length) {
-        throw new TheaterError('work_scope requires reuse_same_revision and 1–200 unique exact work item keys.', 'INVALID_INPUT');
+        throw new OverdriveError('work_scope requires reuse_same_revision and 1–200 unique exact work item keys.', 'INVALID_INPUT');
       }
       scope = [...check.work_scope].sort();
     }
@@ -257,7 +257,7 @@ export async function updateChecks(args) {
     return { key, argv: check.argv, purpose: requiredText(check.purpose, 'purpose', { max: 2000 }), kind: requiredText(check.kind ?? 'test', 'check kind', { max: 80 }), required: check.required !== false, timeout_seconds: timeout, ...(paths.length ? { artifact_paths: paths } : {}), ...(check.reuse_same_revision ? { reuse_same_revision: true } : {}), ...(scope ? { work_scope: scope } : {}) };
   });
   // Submitted order is the execution order and part of the contract, so setup can precede dependent checks.
-  if (new Set(checks.map(check => check.key)).size !== checks.length) throw new TheaterError('Check keys must be unique.', 'INVALID_INPUT');
+  if (new Set(checks.map(check => check.key)).size !== checks.length) throw new OverdriveError('Check keys must be unique.', 'INVALID_INPUT');
   return withFeature(args, async (ctx, feature) => {
     assertAgentIdle(feature);
     const definition = contractDefinition(ctx.db, feature);
@@ -278,7 +278,7 @@ export async function updateChecks(args) {
 
 // The queue marks its own job interrupted when runChecks throws without a receipt; a direct run
 // records an equivalent interrupted job, which blocks further checks, candidates, completion and
-// dispatch in this clone until theater_checks_resolve confirms execution_stopped. The lane marker
+// dispatch in this clone until checks_resolve confirms execution_stopped. The lane marker
 // is written first, under the control lock already held, so a queue that cannot be written still
 // leaves the clone reserved.
 async function reserveUncertainExecution(ctx, feature, check, { revision, contract, startedAt, queued }, error) {
@@ -302,7 +302,7 @@ async function reserveUncertainExecution(ctx, feature, check, { revision, contra
     details: { checkKey: check.key, revision, pid: error.details?.pid ?? null, commandExited: error.details?.commandExited ?? null, reservedBy, reservationError },
   });
   const guidance = queued ? 'Its queue job stays interrupted' : `Job ${reservedBy} reserves this clone${reservationError ? ` (recorded on the lane only; the queue could not be updated: ${reservationError})` : ''}`;
-  return new TheaterError(`${reason} No receipt was recorded. ${guidance} until theater_checks_resolve confirms execution_stopped after you verify the command and its children stopped.`, error.code,
+  return new OverdriveError(`${reason} No receipt was recorded. ${guidance} until checks_resolve confirms execution_stopped after you verify the command and its children stopped.`, error.code,
     { ...error.details, output: redactString(error.details?.output ?? ''), checkKey: check.key, reservedBy, reservationError });
 }
 
@@ -312,22 +312,22 @@ export async function runChecks(args, execution = {}) {
     assertAgentIdle(feature);
     assertWorkersStopped(ctx.db, feature);
     const checks = featureChecks(ctx.db, feature.id);
-    if (!checks.length) throw new TheaterError('Configure meaningful verification commands first.', 'CHECKS_REQUIRED');
+    if (!checks.length) throw new OverdriveError('Configure meaningful verification commands first.', 'CHECKS_REQUIRED');
     let selectedChecks = checks;
     if (args.check_keys !== undefined) {
       if (!Array.isArray(args.check_keys) || !args.check_keys.length || args.check_keys.length > 50
         || new Set(args.check_keys).size !== args.check_keys.length
         || args.check_keys.some(key => typeof key !== 'string' || !checks.some(check => check.key === key))) {
-        throw new TheaterError('check_keys must be a nonempty array of unique configured check keys.', 'INVALID_INPUT');
+        throw new OverdriveError('check_keys must be a nonempty array of unique configured check keys.', 'INVALID_INPUT');
       }
       selectedChecks = checks.filter(check => args.check_keys.includes(check.key));
     }
     const before = await repositorySnapshot(feature.checkout_path);
-    if (!before.clean) throw new TheaterError('Commit the candidate before running recorded checks.', 'DIRTY_CANDIDATE');
+    if (!before.clean) throw new OverdriveError('Commit the candidate before running recorded checks.', 'DIRTY_CANDIDATE');
     const definition = contractDefinition(ctx.db, feature);
     const contract = fingerprint(definition);
     if (execution.receiptId && (selectedChecks.length !== 1 || before.head !== execution.revision || contract !== execution.contractHash)) {
-      throw new TheaterError('Queued verification no longer matches the exact commit and full contract.', 'STALE_QUEUE_JOB');
+      throw new OverdriveError('Queued verification no longer matches the exact commit and full contract.', 'STALE_QUEUE_JOB');
     }
     captureContract(ctx.db, feature, definition);
     // Receipts are live evidence; only a superseded candidate or reopened lane is a semantic change.
@@ -391,7 +391,7 @@ export async function readEvidence(args) {
   try {
     const feature = featureBySlug(ctx.db, safeSlug(args.feature));
     const row = ctx.db.prepare('SELECT * FROM evidence WHERE id = ? AND feature_id = ?').get(requiredText(args.evidence_id, 'evidence_id'), feature.id);
-    if (!row) throw new TheaterError('Evidence is not registered for this feature.', 'EVIDENCE_NOT_FOUND');
+    if (!row) throw new OverdriveError('Evidence is not registered for this feature.', 'EVIDENCE_NOT_FOUND');
     return { ...row, passed: row.passed === null ? null : Boolean(row.passed), argv: parseJson(row.argv_json, null) };
   } finally { ctx.db.close(); }
 }

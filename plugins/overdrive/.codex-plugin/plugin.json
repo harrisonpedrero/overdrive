@@ -1,5 +1,5 @@
 {
-  "name": "feature-theater",
+  "name": "overdrive",
   "version": "0.1.0+codex.20260924073704",
   "description": "OVERDRIVE runs each feature in an isolated repository clone and orchestrates the lane workers, with durable specs, live steering, executed verification, and an inline work graph.",
   "author": {
@@ -28,5 +28,36 @@
     ],
     "brandColor": "#7C3AED"
   },
-  "mcpServers": "./.mcp.json"
+  "mcpServers": {
+    "overdrive": {
+      "command": "node",
+      "args": [
+        "./scripts/server.mjs"
+      ],
+      "cwd": ".",
+      "enabled": true,
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 3600,
+      "default_tools_approval_mode": "approve",
+      "tools": {
+        "workspace_init": {
+          "approval_mode": "prompt"
+        },
+        "candidate_promote": {
+          "approval_mode": "prompt"
+        },
+        "agent_request_resolve": {
+          "approval_mode": "prompt"
+        }
+      },
+      "env_vars": [
+        "PATH",
+        "CODEX_CLI_PATH",
+        "CODEX_HOME",
+        "USERPROFILE",
+        "HOME",
+        "LOCALAPPDATA"
+      ]
+    }
+  }
 }

@@ -1,13 +1,13 @@
 {
-  "name": "feature-theater-local",
+  "name": "overdrive-local",
   "owner": {
     "name": "Harrison Pedrero"
   },
   "plugins": [
     {
-      "name": "feature-theater",
-      "source": "./plugins/feature-theater-claude",
-      "description": "Feature Theater coordinator skill and MCP server for Claude Code. Loads the shared server from plugins/feature-theater, so install from this repository checkout."
+      "name": "overdrive",
+      "source": "./plugins/overdrive",
+      "description": "OVERDRIVE coordinator skill and MCP server for Claude Code."
     }
   ]
 }

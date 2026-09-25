@@ -7,8 +7,8 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "check": "node --check plugins/feature-theater/scripts/server.mjs && node --check plugins/feature-theater/scripts/tools.mjs && node --check plugins/feature-theater/scripts/agent-runtime.mjs && node --check plugins/feature-theater/scripts/app-server.mjs && node --check plugins/feature-theater/scripts/claude-worker.mjs && node --check plugins/feature-theater/scripts/process-tree.mjs && node --check plugins/feature-theater/scripts/workspace.mjs && node --check plugins/feature-theater/scripts/git.mjs && node --check plugins/feature-theater/scripts/state.mjs && node --check plugins/feature-theater/scripts/util.mjs && node --check plugins/feature-theater/scripts/ownership.mjs && node --check plugins/feature-theater/scripts/verification.mjs && node --check plugins/feature-theater/scripts/check-queue.mjs && node --check plugins/feature-theater/scripts/presentation.mjs",
+    "check": "node -e \"for (const f of require('fs').readdirSync('plugins/overdrive/scripts')) require('child_process').execFileSync(process.execPath, ['--check', 'plugins/overdrive/scripts/' + f], { stdio: 'inherit' })\"",
     "test": "node --test tests/*.test.mjs",
-    "validate:plugin": "python -c \"import os,runpy,sys;sys.argv=['validate_plugin.py','plugins/feature-theater'];runpy.run_path(os.path.join(os.environ.get('CODEX_HOME',os.path.expanduser('~/.codex')),'skills','.system','plugin-creator','scripts','validate_plugin.py'),run_name='__main__')\""
+    "validate:plugin": "python -c \"import os,runpy,sys;sys.argv=['validate_plugin.py','plugins/overdrive'];runpy.run_path(os.path.join(os.environ.get('CODEX_HOME',os.path.expanduser('~/.codex')),'skills','.system','plugin-creator','scripts','validate_plugin.py'),run_name='__main__')\""
   }
 }

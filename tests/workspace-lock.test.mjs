@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { withWorkspaceLock } from '../plugins/feature-theater/scripts/util.mjs';
+import { withWorkspaceLock } from '../plugins/overdrive/scripts/util.mjs';
 
 const CONTENDER = path.join(import.meta.dirname, 'fixtures', 'lock-contender.mjs');
 const DEAD_PID = 2 ** 30;
@@ -14,13 +14,13 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const inside = directory => file => path.dirname(path.resolve(String(file))) === directory;
 
 async function lockWorkspace(t) {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'theater-lock-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-lock-'));
   const children = [];
   t.after(async () => {
     for (const child of children) if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, 'exit'); }
     await fs.rm(workspace, { recursive: true, force: true, maxRetries: 5 });
   });
-  const locks = path.join(workspace, '.theater', 'locks');
+  const locks = path.join(workspace, '.overdrive', 'locks');
   await fs.mkdir(locks, { recursive: true });
   await fs.mkdir(path.join(workspace, 'markers'));
   const lockFile = path.join(locks, 'features.lock');
