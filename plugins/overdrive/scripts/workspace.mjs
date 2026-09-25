@@ -126,7 +126,7 @@ async function ensureWorkspaceFiles(root, config) {
   }
   const agentsFile = contained(root, 'AGENTS.md');
   if (!await exists(agentsFile)) {
-    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the overdrive skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nRecover from .overdrive/index.md, each lane's context packet, live Git state, and the saved agent sessions. Never expose private chain-of-thought or treat an agent report as test evidence.\n`);
+    await atomicWrite(root, agentsFile, `# OVERDRIVE coordinator\n\nUse the overdrive skill for this workspace. This directory coordinates feature clones; application work belongs in the selected features/<feature>/repo checkout.\n\nRecover with feature_list and feature_get, live Git state and the saved agent sessions. Agent reports are claims; lab runs and Git are evidence.\n`);
   }
 }
 
@@ -163,7 +163,7 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 
 - Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. The lab README describes the suite format.
 - Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
-- Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible, send them to the owning lane with message_send, and retest fixes.
+- Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible; it notifies the owning lane. Retest fixes.
 - Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - ${LOCAL_SERVERS}
 - ${MESSAGES}
@@ -431,8 +431,14 @@ function partialInitializationError() {
 
 const HARNESSES = new Set(['codex', 'claude']);
 
+// New workspaces default to the harness of the host that launched this server.
+let hostHarness = 'codex';
+export function useHostHarness(clientName) {
+  hostHarness = /claude/i.test(clientName ?? '') ? 'claude' : 'codex';
+}
+
 function harnessAddition(harness) {
-  if (harness === undefined) return {};
+  if (harness === undefined) return { harness: hostHarness };
   if (!HARNESSES.has(harness)) throw new OverdriveError('harness must be codex or claude.', 'INVALID_INPUT');
   return { harness };
 }

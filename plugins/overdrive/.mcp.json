@@ -28,7 +28,9 @@
         "USERPROFILE",
         "HOME",
         "LOCALAPPDATA",
-        "OVERDRIVE_WORKER"
+        "OVERDRIVE_WORKER",
+        "CLAUDE_CLI_PATH",
+        "APPDATA"
       ]
     }
   }

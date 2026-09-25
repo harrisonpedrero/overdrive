@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { callTool, listTools } from './tools.mjs';
+import { useHostHarness } from './workspace.mjs';
 import { shutdownAgentRuntime } from './agent-runtime.mjs';
 
 let buffer = '';
@@ -28,6 +29,7 @@ function toolResult(id, value, isError = false) {
 async function handle(message) {
   const { id, method, params } = message;
   if (method === 'initialize') {
+    useHostHarness(params?.clientInfo?.name);
     return result(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: { listChanged: false } },
