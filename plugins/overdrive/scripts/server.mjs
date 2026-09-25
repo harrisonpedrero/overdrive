@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { callTool, TOOLS } from './tools.mjs';
+import { callTool, listTools } from './tools.mjs';
 import { shutdownAgentRuntime } from './agent-runtime.mjs';
 
 let buffer = '';
@@ -32,12 +32,14 @@ async function handle(message) {
       protocolVersion: '2025-06-18',
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: 'overdrive', title: 'OVERDRIVE', version: '0.1.0' },
-      instructions: 'Use OVERDRIVE to run features in isolated clones and orchestrate their lane workers. Persist only safe summaries and evidence; never expose private reasoning.',
+      instructions: process.env.OVERDRIVE_AGENT
+        ? 'OVERDRIVE worker tools: message other agents or the coordinator, see every lane, and use the QA lab.'
+        : 'Use OVERDRIVE to run features in isolated clones and orchestrate their lane workers. Persist only safe summaries and evidence; never expose private reasoning.',
     });
   }
   if (method === 'notifications/initialized' || method === 'notifications/cancelled') return;
   if (method === 'ping') return result(id, {});
-  if (method === 'tools/list') return result(id, { tools: TOOLS });
+  if (method === 'tools/list') return result(id, { tools: await listTools() });
   if (method === 'tools/call') {
     try {
       const value = await callTool(params?.name, params?.arguments ?? {});

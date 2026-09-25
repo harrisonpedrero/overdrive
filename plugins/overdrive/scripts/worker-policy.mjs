@@ -1,0 +1,44 @@
+import { fileURLToPath } from 'node:url';
+
+const SERVER_SCRIPT = fileURLToPath(new URL('./server.mjs', import.meta.url));
+
+// The agent kinds that may call each tool of the worker-mode server.
+export const WORKER_TOOLS = Object.freeze({
+  message_send: ['feature', 'qa'],
+  lanes: ['feature', 'qa'],
+  lab_get: ['feature', 'qa'],
+  lab_run: ['feature', 'qa'],
+  finding_record: ['qa'],
+  integration_build: ['qa'],
+});
+
+// MCP server names that give browser or computer control; cua_repl is Codex's computer-use engine.
+export const BROWSER_CONTROL = /chrome|browser|computer|playwright|puppeteer|cua_repl/i;
+
+const PUBLISH_COMMAND = /\b(?:git(?:\.exe)?(?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+))?\s+push|gh\s+(?:pr\s+(?:create|merge|edit)|release|repo\s+create)|(?:npm|pnpm|cargo)\s+publish|yarn\s+(?:npm\s+)?publish|dotnet\s+nuget\s+push|twine\s+upload|docker\s+push)\b/i;
+const ALLOW = Object.freeze({ allow: true });
+const deny = message => ({ allow: false, message });
+
+// A lane row's capability profile; anything but an explicit QA agent gets the restricted profile.
+export const workerProfile = row => (row.kind === 'qa' ? 'qa' : 'feature');
+
+// The worker-mode OVERDRIVE server injected into an agent's harness, bound to that agent.
+export function workerServer(root, slug) {
+  return { command: process.execPath, args: [SERVER_SCRIPT], env: { OVERDRIVE_AGENT: slug, OVERDRIVE_WORKSPACE: root } };
+}
+
+// The one permission policy both worker harnesses apply to tool calls that would need approval.
+export function workerToolDecision(profile, toolName, input) {
+  const name = String(toolName ?? '');
+  const server = /^mcp__(.+?)__/.exec(name)?.[1];
+  if (server && (/^plugin_(?:overdrive|feature-theater)_/.test(server) || (server === 'overdrive' && !Object.hasOwn(WORKER_TOOLS, name.slice('mcp__overdrive__'.length))))) {
+    return deny('OVERDRIVE coordinator tools are not available to workers; reach the coordinator with message_send.');
+  }
+  if (profile !== 'qa' && server && BROWSER_CONTROL.test(server)) return deny('Browser and computer control belong to QA; ask qa with message_send to verify it.');
+  if (typeof input?.command === 'string' && PUBLISH_COMMAND.test(input.command)) return deny("Publishing needs the user's authority; ask the coordinator.");
+  return ALLOW;
+}
+
+export function denialNote(tools) {
+  return `Worker permission policy denied ${tools.length} tool call(s): ${[...new Set(tools)].join(', ')}. Send browser or testing needs to QA with message_send; publishing needs the user's authority through the coordinator.`;
+}

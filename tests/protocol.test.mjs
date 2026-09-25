@@ -3,28 +3,33 @@ import { test } from 'node:test';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CodexAppServer, finalVisibleMessage, isolatedMcpConfigArgs } from '../plugins/overdrive/scripts/app-server.mjs';
+import { CodexAppServer, deniedMcpServers, finalVisibleMessage } from '../plugins/overdrive/scripts/app-server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-test('feature worker app-server disables coordinator integrations', () => {
-  const client = new CodexAppServer();
-  const configuration = client.launch.args.join(' ');
-  for (const feature of ['plugins', 'apps', 'browser_use', 'computer_use', 'hooks']) {
-    assert.match(configuration, new RegExp(`features\\.${feature}=false`));
+test('worker app-servers keep user integrations and disable coordinator and browser control by profile', () => {
+  const feature = new CodexAppServer().launch.args.join(' ');
+  for (const override of ['features.browser_use=false', 'features.computer_use=false', 'features.in_app_browser=false', 'features.skill_mcp_dependency_install=false', 'plugins.overdrive@overdrive-local.enabled=false', 'plugins.chrome@openai-bundled.enabled=false']) {
+    assert.ok(feature.includes(override), override);
   }
+  assert.doesNotMatch(feature, /features\.(?:plugins|apps|hooks)=false/);
+  const qa = new CodexAppServer({ profile: 'qa' }).launch.args.join(' ');
+  assert.match(qa, /plugins\.overdrive@overdrive-local\.enabled=false/);
+  assert.doesNotMatch(qa, /browser_use|computer_use|chrome@/);
 });
 
-test('feature worker MCP overrides are disabled and credential-free', () => {
-  const args = isolatedMcpConfigArgs([
-    { name: 'stdio-server', enabled: true, transport: { type: 'stdio', command: 'secret-command', args: ['secret-token'] } },
-    { name: 'remote.server', enabled: true, transport: { type: 'streamable_http', url: 'https://user:secret@example.test/mcp' } },
-    { name: 'already-off', enabled: false, transport: { type: 'stdio' } },
-  ]);
-  const configuration = args.join(' ');
-  assert.match(configuration, /mcp_servers\.stdio-server=.*enabled=false/);
-  assert.match(configuration, /mcp_servers\."remote\.server".*enabled=false/);
-  assert.doesNotMatch(configuration, /secret-command|secret-token|example\.test|already-off/);
+test('denied worker MCP servers are disabled and credential-free', () => {
+  const servers = [
+    { name: 'feature_theater', enabled: true, transport: { type: 'stdio', command: 'secret-command', args: ['secret-token'] } },
+    { name: 'chrome.devtools', enabled: true, transport: { type: 'streamable_http', url: 'https://user:secret@example.test/mcp' } },
+    { name: 'context7', enabled: true, transport: { type: 'stdio', command: 'npx' } },
+    { name: 'playwright', enabled: false, transport: { type: 'stdio' } },
+  ];
+  const feature = deniedMcpServers(servers, 'feature');
+  assert.deepEqual(Object.keys(feature).sort(), ['chrome.devtools', 'feature_theater']);
+  assert.ok(Object.values(feature).every(server => server.enabled === false));
+  assert.doesNotMatch(JSON.stringify(feature), /secret-command|secret-token|example\.test/);
+  assert.deepEqual(Object.keys(deniedMcpServers(servers, 'qa')), ['feature_theater']);
 });
 
 test('app-server client initializes and filters final visible output', async t => {

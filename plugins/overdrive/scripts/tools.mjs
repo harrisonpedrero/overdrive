@@ -1,13 +1,18 @@
 import {
+  agentProfile,
   createFeature,
   doctorWorkspace,
   getFeatureContext,
   initializeManagedProject,
   initializeWorkspace,
   listFeatures,
+  listLanes,
+  sendAgentMessage,
   updateFeature,
   updateWork,
 } from './workspace.mjs';
+import { OverdriveError, safeSlug } from './util.mjs';
+import { WORKER_TOOLS } from './worker-policy.mjs';
 import {
   inspectFeatureAgent,
   interruptFeatureAgent,
@@ -164,6 +169,18 @@ export const TOOLS = [
   }, ['workspace_path', 'feature', 'request_id', 'action']), { destructiveHint: false, openWorldHint: true }),
 ];
 
+// Tools only workers have; their lab tools come from the coordinator surface.
+const WORKER_ONLY_TOOLS = [
+  tool('message_send', 'Message an agent', 'Send a message to a lane agent, a QA agent (such as qa) or the coordinator; the runtime delivers it.', object({
+    ...workspace,
+    to: string('Recipient: a lane slug, a QA agent name, or coordinator.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }),
+    body: string('What changed, what to test or fix, or what you need; self-contained.', { minLength: 1, maxLength: 20000 }),
+  }, ['workspace_path', 'to', 'body']), { destructiveHint: false }),
+  tool('lanes', 'List lanes', 'Every lane and QA agent: kind, title, status, agent status, checkout path, head commit, whether the checkout is dirty, and open findings.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+];
+
+const workerHandlers = { message_send: sendAgentMessage, lanes: listLanes };
+
 const handlers = {
   view: composeView,
   agents_wait: waitFeatureAgents,
@@ -184,7 +201,63 @@ const handlers = {
   agent_request_resolve: resolveFeatureAgentRequest,
 };
 
+// A worker's copy of the server: OVERDRIVE_AGENT binds it to one agent (or to the from argument
+// when it is *); OVERDRIVE_WORKER alone is an inert copy of the plugin with no tools.
+const workerAgent = () => process.env.OVERDRIVE_AGENT || null;
+const inertWorker = () => !workerAgent() && Boolean(process.env.OVERDRIVE_WORKER);
+const forbidden = message => new OverdriveError(message, 'WORKER_TOOL_FORBIDDEN');
+
+// A worker-mode schema drops workspace_path unless the server has no workspace, and asks for
+// from only when the server has no fixed identity.
+function workerSchema(tool) {
+  const { workspace_path, ...properties } = tool.inputSchema.properties;
+  const required = tool.inputSchema.required.filter(key => key !== 'workspace_path');
+  const identity = {
+    ...(workerAgent() === '*' ? { from: string('Your own agent name, as given in your instructions.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }) } : {}),
+    ...(process.env.OVERDRIVE_WORKSPACE ? {} : { workspace_path }),
+  };
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties: { ...properties, ...identity }, required: [...required, ...Object.keys(identity)] } };
+}
+
+async function callerProfile(caller) {
+  return await agentProfile({ workspace_path: caller.workspace_path, agent: caller.from });
+}
+
+function workerCaller(args) {
+  const from = workerAgent() === '*' ? args.from : workerAgent();
+  return { from: safeSlug(from, 'from'), workspace_path: process.env.OVERDRIVE_WORKSPACE || args.workspace_path };
+}
+
+export async function listTools() {
+  if (inertWorker()) return [];
+  if (!workerAgent()) return TOOLS;
+  // A fixed identity lists only the tools its kind may call; otherwise every worker tool is listed.
+  const profile = workerAgent() === '*' ? null : await callerProfile(workerCaller({})).catch(() => null);
+  return [...WORKER_ONLY_TOOLS, ...TOOLS]
+    .filter(tool => WORKER_TOOLS[tool.name] && (!profile || WORKER_TOOLS[tool.name].includes(profile)))
+    .map(workerSchema);
+}
+
+// The caller's kind comes from its recorded row, never from an argument. A feature agent's lab
+// calls always target its own lane.
+async function callWorkerTool(name, args) {
+  const access = WORKER_TOOLS[name];
+  const handler = access && (workerHandlers[name] ?? handlers[name]);
+  if (!handler) throw forbidden(`${name} is not available to OVERDRIVE workers.`);
+  const caller = workerCaller(args);
+  const profile = await callerProfile(caller);
+  if (!access.includes(profile)) throw forbidden(`${name} is available to QA agents only.`);
+  const call = { ...args, ...caller };
+  if (profile === 'feature' && name.startsWith('lab_')) {
+    if (call.target !== undefined && call.target !== caller.from) throw forbidden(`A feature agent may only target its own lane, ${caller.from}.`);
+    call.target = caller.from;
+  }
+  return await handler(call);
+}
+
 export async function callTool(name, args) {
+  if (inertWorker()) throw forbidden('This OVERDRIVE server runs inside a worker and exposes no tools.');
+  if (workerAgent()) return await callWorkerTool(name, args ?? {});
   const handler = handlers[name];
   if (!handler) throw new Error(`Unknown tool: ${name}`);
   return await handler(args ?? {});

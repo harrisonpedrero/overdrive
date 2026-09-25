@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { codexExecutable } from './app-server.mjs';
 import { claudeExecutable, normalizeWorkerOptions } from './claude-worker.mjs';
+import { workerProfile } from './worker-policy.mjs';
 import {
   OverdriveError,
   atomicWrite,
@@ -14,6 +15,7 @@ import {
   normalizeRepositorySource,
   now,
   optionalText,
+  redactString,
   requiredText,
   resolveWorkspace,
   run,
@@ -42,6 +44,7 @@ import {
   meta,
   newId,
   parseJson,
+  readFeatureRow,
   readWorkspaceConfig,
   recordEvent,
   transaction,
@@ -122,36 +125,52 @@ async function ensureWorkspaceFiles(root, config) {
   }
 }
 
+const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only (binding all interfaces triggers firewall prompts on the user\'s machine), and stop it before your turn ends.';
+
+function agentFiles(root, slug) {
+  return `Before each turn, read ${contained(root, STATE_DIR, 'features', slug, 'context.md')} and ${contained(root, STATE_DIR, 'features', slug, 'spec.md')}; treat them as read-only. The context packet holds your work graph. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key.`;
+}
+
 function featureAgentInstructions(root, feature) {
-  const contextFile = contained(root, STATE_DIR, 'features', feature.slug, 'context.md');
-  const specFile = contained(root, STATE_DIR, 'features', feature.slug, 'spec.md');
-  return `# OVERDRIVE lane: ${feature.slug}
+  return `# OVERDRIVE feature agent: ${feature.slug}
 
-You are the implementation director for exactly one feature lane. Work only inside repo/; OVERDRIVE context lives outside the application checkout. You are a lane worker, not the OVERDRIVE coordinator: do not invoke OVERDRIVE coordinator tools, alter other lanes, or recursively inspect or steer this task. Apps, hooks, plugins, browser/computer control, and external MCP servers are deliberately unavailable; route cross-lane and external-system needs through your visible handoff.
+You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checkout_path} on branch ${feature.branch}. ${agentFiles(root, feature.slug)} Follow the repository's own instructions (AGENTS.md, CLAUDE.md and similar).
 
-Before each turn, read:
-
-1. ${contextFile}
-2. ${specFile}
-3. the repository's applicable AGENTS.md, CLAUDE.md and other local instructions under repo/
-
-Use the durable work graph in the context packet to choose the next useful work. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key before implementing it. Keep exploration bounded, use native subagents only for genuinely independent work, and verify outcomes against the spec. Do not edit OVERDRIVE state files directly. Do not put coordination artifacts into application commits.
-
-The coordinator owns work-item status changes; follow the assigned work key when provided. Surface a conflicting assignment or unmet prerequisite before proceeding with the affected work; your final report does not itself mark work done or create execution receipts.
-
-Your visible updates and final messages may be recorded as safe progress summaries. Never reveal private chain-of-thought. Record exact commands, revisions, and observed outcomes in your visible handoff. Remote pushes, pull requests, merges, destructive cleanup, and new external authority require explicit user authorization.
-
-The coordinator owns final Git staging and commits. Implement and verify the requested change, then report the exact modified paths and remaining work. If Git metadata writes are blocked by the workspace sandbox, preserve the diff and hand it back; do not seek broader permissions just to make a local commit.
-
-Keep temporary verification executables and their local support/fixture inputs available while coordinator review or registered execution still needs them. Leave the ignored originals in place, or preserve byte-exact inert source copies before removing runnable files; report archive locations, hashes, original restore paths, exact commands and source revisions. Hashes and result JSON are not source archives. This temporary handoff retention does not require permanent tests or application commits. Once downstream use is complete, ordinary temporary-file cleanup applies; do not wait for cleanup to deliver the handoff.
-
-Optional housekeeping must not delay a useful handoff. If removal of your own ignored temporary probes or fixtures cannot proceed within available permissions, retain them and finish with their exact paths, purpose and deferred cleanup noted; do not retry or seek escalation solely for that cleanup. Distinguish retained files from live services or residue that affects correctness: report those conditions and any required shutdown or verification still outstanding.
+- Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions.
+- Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
+- Do not add or expand test suites in the product repository unless the spec asks for it: QA owns testing in a decoupled lab. You may run existing repository checks for quick feedback.
+- Commit your work on the lane branch with clear messages.
+- ${LOCAL_SERVERS}
+- No browser or computer use. When a change is ready to test, or you need a behavior verified, send \`qa\` a message saying what changed and what to test.
+- Fix findings minimally at their root cause.
+- Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
+- Your \`overdrive\` tools: message_send reaches \`qa\`, another lane or \`coordinator\`; lanes shows every lane and QA agent; lab_get and lab_run read and run lab suites against your own lane.
+- End each turn with a short handoff: the resulting commit or uncommitted state, what you ran and observed, and anything unresolved. Never include private reasoning.
 `;
 }
 
+export function qaAgentInstructions(root, agent) {
+  return `# OVERDRIVE QA agent: ${agent.slug}
+
+You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${contained(root, 'lab')}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
+
+- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. The lab README describes the suite format.
+- Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
+- Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible, send them to the owning lane with message_send, and retest fixes.
+- Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send.
+- ${LOCAL_SERVERS}
+- Never edit product code in lane checkouts; resolving a conflict in the integration clone is allowed.
+- Commit lab changes to the lab repository. Never publish anything without the user's authority, which comes through the coordinator.
+- lanes shows every lane with its checkout path, head and open findings.
+- End each turn with a short handoff: runs and verdicts, findings recorded, and anything unresolved. Never include private reasoning.
+`;
+}
+
+const agentInstructions = (root, row) => (workerProfile(row) === 'qa' ? qaAgentInstructions : featureAgentInstructions)(root, row);
+
 async function writeFeatureAgentFile(ctx, feature) {
   const file = contained(ctx.root, 'features', feature.slug, 'AGENTS.md');
-  await atomicWrite(ctx.root, file, featureAgentInstructions(ctx.root, feature));
+  await atomicWrite(ctx.root, file, agentInstructions(ctx.root, feature));
 }
 
 async function writeEventLog(ctx, event) {
@@ -670,6 +689,43 @@ export async function listFeatures({ workspace_path, include_archived = false, r
   });
 }
 
+// The capability profile of a worker-mode caller, read from its recorded row.
+export async function agentProfile({ workspace_path, agent }) {
+  return await withContext(workspace_path, ctx => workerProfile(readFeatureRow(ctx.db, safeSlug(agent, 'agent'))));
+}
+
+// Depends on the messages table of schema v8.
+export async function sendAgentMessage({ workspace_path, from, to, body }) {
+  const sender = safeSlug(from, 'from');
+  const recipient = to === 'coordinator' ? to : safeSlug(to, 'to');
+  const text = redactString(requiredText(body, 'body', { max: 20_000 }));
+  return await withContext(workspace_path, ctx => {
+    if (recipient !== 'coordinator') readFeatureRow(ctx.db, recipient);
+    const createdAt = now();
+    const { lastInsertRowid } = ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, recipient, text, createdAt);
+    return { sent: true, id: Number(lastInsertRowid), from: sender, to: recipient, createdAt };
+  });
+}
+
+// Every lane and QA agent as other agents need to see it; archived rows are left out.
+export async function listLanes({ workspace_path }) {
+  return await withContext(workspace_path, async ctx => {
+    const findings = ctx.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'findings'").get()
+      ? new Map(ctx.db.prepare("SELECT feature, COUNT(*) AS count FROM findings WHERE status = 'open' GROUP BY feature").all().map(row => [row.feature, Number(row.count)]))
+      : null;
+    const lanes = [];
+    for (const row of listFeatureRows(ctx.db)) {
+      const git = await repositorySnapshot(row.checkout_path).catch(() => null);
+      lanes.push({
+        slug: row.slug, kind: workerProfile(row), title: row.title, status: row.status, agentStatus: row.agent_status,
+        checkoutPath: row.checkout_path, head: git?.head ?? null, dirty: git ? !git.clean : null,
+        ...(findings ? { openFindings: findings.get(row.slug) ?? 0 } : {}),
+      });
+    }
+    return { lanes };
+  });
+}
+
 export async function getFeatureContext({ workspace_path, feature, timeline_limit = 20 }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
@@ -893,14 +949,18 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new OverdriveError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
     const packet = await writeFeatureContext(ctx, row);
     await writeFeatureAgentFile(ctx, row);
+    const contextPath = contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md');
     return {
       root: ctx.root,
       feature: row,
-      contextPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md'),
+      profile: workerProfile(row),
+      cwd: row.checkout_path,
+      roots: [row.checkout_path, path.dirname(contextPath)],
+      contextPath,
       specPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'),
       agentFile: contained(ctx.root, 'features', row.slug, 'AGENTS.md'),
       work: packet.work,
-      developerInstructions: featureAgentInstructions(ctx.root, row),
+      developerInstructions: agentInstructions(ctx.root, row),
       ...sessionHarness(ctx.config, row, force_new_session),
     };
   });

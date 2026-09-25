@@ -53,7 +53,8 @@
         "CODEX_HOME",
         "USERPROFILE",
         "HOME",
-        "LOCALAPPDATA"
+        "LOCALAPPDATA",
+        "OVERDRIVE_WORKER"
       ]
     }
   }
