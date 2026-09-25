@@ -1,172 +1,128 @@
 # Operator guide
 
-The everyday loop is in the [README](../README.md#daily-use). This guide covers setup, configuration, coordination rules and recovery.
+The [README](../README.md) covers daily use and installation. This guide covers setup, configuration, the lab, integration and recovery.
 
-## First run
+## Setup
 
-Open `C:\path\to\overdrive\workspace` in a fresh Codex task (its local configuration selects GPT-6 Astra for the coordinator unless you choose another model), or use a Claude Code session with the plugin installed. Say `Use OVERDRIVE with <repository URL>`. The plugin creates local state and reports detected repository instructions, ecosystems, setup candidates, and check candidates. Review those facts; they are hints, not commands that were executed.
+1. Install the plugin ([README](../README.md#installation)). OVERDRIVE looks for the worker CLI on `PATH`, and for Claude also in `~/.local/bin`. Set `CODEX_CLI_PATH` or `CLAUDE_CLI_PATH` to use a different executable; under a Codex coordinator only `CODEX_CLI_PATH` reaches the server.
+2. Open an empty folder, such as `workspace/`, as the coordinator's working directory.
+3. Adopt a repository with `workspace_init` (a credential-free URL, SSH remote or absolute local path), or start one from a brief with `project_create`. Either creates `overdrive.json`, `.overdrive/` and the lab. The response lists detected ecosystems and setup hints; nothing from the repository is executed.
+4. Run `doctor` after setup or whenever something looks wrong. It checks Git, Node, the configured worker CLI, `overdrive.json`, database integrity, the repository cache, the managed project and lane paths.
 
-To begin from nothing, say `Start a new OVERDRIVE project called <name> that <product brief>`. The plugin creates a minimal canonical repository at `project/`, then uses the same spec, lane, agent, and evidence workflow. After a feature is completed through the candidate gate, an explicit promotion request fast-forwards that canonical repository and refreshes the mirror. A divergent or dirty canonical project is refused rather than merged or reset.
+Each lane is a full clone at `features/<slug>/repo` on `feature/<slug>`, created from the refreshed default revision or from `base_revision`. To start from another lane's unintegrated commit, pass that lane as `base_feature` and the full commit ID as `base_revision`.
 
-## Worker harness and models
+A clone commits with a locally adopted repository's own `user.name` and `user.email` when that repository sets both, or else with your configured Git identity. Failing both, it commits as the clone-local `OVERDRIVE <overdrive@local.invalid>`. Global Git config is never changed. `feature_create` reports the identity Git will record and the commands for a lane-local override.
 
-The coordinator's model is whatever its Codex task or Claude Code session uses; it never selects worker models, and worker settings never change it. The top-level `model` field in `overdrive.json` is recorded coordinator metadata. When the user names a worker model, record it in the settings below instead of substituting the coordinator's model. Harness changes apply to new sessions; model changes apply to the next turn.
+In Codex, `workspace_init`, `integrate` and `agent_request_resolve` ask for approval before running.
 
-Lane workers run under Codex by default, using `gpt-6-sol`. Set `codex.model` for a workspace default and `codex.laneModels` for named lane overrides in `overdrive.json`:
+## overdrive.json
 
-```json
-{
-  "codex": {
-    "model": "gpt-6-sol",
-    "laneModels": { "search-redesign": "gpt-6-luna" }
-  }
-}
-```
-
-`codex.laneModels[<slug>]` takes precedence over `codex.model`, which takes precedence over the `gpt-6-sol` default.
-
-The selected model is used when starting or resuming a worker thread and for each new turn. Model names must be nonempty identifiers using letters, numbers, periods, underscores, colons or hyphens.
-
-A lane keeps the harness that created its native session. Changing `overdrive.json` applies to new sessions; existing sessions resume, steer, inspect, interrupt and compact on their recorded harness. Current model and permission settings for that harness apply to the next turn, including after a controller restart. Use `force_new_session: true` to replace a session on the newly configured harness; the earlier conversation remains in its original backend.
-
-If a turn request times out or loses its response, the lane stays `uncertain` until the owning backend shows whether a turn started. This state survives a controller restart and blocks duplicate dispatch. A newly attached Claude session has no earlier turn history in the controller, so inspection reports `history: "unavailable"` and relies on the retained feature summary and timeline. When native history is unavailable, the coordinator can resume only after verifying that no worker from the request still runs and supplying `prior_turn_attestation: { evidence }` to `agent_start`. Sessions saved before harness ownership was recorded require a replacement when their owner cannot be proven.
-
-To run workers as Claude Code sessions instead, pass `harness: "claude"` to `workspace_init` or `project_create`, or set `"harness": "claude"` in an existing `overdrive.json`. An optional `claude` object configures the workers:
+`workspace_init` and `project_create` write the repository fields; leave those alone. You, or the coordinator on your behalf, edit these:
 
 ```json
 {
   "harness": "claude",
+  "codex": {
+    "model": "gpt-6-sol",
+    "laneModels": { "search-redesign": "gpt-6-luna" }
+  },
   "claude": {
     "model": "claude-opus-5-5",
-    "laneModels": { "search-redesign": "sonnet" },
+    "laneModels": { "qa": "sonnet" },
     "permissionMode": "acceptEdits",
-    "allowedTools": ["Bash", "PowerShell"],
-    "disallowedTools": ["Bash(git push:*)", "Bash(gh pr:*)", "WebFetch", "WebSearch"]
+    "allowedTools": [],
+    "disallowedTools": ["Bash(git push:*)", "Bash(gh pr:*)"]
   }
 }
 ```
 
-Omitted fields use the values shown, except `model`, which defaults to the CLI's configured model. `claude.laneModels[<slug>]` takes precedence over `claude.model`. Model values are passed to `claude --model` unchanged, so exact IDs such as `claude-opus-5-5` and CLI aliases such as `sonnet` both work. Each turn is one `claude -p` process in the feature clone, resumed by session ID, with the feature contract appended to the system prompt and the context packet directory added as a readable root. Workers run with `--strict-mcp-config` and an empty MCP configuration, no settings files, no skills and no browser integration, so a lane cannot call OVERDRIVE, hooks or the coordinator's integrations. A mid-turn steer is queued as the next user message of the same process; an interrupt terminates the process tree. Compaction requests are acknowledged without a model call because Claude Code compacts its own context; the saved checkpoint remains the semantic boundary.
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `harness` | `codex` | Harness for new agent sessions. A saved session always resumes on the harness that created it; `agent_start` with `force_new_session: true` replaces it on the current one, and the old conversation stays in its backend. |
+| `codex.model`, `claude.model` | `gpt-6-sol`; the Claude CLI's configured model | Worker model for the workspace. Claude accepts exact IDs and CLI aliases. |
+| `codex.laneModels`, `claude.laneModels` | none | Per-agent model, keyed by lane slug or QA agent name. |
+| `claude.permissionMode` | `acceptEdits` | One of `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`. Decides which calls prompt. |
+| `claude.allowedTools` | `[]` | Allow rules; a matching call runs without a prompt. |
+| `claude.disallowedTools` | `["Bash(git push:*)", "Bash(gh pr:*)"]` | Deny rules. Setting this replaces the default list. |
 
-A Claude turn's tools can outlive the CLI, whether started detached or as an ordinary `npm test` tree, so the lane's safety boundary is the whole process tree, not the CLI process. On Windows each worker runs under a small Windows PowerShell warden that places itself in a named kill-on-close Job Object before starting the CLI. Everything the CLI launches is born in that job, so the lane's worker guard clears only once the job no longer exists or holds no process; until then checks, candidate recording and completion are refused. The warden adds about half a second to each turn start. A pause, an interrupt or the next turn start stops a remaining tree by terminating its job, which confirms the stop. The warden is an ordinary child of the controller, which Node places in a kill-on-close job of its own, so a controller that exits, even abruptly, also ends its wardens and with them their trees. Nothing records that exit, so the guard stays until a later controller's inspection, pause or turn start finds the recorded job gone; no attestation is needed. The job cannot see work handed to something outside it (services, Task Scheduler, WMI, an already-running Explorer or daemon), and a tool that insists on breaking away from its job fails to launch. Where no job can be created (other platforms, a Windows PowerShell restricted by Constrained Language Mode, or a worker that is not a native `.exe`), workers run uncontained and fail closed: every turn keeps its guard, so checks, candidates, completion and the next turn wait until the coordinator verifies that no process for the lane is running and supplies `prior_turn_attestation: { evidence }` to `agent_start` or a pause. The turn's handoff says when this applies.
+Model and permission changes apply from the next turn; `harness` applies to new sessions.
 
-Permission prompts cannot be relayed from a non-interactive Claude worker: anything outside the permission mode and allow list is denied automatically and the denied tool names are appended to the turn's handoff. The default policy therefore allows shell commands, confines Claude's file-edit tools to the clone and packet directory, and denies the web tools. Its `Bash(git push:*)` and `Bash(gh pr:*)` rules block the common direct publication commands only; they match command prefixes, so equivalent commands through PowerShell or forms such as `git -C <path> push` are not blocked. These rules are not a sandbox. Unlike the Codex `:workspace` sandbox, shell commands are not filesystem- or network-contained on Windows; treat `bypassPermissions` as an explicit per-workspace choice. Agent tools need the server process that started the turn; a one-shot client that exits after each call ends the worker with it, so drive `agent_*` from a persistent MCP connection.
+The worker permission policy ([architecture](architecture.md#worker-capability-profiles)) answers only the calls that prompt. A call matching `allowedTools`, or one the permission mode lets through without prompting, skips it. Under `bypassPermissions` nothing prompts, so publishing is then blocked only by `disallowedTools`. Deny rules hold in every mode, and feature agents always get deny rules for the browser and computer-control servers on top of this list.
 
-Create a lane in ordinary language. The feature clone appears at `features/<slug>/repo`; its branch is `feature/<slug>`. The clone commits with an adopted local source's repository-local `user.name`/`user.email` when the source has both, as work in that source would; otherwise with your existing Git identity when one is configured; and otherwise with the clone-local `OVERDRIVE <overdrive@local.invalid>` automation identity. The coordinator reports the author and committer Git will actually record, including any inherited `GIT_AUTHOR_*`/`GIT_COMMITTER_*` or command-line overrides, with optional commands to set a lane-local identity; work does not wait for that choice. Global and system Git config are never changed. With the Codex harness, feature tasks appear as normal persisted Codex tasks and can be opened directly when desired. Their app-server disables apps, hooks, plugins, browser/computer control, and external MCP servers, so a lane worker cannot call OVERDRIVE recursively or bypass coordinator-owned external authority.
+Codex workers have no permission settings: they run in the `workspace-write` sandbox with network access, and the policy answers their escalations. Questions and MCP elicitations from a worker reach the coordinator as pending requests, answered with `agent_request_resolve`.
 
-To start from an explicitly reviewed, unpromoted sibling candidate, pass its lane as `base_feature` and its full frozen commit ID as `base_revision`. The runtime validates that commit in the source lane and fetches its committed objects directly into the independent new clone; the source may have advanced or have dirty files, which are not included. This selects provenance, not candidate approval. Canonical source/cache publication is unnecessary: the cached mirror seeds the clone without a refresh, so this works while canonical source is unavailable, and the result reports `canonicalSource.status` as `cached`. Omitted or canonical bases still refresh canonical source first and fail when it is unavailable. Confirm the callable schema supports `base_feature` before using it; older runtimes need the previously verified cache-based workflow or a coordinated update. Without `base_feature`, the selected revision must resolve in the refreshed cache; private ref names can be pruned, so use their full commit ID. Repository-profile hints describe the selected base checked out in the new clone; they are hints, so inspect that checkout's actual setup requirements.
+## The lab
 
-Checkout-construction failures retain their partial directory and return its path, selected revision and recovery guidance before feature registration. Inspect any existing path and durable state before an authorized recovery; an occupied slug is never overwritten automatically. Errors later in registration/projection can have different state and must be reconciled separately.
+`lab/` is created at initialization, or on first use in older workspaces, with a README that QA agents follow. QA agents own its contents and commit to it. Each suite is a directory:
 
-Before dispatch, the coordinator prepares known-needed dependencies and local Git refs when already authorized, using repository instructions and lockfiles. Dependency reinstalls must be coordinated with any preview in that clone. Assign known environment-limited probes, such as native PostgreSQL initialization under a restricted Windows token, to the coordinator along with protected local Git operations. Give the worker the preparation result and execution ownership so it can continue implementation and supported focused checks.
+```text
+lab/suites/<name>/suite.json
+{
+  "description": "What this suite proves",
+  "argv": ["node", "run.mjs"],
+  "cwd": "suite",
+  "timeout_seconds": 600,
+  "features": ["search-redesign"]
+}
+```
 
-For an existing work item, the coordinator claims it as running with `work_update` before dispatch or resumption, retains a stable owner for renewals and reconciliation, and sends its exact key and outcome. A worker cannot call OVERDRIVE to claim work or update leases. If dispatch fails, confirm whether a worker started before correcting the claim; if it completes, reconcile actual changes and command evidence before recording the work outcome. Agent completion alone does not mark work done or produce execution receipts.
+- `<name>`: lowercase letters, digits, `-` and `_`.
+- `argv`: 1 to 200 strings, run without a shell.
+- `cwd`: `suite` (the suite directory, the default) or `target` (the checkout under test).
+- `timeout_seconds`: 1 to 3600, default 600.
+- `features`: optional, the lanes the suite covers.
 
-`work_plan` returns current records only for the keys submitted in that call, alongside the feature summary, aggregate progress and next action. Omitted items remain in the graph. Use `feature_get` for complete work records or `view` for explicit graph inspection.
+Every run receives this environment:
 
-When a probe encounters a demonstrated environment restriction, hand off its exact argv, checkout/revision, relevant environment requirements, failure output, and service/cleanup scope instead of repeating unchanged setup or permission requests. The coordinator runs the authorized focused command when its checkout and resources are available, verifies owned cleanup, and returns the actual result promptly while independent work continues. Classify the restriction as an environment failure; require fresh product evidence from the capable environment. Required acceptance checks still need normal revision-bound OVERDRIVE execution receipts; an ad hoc command result or worker report does not replace them.
+| Variable | Value |
+| --- | --- |
+| `OVERDRIVE_TARGET` | Clean clone at the revision under test |
+| `OVERDRIVE_REVISION` | Commit under test |
+| `OVERDRIVE_LAB` | The lab repository |
+| `OVERDRIVE_SUITE` | Suite name |
+| `OVERDRIVE_ARTIFACTS` | Empty directory for this run's screenshots, logs and traces |
+| `OVERDRIVE_PORT` | A free TCP port on 127.0.0.1 |
 
-During active coordination, reconcile completed workers and checks promptly and advance ready work. A requested notification interval governs reporting; it is not a reason to leave a completed handoff waiting. Continue independent lanes while another lane needs investigation or a user decision.
+A suite starts every service it needs and stops it before exiting. Target clones keep ignored directories such as `node_modules` between runs, so dependency setup should be idempotent, for example reinstalling only when the lockfile changed. Keep dependencies and outputs out of the lab's Git with `.gitignore`, because every run snapshots the lab's working tree.
 
-Use `agents_wait` to receive the first handoff among up to eight unreconciled workers, then review the returned lane and advance its authorized next action. Remove handled idle lanes from the wait set. On a verification drain's completion, reconcile its `completed` and `needsAttention` results immediately, including candidate preparation when the complete gate passes. These calls drive an active coordinator; they cannot wake an ended host turn or perform source review and candidate judgment themselves. Scheduled follow-up remains necessary for that host boundary.
+`lab_run {suite, target, revision?}` targets a lane slug or `integration`. Without a revision a lane is tested at a snapshot of its working tree, uncommitted changes included, and the integration build at its HEAD. A run is `passed` (exit 0 within the timeout), `failed`, or `uncertain` when its processes could not be confirmed stopped. Artifacts stay in `.overdrive/lab/runs/<id>/artifacts/`, with a manifest of path, size and sha256. `lab_run` returns a 4,000-character output tail; `lab_get {run}` returns the full stored tail of up to 24,000 characters and the artifact list. `lab_get` without a run lists the suites, the latest runs, the integration build and, on request, findings.
 
-For OVERDRIVE-owned workers, reconcile liveness through their owning OVERDRIVE controller. An app task view reporting `notLoaded` or `interrupted` does not by itself establish that this controller's active turn stopped; compare the exact turn and controller state before recovery or redispatch. If refresh fails, preserve that uncertainty instead of declaring completion or starting a competing worker.
+Feature agents may read the lab and run suites against their own lane only. QA agents may run any target, record findings and build integrations.
 
-## Claude Code installation
+`finding_record` opens a finding on a lane (`blocking` by default, or `minor`) and messages the lane. A finding with a `repro_suite` is resolved by a passing run of that suite on the lane, or on an integration that includes it, at a revision containing the one it was found at. Only the coordinator marks a finding resolved by hand; QA agents and the coordinator can close one as `wontfix` with a note.
 
-`plugins/overdrive/` packages the OVERDRIVE coordinator for Claude Code: the `overdrive` skill (the Codex skill rewritten without Codex-only mechanics) and an inline MCP declaration that launches the shared server from `plugins/overdrive/scripts/server.mjs`. The plugin references that server through `${CLAUDE_PLUGIN_ROOT}/../overdrive/`, so it must stay inside this repository checkout; the repository root also carries `.claude-plugin/marketplace.json` for a local marketplace named `overdrive-local`.
+## Integration and publishing
 
-Validate with `claude plugin validate plugins/overdrive`. For one session, start Claude Code with `--plugin-dir C:\path\to\overdrive\plugins\overdrive-claude`. To install persistently, run `/plugin marketplace add C:\path\to\overdrive` once, then `/plugin install overdrive@overdrive-local` (or `claude plugin install overdrive@overdrive-local --scope user`). A control workspace that already declares `overdrive` in its own `.mcp.json` should remove that entry when the plugin is installed, otherwise the server is loaded twice with duplicate tools; a workspace that wants only the skill can instead copy `plugins/overdrive/skills/overdrive/` into its `.claude/skills/` directory. Agent tools must be called through the session's MCP connection: a one-shot stdio client that exits after each call terminates the worker turn it started.
+`integration_build {features, base?}` merges lanes in order into `.overdrive/lab/integration`. Each entry is a lane slug, which contributes a snapshot of its working tree, or `slug@ref` for an exact revision. On a conflict, the build stops with the lane and the conflicting files, and leaves the merge in place. Resolve and commit it in the integration clone, or run `git merge --abort` there and have the lanes reconcile. Lanes after the conflict are not merged yet (`lab_get` lists them as `pending`), so rebuild to include them; rebuilds replay the recorded resolution. Then test the integration with `lab_run` on target `integration`.
 
-## Deliver progressively
+`integrate {target, revision?}` takes a lane or `integration` and only committed work, so test the exact commit you mean to integrate:
 
-For multi-feature work, use the integration lane as an evolving deliverable. Start with the smallest coherent reviewed set of exact inputs and add later inputs as they become ready. A missing input blocks only behavior that depends on it; retain the complete final acceptance gate. An intermediate combined preview is not a release-ready candidate.
-
-As soon as that slice supports the first meaningful user outcome and cheap readiness checks pass, prioritize walking the actual journey from normal entry through the user's approach, core action and observable result before further component polish. Use the real interface when the behavior depends on rendering or input. Controlled fixtures establish only the states and paths they exercise; placing the user inside an interaction or bypassing its approach does not prove ordinary reachability. Send concrete failures, including the relevant input/state and observed result, promptly to the responsible owner; use a focused reconstruction when useful, then retry the affected ordinary path while independent work continues. This priority does not require another framework, broad suite or approval step.
-
-Give independent bounded reviews one owner each, exact revisions and concrete behavior/integration questions. Feature workers own implementation and focused checks; reviewers assess source; the coordinator prepares authorized setup/Git work, reconciles evidence and makes delivery decisions. Keep included revisions, owners/results and pending-input blockers in the existing integration checkpoint and work items. Reuse unchanged valid reviews and current receipts, but verify each resulting integration revision. Do not serialize all reviews through the coordinator or add a second orchestration graph merely to track the same work.
-
-## Deliver selected peer inputs
-
-A sibling commit ID identifies source; it does not make that commit readable in another isolated clone. Before assigning work that depends on it, the coordinator delivers the deliberately selected peer input and verifies access from the receiving checkout. For an authorized Git intake, fetch the frozen full commit ID from its owning clone into a named destination ref, then confirm `git cat-file -e <commit>^{commit}` and the required paths in the destination. Coordinate destination Git writes with its owner; preserve its HEAD and working files. Tell the worker the exact input revision, relevant paths and integration question rather than asking it to discover or fetch sibling context.
-
-When destination Git writes are unsuitable, export selected committed files with `git archive` and, if needed, a binary/full-index patch between explicit base and target commits. Write a fresh bundle under the receiver's ignored `.overdrive/source-intake/` directory. Record the source clone, full base/target IDs, selected paths, additions/deletions or mode changes, and SHA256 hashes of the delivered artifacts in a manifest. Read committed Git objects rather than mutable working files, preserve earlier bundles, and publish the handoff only after verifying the files and manifest. This is source input, not applied code or acceptance evidence; the receiving owner decides how to compose it. Once actual peer inputs exist, use cheap checks against those modules for the relevant interface seam instead of continuing to infer compatibility from adapter stubs. Keep unrelated work moving while a missing input is delivered.
+- **Managed project:** fast-forwards `project/` when it is clean and on its default branch, the commit contains its HEAD, a lab run passed at that commit, and no blocking finding is open on the included lanes. The lanes become `done` and new lanes start from the new HEAD. `PROMOTION_NOT_FAST_FORWARD` means the commit does not contain the project HEAD; rebuild the integration on the current HEAD, which `integration_build` does by default.
+- **Adopted repository:** changes nothing. It returns the commit, the passing run and any open blocking findings. With the user's authority, the coordinator publishes with ordinary Git. A lane clone's `origin` is the adopted repository. The integration clone's `origin` is the private mirror, so push from it to the repository URL explicitly.
 
 ## Recovery
 
-After a new coordinator task or compaction:
+**Controller restart.** The first command that reads a lane whose controller has exited releases it. A busy agent becomes `uncertain` when its turn may still be running, and `disconnected` otherwise; idle agents are unchanged. Checkouts, sessions and pending messages are kept. Requests pending on the old process cannot be answered (`REQUEST_ORPHANED`); the worker asks again on its next turn. A controller sweeps messages only while it runs at least one agent, so after a restart review `feature_list` and `agent_start` the agents you want running. Their waiting messages open the new turns. A lab run left running by an exited controller is marked `uncertain` by the next run on that target.
 
-1. Read `.overdrive/index.md` or call the feature-list tool.
-2. Load only the focused feature's context.
-3. Reconcile the recorded task status with the native task and live Git state.
-4. Continue from the saved next action; do not reconstruct old deliberation.
+**Uncertain dispatch.** When a turn request got no confirmed answer, the lane stays `uncertain` and no new turn starts until the native session shows whether one ran. The next `agent_inspect`, `agent_start` or `agent_steer` settles it from Codex history. A Claude session resumed by a later controller has no readable history, so `agent_start` fails with `DISPATCH_UNCERTAIN`. Check that no process for the lane is running, for example the processes whose working directory is its checkout. Then retry with `prior_turn_attestation: { "evidence": "<what you checked and found>" }`, which is recorded in the timeline.
 
-Archiving sets a lane's next action to the terminal archived direction. An archived lane refuses candidate recording with `INVALID_TRANSITION` and leaves its status, direction and candidates unchanged; reactivate it with the feature-status tool first. A checkpoint saved after the archive may record explicit historical direction, and repeating the archive keeps it; reactivating replaces only the terminal text. Lanes archived before this behavior keep their stored direction, except that a recorded candidate's review instruction reads as the archived direction unless a checkpoint followed the lane's latest recorded archive. Other stored text is not rewritten, because it cannot be told apart from an explicit checkpoint without ordering the lane's history; treat it as history, or checkpoint the lane with the direction it should show.
+**Unconfirmed worker processes.** `WORKERS_UNCONFIRMED` (on start) and `STOP_UNCONFIRMED` (on pause or archive) mean tools an earlier Claude turn launched may still be running. A guard whose Job Object has ended clears on the next inspect, start or pause. An attestation, passed as `prior_turn_attestation` to `agent_start` or to the pausing `feature_update`, clears only guards whose job no longer exists or was never recorded. A job that still holds processes must end first. When another live session owns the lane, pause it from that session or attest.
 
-Switching lanes automatically compacts the outgoing feature task when it is idle. For the coordinator itself, use the single `/compact` recommendation returned after a substantial switch; MCP servers cannot safely compact the already-loaded host task from a second app-server process.
+**Stuck agents.**
 
-If Codex restarted during an approval prompt, the old callback cannot safely be answered. Inspect the feature, resume or steer it, and let it issue a fresh request.
+- `agent_inspect` shows safe progress, the live diff and pending requests.
+- `agent_steer` redirects the running turn.
+- `agent_interrupt` stops the turn and keeps the session and checkout.
+- `feature_update {status: "paused"}` stops the worker and holds further dispatch.
+- `agent_start` with `force_new_session: true` starts a fresh session, and is required when an old session has no recorded harness (`SESSION_OWNER_UNKNOWN`).
+- `AGENT_OWNED` means another live coordinator session runs the lane: use that session or wait for its turn to end.
 
-An ended controller is detected by its persisted process owner; inspection clears stale activity and preserves the checkout. A running lane owned by another live coordinator cannot be started again from a competing session. Pausing requests interruption; switching focus alone preserves lifecycle state. A paused lane refuses candidate recording with `INVALID_TRANSITION` and leaves its status, direction and candidates unchanged; resume it with the feature-status tool first. The existing desktop coordinator still needs the explicit `/compact` command at substantial context boundaries.
+**Directories.** OVERDRIVE never deletes a directory it did not finish creating. For `PARTIAL_INITIALIZATION`, `FEATURE_PATH_OCCUPIED`, `LAB_PATH_OCCUPIED` or `CLONE_INVALID`, inspect the named path, keep what matters, move it aside and retry. `INTEGRATION_DIRTY` means an unfinished resolution in the integration clone: commit it or abort it there.
 
-Inspect `checks_queue` after a restart. Completed jobs retain their receipts; an interrupted command remains uncertain and reserves its clone and declared resources until explicitly resolved. Controller death does not prove child-process termination. Establish that the command processes stopped before using `checks_resolve` with a reason and `execution_stopped: true` to retry or cancel interrupted work. Resume eligible saved jobs instead of submitting duplicate work. On Windows, a check that passes its deadline is stopped with `taskkill /T`; if that fails and only the command itself could be stopped, or the command does not close, the check reports `COMMAND_TERMINATION_UNCERTAIN` without a receipt. A queued job becomes interrupted, and a direct `checks_run` records an interrupted `direct-*` job; either blocks checks, candidates and completion for that clone until resolved in the same way.
+## Windows notes
 
-## Verification and state views
-
-Configure the relevant repository/feature commands, then have the runtime execute them against the idle, clean candidate commit. Every current required check needs a latest passing execution receipt for the current spec/work/check contract. A report, old spec, earlier pass followed by a failure, or a command that changes the checkout cannot authorize delivery. Individual receipt output is available on demand. Existing version-2 workspaces migrate automatically: historical evidence survives, but old manually authorized candidates need fresh verification.
-
-Use `check_keys` on `checks_run` for focused execution only when the actual callable schema exposes it. Installed files do not prove what an existing task loaded. If the field is absent, do not attempt that unsupported selection; settle any active run, reconcile its receipts, then use the existing selective helper described under Updating the development install to reach a verified fresh controller. Omit selection only when a full run is intended. For an already-reviewed sequence, enqueue one configured check per job with `checks_enqueue`, stating real dependencies and shared resources. Drain with bounded concurrency, command count and admission time using `checks_drain`. A successful job releases its eligible successors immediately; a failure stops dependent work while unrelated lanes can proceed. The same clone is serialized automatically. Declare shared ports and sensitive performance resources consistently; previews and commands outside the queue still require coordinator scheduling.
-
-Queue inspection separates waiting from execution time. Jobs bind to the exact revision and complete contract; source or contract changes require fresh work and evidence. The queue does not dispatch workers, decide repairs or record candidates. All required final acceptance checks remain mandatory even when focused checks or an intermediate combined preview are ready.
-
-For each external resource lease used by a check, record its path and one claim/release owner alongside the command in the existing checkpoint. Follow the actual adapter contract, including after context recovery: let a self-claiming adapter acquire the idle lease; preclaim it only when the coordinator owns that protocol. Do not infer ownership from another check using the same resource. After failure, reconcile the recorded owner, actual process termination and cleanup before releasing your own claim; never automatically clear a busy or uncertain lease. A claim conflict before workload launch is a coordination failure, not a product result; fix that cause before the focused retry.
-
-Choose the smallest meaningful contract for the required behavior and plausible failures; do not copy every broad suite into every lane by default. Before retrying a failed scenario, compare its recorded inputs, state and observed response with the intended product rule. An allowed loss or rejection can fail the driver's objective without violating that rule. Preserve the failed receipt, achieved milestones and unexercised remainder; do not reroll a dynamic outcome or change product behavior merely to obtain a pass. If the evidence cannot distinguish an allowed outcome from a defect, or successful completion is itself required under those conditions, keep that acceptance unresolved. Separate independently executable required milestones from optional follow-ons where the specification supports it.
-
-Choose fresh validation from the changed behavior, its dependencies and plausible integration risks. An earlier complete journey informs that review at its original revision; it is not fresh proof. Matching Git trees can support source-equivalence review, but do not establish matching untracked fixtures, dependencies, services or command inputs and do not transfer runtime receipts across revisions. Small source changes do not automatically require another complete journey, and few changed lines alone do not establish narrow risk. Run focused current-revision checks that exercise the affected contract, including browser interaction where relevant; replay the journey when affected dependencies, unresolved integration risk or explicit acceptance require it. Disclose any bypassed setup or untested remainder.
-
-For each delivery, reassess accumulated blocking checks against its intended outcome, affected behavior, available evidence and remaining product qualification. A previously required command need not remain blocking forever: after active verification settles, revise obsolete or redundant gates when the current coverage justifies it, including a predicate that mistakes a scenario win for product correctness. Use the existing checkpoint to state what remains required, why coverage is sufficient, exact revisions/receipt references and what is only historical or still unqualified. Preserve substantive acceptance and failure history; an inconvenient failure alone does not justify making a required check optional. Current required checks still need eligible execution receipts before a new candidate; changing requiredness neither turns a failed receipt into a pass nor carries historical proof to a new revision.
-
-Direct multi-check execution stops on its first failure. Drain admission budgets stop new starts while admitted commands finish under their configured deadlines. The queue keeps at most 500 jobs per workspace. When an enqueue would exceed that, the oldest passed or cancelled jobs that no remaining job depends on and the live drain did not start are retired: the response lists their keys, a `checks.queue_retired` event keeps each full job record, and their evidence receipts are unchanged. Queued, running, interrupted, failed and stale jobs are never retired, so only live or unresolved work can reach the limit. Re-enqueuing a retired key stays idempotent; a new job cannot depend on a retired one. Attempt `queueWaitMs` measures enqueue-to-start (including prerequisites), `eligibleWaitMs` measures observed eligibility-to-start, and `executionMs` comes from the actual command receipt; neither waiting measurement is model execution time.
-
-When reusing or handing off a probe, make assertion-dependent fixture inputs explicit, such as generation, catalog or schema version; do not inherit changing defaults. Include those selectors with the command and confirm the resolved input during existing cheap setup. Preserve frozen comparison manifests, required input pins and semantic assertions. In an intended current-HEAD mode, replace only obsolete candidate-specific guards with clean-current-revision verification and actual module hashes. A setup mismatch before assertions proves neither a product defect nor a behavior pass; inspect related setup assumptions before the focused retry while preserving unaffected evidence.
-
-Use existing work updates and checkpoints for progress and result reporting. Work-status updates preserve the feature's next action while recording item status, blockers and results; checkpoint again when the intended direction changes. Plan, specification and candidate operations can still replace that direction. Adding or changing a work definition changes the current verification contract; ordinary status, owner and result updates do not. Preserve genuinely new requirements or repair scope in the plan even when that invalidates receipts. An earlier revision's observation remains useful evidence, not a current-revision execution receipt.
-
-For a standalone check with immutable non-Git inputs bound in its command or spec/work contract, set `reuse_same_revision: true` in its check definition to retain exact same-revision receipts across unrelated check edits. Leave this off for checks that consume mutable shared setup or opaque external inputs; an unchanged command alone does not establish unchanged inputs. The binding includes the spec/work contract and every normalized field of that check except this reuse policy, so changed command arguments, purpose/input binding, timeout, artifacts, kind or requiredness invalidate its proof. Other checks retain the full-contract rule by default. Candidates still bind the complete current contract and must be recorded again after a contract change; queue jobs also retain their full original authorization.
-
-For a reviewed independent check, optional `work_scope: ["exact-work-key"]` with `reuse_same_revision: true` binds only the selected work definitions and every transitive prerequisite. Omission binds all work. Scope is itself part of the check definition: adding or changing it requires prospective execution proof and cannot narrow legacy all-work receipts retroactively. Unrelated work additions preserve eligible scoped receipts; changes to selected definitions or prerequisites invalidate them. The complete specification and exact source revision remain bound.
-
-The runtime preserves receipt IDs, original contract hashes, results and artifacts. It records versioned per-check bindings at execution and atomically captures the exact old full contract before replacing check definitions. Thus an older receipt can gain a verifiable definition binding only when its recorded full hash matches that captured contract. Already-lost definitions are not reconstructed from argv or the latest configuration. The newest applicable receipt wins, including failures; opting out cannot revive an older pass over a newer known-equivalent failure. An unknown newer failure blocks reuse and is identified by `reuseBlockedBy`. Reused results expose `reused: true` and their receipt's original `contract_hash`. No cross-revision or changed external-input equivalence is inferred. Confirm the installed callable schema supports these options before using them.
-
-Plan changes still supersede the whole-contract candidate. Verification `ready` means current required receipts permit an intermediate candidate; `openWork` lists outstanding items, and `completionReady` additionally requires them closed. Feature completion retains its candidate, clean-checkout and idle-agent gates. Reconcile each new acceptance criterion with required checks and review before recording the new candidate; scoped proof is not coverage of unrelated new work. Closing work creates no execution evidence, and adding a required check blocks candidate readiness until it has proof. Review and integration work may remain open for an intermediate candidate, avoiding a cycle where finishing that work requires the candidate itself.
-
-Ask for the work graph to see dependencies, task states, and blockers as a native diagram in the conversation. Larger graphs can focus on selected work keys and label prerequisites outside the view. Other state—evidence, handoff, specs, and feature summaries—is normally answered in prose from scoped snapshots. Steering, switching, and refresh requests stay in the existing chat. There are no embedded forms, chat boxes, control panels, or separate dashboard.
-
-## Failure handling
-
-Treat `selectedCheckKeys` as a request, not a list of running work. A completed run's `completion` separates selected, executed, passed, failed and `notRunCheckKeys`; omitted execution does not create or alter receipts. On `checks.finished`, close that invocation's work and join its shell/controller rather than waiting for selected-but-unrun commands. Inspect the failed receipt, then explicitly run independent needed checks or admit them through the existing queue. The local selective client prints requested/finished events with its controller PID to stderr as well as completion in the JSON result, including when it uses the currently installed older response format. If no complete handoff arrives, it reports `checks.unconfirmed`: inspect the owned process and durable receipts before retrying. No additional polling loop is required.
-
-Initialization and clone failures preserve partial directories for diagnosis. OVERDRIVE will not automatically delete, stash, reset, or overwrite a dirty checkout. A failed work item remains visible; add repair work with explicit acceptance criteria. A feature blocked on user input does not freeze independent lanes.
-
-Keep temporary verification executables and their local support/fixture inputs available while coordinator review or registered execution still needs them. Leave the ignored originals in place, or preserve byte-exact inert source copies before removing runnable files; report archive locations, hashes, original restore paths, exact commands and source revisions. Hashes and result JSON are not source archives. This temporary handoff retention does not require permanent tests or application commits. Once downstream use is complete, ordinary temporary-file cleanup applies; do not wait for cleanup to deliver the handoff.
-
-Optional cleanup must not delay completed useful work. A worker unable to remove its own ignored temporary probes or fixtures within available permissions should retain them and finish its handoff with exact paths, purpose and deferred cleanup, without repeated attempts or escalation solely for housekeeping. Live services and residue affecting correctness still need explicit disposition. OVERDRIVE waits already return pending request summaries, payloads and creation times; reconcile them promptly and distinguish optional housekeeping from decisions blocking the requested behavior. Preserve request ownership and authorization, and let the worker finish its actual turn rather than synthesizing completion.
-
-Start with cheap environment readiness and focused behavior checks before broad suites. For rendering work, verify the backend actually selected by the intended browser/launch options and report it in the real workload; installed hardware or a headless label does not establish hardware acceleration. A small graphics-context probe establishes availability, not application performance, and earlier software-rendered evidence keeps its original qualification.
-
-Use actual inputs and observed results to distinguish environment, driver, resource-contention and product failures. Scope constraints to the responsible identity, shared resource or phase; keep unrelated participants concurrent and match deadlines to the operation and starting conditions measured. Once evidence identifies a driver-policy failure, simplify to the smallest native input sequence that can establish the remaining criterion instead of adding more bot heuristics. Preserve meaningful scenario progress, cumulative attempts and the applicable deadline across local retries or fallback calls; restarting a helper is not a new scenario. Correct product responses during a failed attempt establish those behaviors, not an unfinished end-to-end outcome. Probe the repair cheaply where useful, then retry the affected path while preserving target concurrency, behavior coverage, valid timing requirements and unrelated current evidence.
-
-## Updating the development install
-
-If an existing task still advertises an old schema, a necessary selective retry can use a fresh installed MCP controller without restarting that task:
-
-```powershell
-node C:\path\to\overdrive\tools\run-installed-checks.mjs `
-  C:\path\to\codex-home\plugins\cache\overdrive-local\overdrive\<verified-version> `
-  <control-workspace-path> <feature> <exact-check-key> [additional-check-key]
-```
-
-Replace the angle/bracket placeholders with actual arguments; `<verified-version>` is the installed cache directory of the plugin version you verified. The client requires a nonempty selection, initializes the installed server, checks its advertised schema, and calls normal `checks_run`. It refuses older schemas before execution. Normal clone locks, idle/clean checks, interruption reservations, receipt persistence and the full acceptance contract still apply. It keeps stdin open until the tool finishes under the configured check deadlines; do not pipe a one-shot request directly into `server.mjs`. Installing this helper executes no checks. Pin the verified package's installed path; use a newly verified installed path after a future update.
-
-Validate the plugin, update its Codex cachebuster, and reinstall it from the `overdrive-local` marketplace. Test changed tools in a fresh Codex task so the task receives the new manifest, skill, and MCP process.
+- **Long paths:** every clone OVERDRIVE creates sets `core.longpaths=true`, so deep paths work without a system-wide change.
+- **Loopback only:** bind every server to 127.0.0.1, never `0.0.0.0` or all interfaces, which triggers Windows Firewall prompts. Suites should use `OVERDRIVE_PORT`.
+- **Symlinks:** Git creates symbolic links only with Developer Mode enabled (and `core.symlinks=true`); otherwise they check out as small text files. OVERDRIVE refuses to manage workspace paths that pass through a symlink or junction.
+- **Line endings:** the runtime never sets `core.autocrlf`; clones, lab targets and integration builds follow your Git config. Suites that compare exact bytes should rely on the repository's `.gitattributes`.
+- **Claude containment:** each Claude turn runs under a small Windows PowerShell warden in a kill-on-close Job Object, adding about half a second per turn start. Where the job cannot be created, as under Constrained Language Mode, workers run uncontained, and each later turn and pause needs an attestation.

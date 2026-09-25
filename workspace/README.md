@@ -1,17 +1,15 @@
 # OVERDRIVE workspace
 
-Open this folder in a fresh Codex task; its local configuration defaults the coordinator to GPT-6 Astra. Paste a repository URL:
+Open this folder in a fresh Codex task, or in Claude Code with the plugin installed. For Codex tasks, `.codex/config.toml` makes GPT-6 Astra the coordinator model unless you choose another.
+
+Adopt a repository:
 
 > Use OVERDRIVE with https://github.com/owner/repository.git
 
-Or begin without a repository:
+Or start from a brief:
 
 > Start a new OVERDRIVE project called Atlas that helps teams triage incidents.
 
-OVERDRIVE will create its local state here. Feature clones appear under `features/`; compact specs, checkpoints, and the navigation index appear under `.overdrive/`, alongside the `overdrive.json` configuration. You can create, switch, inspect, pause, resume, steer, and finish features entirely through normal Codex requests.
+Nothing is set up yet. Initialization adds `overdrive.json`, the `.overdrive/` state directory and the QA lab in `lab/`, plus `project/` for a new project. It never runs repository setup scripts. Lane clones then appear under `features/`.
 
-Nothing is configured yet. Existing-repository initialization never runs setup scripts automatically. Scratch initialization creates a minimal local Git repository under `project/`; completed, evidence-backed candidates can be promoted there by fast-forward so each later lane inherits accepted work.
-
-Lane workers run as Codex tasks using `gpt-6-sol` unless `overdrive.json` sets `codex.model` or a per-lane `codex.laneModels` entry; ask the coordinator to change it. The coordinator's own model is chosen separately in this task.
-
-Ask “Show the work graph” to see dependencies, progress, and blockers directly in the conversation. Ask questions and steer through this chat as usual. Delivery requires current executed checks; the coordinator keeps reports and verified results distinct.
+From there, ask for lanes, QA agents, progress, steering and integration in plain language. The [main README](../README.md) has examples.

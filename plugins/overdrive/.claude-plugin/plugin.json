@@ -1,16 +1,17 @@
 {
   "name": "overdrive",
   "version": "0.1.0",
-  "description": "OVERDRIVE: run each feature in an isolated repository clone and orchestrate its worker from Claude Code, with durable specs, live steering and executed verification.",
+  "description": "OVERDRIVE: run parallel feature lanes from Claude Code, with isolated clones and worker agents, QA agents in a decoupled test and integration lab, direct agent messaging, and worker boundaries the runtime enforces.",
   "author": {
     "name": "Harrison Pedrero"
   },
   "keywords": [
     "overdrive",
     "orchestration",
-    "feature-clones",
     "feature-lanes",
-    "verification"
+    "multi-agent",
+    "qa-lab",
+    "integration"
   ],
   "mcpServers": {
     "overdrive": {

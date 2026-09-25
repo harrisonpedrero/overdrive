@@ -1,30 +1,30 @@
 {
   "name": "overdrive",
-  "version": "0.1.0+codex.20260924073704",
-  "description": "OVERDRIVE runs each feature in an isolated repository clone and orchestrates the lane workers, with durable specs, live steering, executed verification, and an inline work graph.",
+  "version": "0.1.0+codex.20260925104051",
+  "description": "OVERDRIVE runs parallel feature lanes against one repository from a single conversation: isolated clones and worker agents, QA agents in a decoupled test and integration lab, direct agent messaging, and worker boundaries the runtime enforces.",
   "author": {
     "name": "Harrison Pedrero"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "OVERDRIVE",
-    "shortDescription": "Isolated feature clones, orchestrated from Codex.",
-    "longDescription": "OVERDRIVE develops a repository through isolated feature clones orchestrated from one conversation. Adopt a repository or begin a managed project from scratch; every feature lane gets its own full clone, durable spec, and context packet. The coordinator refines specs, dispatches and steers lane workers, and checkpoints context. A native work graph shows dependencies, progress, and blockers; all interaction stays in the existing conversation. Required checks execute against exact commits and the current feature contract before a lane is accepted.",
+    "shortDescription": "Parallel feature lanes with a QA lab, run from Codex.",
+    "longDescription": "OVERDRIVE develops a repository through parallel feature lanes coordinated from one conversation. Adopt a repository or start a managed project from a brief; each lane gets a full clone, a durable spec and its own worker agent. QA agents build reusable suites in a local lab kept out of the product repository, test lanes and integration builds at exact revisions, and send findings straight to the responsible lanes. Agents message each other while the coordinator decides, steers and integrates. Only runs the runtime executes count as evidence, a managed project advances only by fast-forward to a tested commit, and the runtime denies workers publishing and coordinator tools, and denies browser and computer control to feature agents.",
     "developerName": "Harrison Pedrero",
     "category": "Productivity",
     "capabilities": [
-      "Isolated feature clones",
-      "Spec iteration",
-      "Agent orchestration",
-      "Progress and steering",
-      "Native work graph",
-      "Executed verification"
+      "Parallel feature lanes",
+      "QA and integration lab",
+      "Agent messaging",
+      "Runtime-enforced worker boundaries",
+      "Executed lab evidence",
+      "Native work graph"
     ],
     "defaultPrompt": [
       "Set up OVERDRIVE for this repository.",
       "Start a managed project from a product brief.",
-      "Create a feature lane and refine its spec.",
-      "Show this feature's work graph and what is blocked."
+      "Create a feature lane, refine its spec and start it.",
+      "Add a QA agent and test an integration of my lanes."
     ],
     "brandColor": "#7C3AED"
   },

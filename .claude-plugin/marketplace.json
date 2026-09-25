@@ -1,5 +1,6 @@
 {
   "name": "overdrive-local",
+  "description": "Local development marketplace for the OVERDRIVE plugin.",
   "owner": {
     "name": "Harrison Pedrero"
   },
@@ -7,7 +8,7 @@
     {
       "name": "overdrive",
       "source": "./plugins/overdrive",
-      "description": "OVERDRIVE coordinator skill and MCP server for Claude Code."
+      "description": "Parallel feature lanes, a QA and integration lab, and agent messaging, coordinated from Claude Code with runtime-enforced worker boundaries."
     }
   ]
 }
