@@ -49,6 +49,10 @@ const targetName = value => (value === 'integration' || value === 'base' ? value
 const agentName = value => (value === undefined || value === 'coordinator' ? 'coordinator' : safeSlug(value, 'from'));
 const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
 const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
+// A run holds its target's lock for its whole suite, so a queued run waits as long as it can still finish
+// within the hour its MCP clients allow a call (tool_timeout_sec), and never less than the usual two minutes.
+const LAB_CALL_BUDGET_MS = 3_600_000;
+const labRunLockWait = suite => Math.max(120_000, LAB_CALL_BUDGET_MS - suite.timeout * 1_000);
 
 // Lock names allow 63 characters after the optional control- prefix, so a long lane slug is hashed.
 function labLock(target) {
@@ -256,7 +260,7 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
         ...(targetSlug === 'integration' ? { included: features } : {}),
         next: `lab_get {"run": "${id}"} returns the full output and artifact list.`,
       };
-    });
+    }, { timeoutMs: labRunLockWait(spec) });
   });
 }
 
@@ -480,15 +484,17 @@ function unpassedRunsNote(runs) {
 }
 
 // An adopted repository is never published to; a tested commit with no open blocking findings is
-// delivered, and the user publishes it with the returned push command.
+// delivered, and the user publishes it with the returned push command or fetches it into their own clone.
 async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs) {
   const delivered = Boolean(passing) && !blocking.length;
   if (delivered) await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, runs });
-  const push = `git -C "${source}" push "${ctx.config.repository}" ${commit}:refs/heads/${branch ?? '<branch>'}`;
+  const ref = `${commit}:refs/heads/${branch ?? '<branch>'}`;
+  const push = `git -C "${source}" push "${ctx.config.repository}" ${ref}`;
+  const fetch = `git fetch "${source}" ${ref}`;
   const unpassed = unpassedRunsNote(runs);
   return {
-    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, openBlockingFindings: blocking.map(finding => finding.id), push,
-    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command${branch ? '' : ' after replacing <branch> with a new branch name'}, then merge the branch through the repository's normal review.${unpassed ? ` ${unpassed}` : ''}`,
+    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, openBlockingFindings: blocking.map(finding => finding.id), push, fetch,
+    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${unpassed ? ` ${unpassed}` : ''}`,
   };
 }
 

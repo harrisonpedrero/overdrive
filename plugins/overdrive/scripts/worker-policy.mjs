@@ -19,7 +19,11 @@ export const BROWSER_CONTROL = /chrome|browser|computer|playwright|puppeteer|cua
 // gh api calls with a writing method all count as publishing.
 const GIT_PUSH = String.raw`git(?:\.exe)?["']?(?:\s+-\S*(?:\s+(?:"[^"]*"|'[^']*'|\S+))?)*\s+(?:subtree\s+)?push`;
 const GH_API_WRITE = String.raw`gh\s+api\b[^\n;&|]*\s(?:-X|--method)[\s=]*(?:POST|PATCH|PUT|DELETE)`;
-const PUBLISH_COMMAND = new RegExp(String.raw`\b(?:${GIT_PUSH}|gh\s+(?:pr\s+(?:create|merge|edit)|release|repo\s+create)|${GH_API_WRITE}|(?:npm|pnpm|cargo)\s+publish|yarn\s+(?:npm\s+)?publish|dotnet\s+nuget\s+push|twine\s+upload|docker\s+push)\b`, 'i');
+// The gh pr and gh issue subcommands that change GitHub; reads such as view, list, diff and checks stay allowed.
+export const GH_PR_WRITES = Object.freeze(['create', 'merge', 'edit', 'comment', 'review', 'close', 'reopen', 'ready', 'lock', 'unlock', 'revert', 'update-branch']);
+const GH_ISSUE_WRITES = ['create', 'edit', 'comment', 'close', 'reopen', 'lock', 'unlock', 'delete', 'transfer', 'pin', 'unpin', 'develop'];
+const GH_WRITE = String.raw`gh\s+(?:pr\s+(?:${GH_PR_WRITES.join('|')})|issue\s+(?:${GH_ISSUE_WRITES.join('|')})|release|repo\s+create)`;
+const PUBLISH_COMMAND = new RegExp(String.raw`\b(?:${GIT_PUSH}|${GH_WRITE}|${GH_API_WRITE}|(?:npm|pnpm|cargo)\s+publish|yarn\s+(?:npm\s+)?publish|dotnet\s+nuget\s+push|twine\s+upload|docker\s+push)\b`, 'i');
 const ALLOW = Object.freeze({ allow: true });
 const deny = message => ({ allow: false, message });
 

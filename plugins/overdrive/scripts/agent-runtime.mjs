@@ -688,8 +688,16 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
     }
     await notificationQueue;
     const initial = await Promise.all(runtimes.map(runtime => getFeatureContext({ workspace_path, feature: runtime.feature.slug, timeline_limit: 1 })));
+    // A listed agent at rest whose turn was already handed off has nothing new until its next turn;
+    // one starting or uncertain is still reported, as without a list.
+    const handedOff = ({ feature: { slug, agent } }) => Boolean(features) && registered.has(slug) && !registered.get(slug).handoffPending
+      && !agentBusy({ active_turn_id: agent.activeTurnId, agent_status: agent.status });
     for (const state of initial) {
-      if (!state.feature.agent.activeTurnId || state.pendingAgentRequests.length) signalled.add(state.feature.slug);
+      if (state.pendingAgentRequests.length || (!state.feature.agent.activeTurnId && !handedOff(state))) signalled.add(state.feature.slug);
+    }
+    if (features && !signalled.size && initial.every(handedOff)) {
+      const messages = await takeCoordinatorMessages({ workspace_path: root });
+      return { timedOut: false, handoffs: [], messages, nextAction: `${messages.length ? 'Act on these coordinator messages. ' : ''}${features.join(', ')} ${features.length > 1 ? 'are' : 'is'} idle and already handed off, so nothing is new until a turn starts; agent_inspect returns an agent's full state.` };
     }
     const signal = signalled.size || inbox.waiting() ? true : await changed;
     await notificationQueue;

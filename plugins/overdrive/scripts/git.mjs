@@ -122,13 +122,16 @@ export async function resetIntegration(root, base, baseSource, builtHead, origin
 // an explicit --ff overrides a user's merge.ff setting.
 export async function mergeIntoIntegration(root, clone, source, commit, message) {
   await fetchCommit(clone, source, commit);
-  const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--ff', '--no-edit', '-m', message, commit], { cwd: clone, env: automationEnv(), allowFailure: true });
+  // Dated at its later parent, as a snapshot is, so rebuilding the same lanes on the same base gives the same commit.
+  const time = Math.max(...(await git(clone, 'show', '-s', '--format=%ct', 'HEAD', commit)).stdout.split(/\r?\n/).map(Number));
+  const env = automationEnv({ GIT_AUTHOR_DATE: `${time} +0000`, GIT_COMMITTER_DATE: `${time} +0000` });
+  const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--ff', '--no-edit', '-m', message, commit], { cwd: clone, env, allowFailure: true });
   if (merged.exitCode === 0) return [];
   const conflicts = (await run(['git', 'diff', '--name-only', '-z', '--diff-filter=U'], { cwd: clone })).stdout.split('\0').filter(Boolean);
   if (conflicts.length) return conflicts;
   if (await exists(path.join(clone, '.git', 'MERGE_HEAD'))) {
     // rerere resolved every conflict from a recorded resolution; conclude the merge it describes.
-    await run(['git', ...runtimeGitConfig(root), 'commit', '--no-edit'], { cwd: clone, env: automationEnv() });
+    await run(['git', ...runtimeGitConfig(root), 'commit', '--no-edit'], { cwd: clone, env });
     return [];
   }
   throw new OverdriveError(`Merging ${commit} into the integration clone failed: ${(merged.stderr || merged.stdout).slice(-4_000)}`, 'INTEGRATION_FAILED');

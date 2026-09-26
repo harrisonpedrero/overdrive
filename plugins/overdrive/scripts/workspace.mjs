@@ -130,7 +130,7 @@ async function ensureWorkspaceFiles(root, config) {
   }
 }
 
-const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so, and stop every server before your turn ends.';
+const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so. Stop every server you started before your turn ends, by its PID or process tree (on Windows, `taskkill /PID <pid> /T /F`, with doubled slashes in Git Bash), never by image name such as dotnet.exe or node.exe: other agents\' lab runs and the user\'s own programs share this machine.';
 const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
 const SPEC_GAPS = 'When the spec contradicts its own goal, or a result meets the spec but would look wrong to the person using it, send `coordinator` the concrete example instead of following or encoding it silently, and keep working on the rest while it decides.';
 
@@ -163,10 +163,10 @@ function qaAgentInstructions(root, agent) {
 
 You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
 
-- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Wrap the repository's own checks (build, lint, existing tests) as a suite too, because lanes run only the checks nearest their change. The lab README describes the suite format.
+- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Where expected results would otherwise come only from the spec, add an independent oracle when one exists: an established tool or reference implementation to compare against, or real-world inputs. Wrap the repository's own checks (build, lint, existing tests) as a suite too, because lanes run only the checks nearest their change. The lab README describes the suite format.
 - Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
 - Run suites with lab_run; only runs the runtime executed are evidence. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes.
-- Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send. A conflict you resolve and commit in the integration clone is replayed on later builds.
+- Build and test integration combinations with integration_build. Your handoff reaches the coordinator, so message \`coordinator\` only when it must act before your turn ends. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
 - When every lane you are verifying is ready, test one commit that combines them (an integration build, or a lane that merged the others) instead of each lane. Test a lane head on its own when it is ready well before the others, or to localize a failure.
 - ${LOCAL_SERVERS}
@@ -576,7 +576,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Only lab_run produces evidence: the runtime runs the suite itself at an exact target revision and lab snapshot, and records the verdict, output and artifacts. A passing run resolves the open findings it is the repro suite for.
 - Keep suites deterministic: the same revision gives the same verdict.
 - Set up dependencies in the target idempotently, for example install only when the lockfile hash changed. Ignored directories such as node_modules survive between runs against the same target.
-- Start every service a suite needs within the run, and stop it before the run ends.
+- Start every service a suite needs within the run, and stop it by its PID or process tree, never by image name, before the run ends.
 - Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host (for Node, a --require preload that rewrites every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1) or leave those tests out and say so. Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).

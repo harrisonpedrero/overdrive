@@ -30,8 +30,7 @@ In Codex, `workspace_init`, `integrate` and `agent_request_resolve` ask for appr
     "model": "claude-opus-5-5",
     "laneModels": { "qa": "sonnet" },
     "permissionMode": "acceptEdits",
-    "allowedTools": [],
-    "disallowedTools": ["Bash(git push:*)", "Bash(gh pr:*)"]
+    "allowedTools": []
   }
 }
 ```
@@ -43,7 +42,7 @@ In Codex, `workspace_init`, `integrate` and `agent_request_resolve` ask for appr
 | `codex.laneModels`, `claude.laneModels` | none | Per-agent model, keyed by lane slug or QA agent name. |
 | `claude.permissionMode` | `acceptEdits` | One of `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`. Decides which calls prompt. |
 | `claude.allowedTools` | `[]` | Allow rules; a matching call runs without a prompt. |
-| `claude.disallowedTools` | `["Bash(git push:*)", "Bash(gh pr:*)"]` | Deny rules. Setting this replaces the default list. |
+| `claude.disallowedTools` | `Bash(git push:*)`, and `Bash(gh pr <subcommand>:*)` for each `gh pr` subcommand that writes (`create`, `merge`, `edit`, `comment`, `review`, `close`, `reopen`, `ready`, `lock`, `unlock`, `revert`, `update-branch`) | Deny rules. Setting this replaces the default list. |
 
 Model and permission changes apply from the next turn; `harness` applies to new sessions.
 
@@ -98,7 +97,7 @@ Feature agents may read the lab and run suites against their own lane only. QA a
 `integrate {target, revision?}` takes a lane or `integration` and only committed work, so test the exact commit you mean to integrate:
 
 - **Managed project:** fast-forwards `project/` when it is clean and on its default branch, the commit contains its HEAD, a lab run passed at that commit, and no blocking finding is open on the included lanes. The lanes become `done` and new lanes start from the new HEAD. `PROMOTION_NOT_FAST_FORWARD` means the commit does not contain the project HEAD; rebuild the integration on the current HEAD, which `integration_build` does by default.
-- **Adopted repository:** publishes nothing. It returns the commit, the checkout that holds it (`path`), the latest run of each suite at that commit, any open blocking findings, and a `push` command that pushes the commit from that checkout to the repository URL: to `feature/<slug>` for a lane, or to a branch name you fill in for the integration. When the commit has a passing run and no open blocking findings, the included lanes become `done`. With the user's authority, the coordinator runs the push.
+- **Adopted repository:** publishes nothing. It returns the commit, the checkout that holds it (`path`), the latest run of each suite at that commit, any open blocking findings, and two commands for a branch, `feature/<slug>` for a lane or a name you fill in for the integration: `push` pushes the commit from that checkout to the repository URL, and `fetch`, run in the user's own clone, creates the branch at the commit. When the commit has a passing run and no open blocking findings, the included lanes become `done`. With the user's authority, the coordinator runs the push, to the user's fork when they cannot push to the repository; otherwise the user runs the fetch.
 
 ## Recovery
 

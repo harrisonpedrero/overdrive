@@ -43,7 +43,7 @@ The control workspace is the directory that holds `overdrive.json`, normally thi
 - Keep the default name `qa` for the first QA agent, because feature agents address their notices to `qa`. Give it a brief naming the lanes, the journeys and behaviors to verify, the environments, and the integration you intend to deliver.
 - Add another QA agent, such as `qa-ui`, when lanes or surfaces would otherwise queue behind the first, as at a fan-out of several lanes. Name the lanes it covers in its brief, and tell those lanes to notify it instead of `qa`.
 - Do not relay messages between agents; they reach each other directly, and any agent can message `coordinator`.
-- Loop on `agents_wait`; with no `agents` it covers every agent you run. It returns finished turns with each agent's handoff, pending agent requests and messages to you, so specs need not ask lanes to message you when they finish. If the host moves a long wait to the background (Claude Code does after two minutes), its result arrives as a notification; do not start another wait meanwhile. Act on what needs you (decisions, blockers, stuck or looping agents, scope drift, review) and let the rest run.
+- Loop on `agents_wait`; with no `agents` it covers every agent you run. It returns finished turns with each agent's handoff, pending agent requests and messages to you, so specs and briefs need not ask agents to message you when they finish. If the host moves a long wait to the background (Claude Code does after two minutes), its result arrives as a notification; do not start another wait meanwhile. Act on what needs you (decisions, blockers, stuck or looping agents, scope drift, review) and let the rest run.
 - Keep independent lanes moving while you resolve a blocked one.
 - A finished turn is not a finished lane. Read the handoff, check Git, and choose the next step.
 - Steer with `agent_steer`. It reaches a running turn, starts a turn for an idle agent, or waits in the agent's inbox, so one call is enough. Make each steer self-contained and concrete.
@@ -68,6 +68,8 @@ The feature-agent contract asks for the following. Hold lanes to it in review:
 
 Before a lane is integrated, review its diff yourself: in its checkout, compare the working tree with its `baseRevision` from `feature_get`, untracked files included. Send concrete feedback (file, problem, expected change) with `agent_steer`. Route changes through the owning agent rather than editing its checkout.
 
+When several lanes integrate together, skim the combined diff once for logic two lanes each wrote (a rule, a helper, or one fix at two layers), and have one owner keep it.
+
 ## Verify and integrate
 
 - Evidence is a lab run the runtime executed: `lab_run`, read with `lab_get`. Agent reports, QA's included, are claims until a run backs them.
@@ -78,7 +80,7 @@ Before a lane is integrated, review its diff yourself: in its checkout, compare 
 - Once several lanes are in flight, deliver through an integration build, which starts from the current base. In a managed project a single lane integrates alone only if it already contains the project head.
 - Send a semantic merge conflict to the owning lanes with the conflicting files. QA may resolve a trivial one in the integration clone and commit it; later builds replay that resolution.
 - `integrate` fast-forwards a managed `project/` to a lane or integration commit that has a passing lab run at that exact commit and no open blocking findings, and marks the included lanes done. New lanes then start from the new project head.
-- For an adopted repository `integrate` publishes nothing. It returns the commit, its checkout `path` and a `push` command, and marks the included lanes done when the commit has a passing run and no open blocking findings. Run the push when the user asked you to publish; otherwise hand it to them.
+- For an adopted repository `integrate` publishes nothing. It returns the commit, its checkout `path`, a `push` and a `fetch` command, and marks the included lanes done when the commit has a passing run and no open blocking findings. Run the push when the user asked you to publish, to their fork if they cannot push to the repository; otherwise give them the fetch command, which creates the branch in their own clone.
 - Push, open pull requests or publish only on the user's explicit instruction.
 
 ## Boundaries

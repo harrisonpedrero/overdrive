@@ -60,7 +60,8 @@ test('claude worker launch follows its capability profile, resumes and is free o
   assert.ok(first.includes('--add-dir') && first.includes('--append-system-prompt') && first.includes('--name'));
   const qa = workerLaunchArgs({ ...meta, profile: 'qa' }, 'high');
   assert.ok(qa.includes('--chrome') && !qa.includes('--no-chrome') && qa.includes('--mcp-config'));
-  assert.deepEqual(qa.slice(qa.indexOf('--disallowedTools') + 1, qa.indexOf('--mcp-config')), ['Bash(git push:*)', 'Bash(gh pr:*)']);
+  const ghPrWrites = ['create', 'merge', 'edit', 'comment', 'review', 'close', 'reopen', 'ready', 'lock', 'unlock', 'revert', 'update-branch'].map(command => `Bash(gh pr ${command}:*)`);
+  assert.deepEqual(qa.slice(qa.indexOf('--disallowedTools') + 1, qa.indexOf('--mcp-config')), ['Bash(git push:*)', ...ghPrWrites]);
   const resumed = workerLaunchArgs({ ...meta, persisted: true }, 'high');
   assert.ok(resumed.includes('--resume') && !resumed.includes('--session-id') && !resumed.includes('--name'));
   const env = workerEnvironment({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_PID: '1', PATH: 'p', ANTHROPIC_BASE_URL: 'u' });

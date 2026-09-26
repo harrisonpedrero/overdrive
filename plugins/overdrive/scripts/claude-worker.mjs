@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { TREE_MARK, defaultContainment } from './process-tree.mjs';
 import { OverdriveError, now, redactString, refusedRequest, run } from './util.mjs';
-import { workerToolDecision } from './worker-policy.mjs';
+import { GH_PR_WRITES, workerToolDecision } from './worker-policy.mjs';
 
 // Server-level rules; they remove these servers' tools from a feature worker entirely.
 const COMPUTER_USE_SERVERS = ['mcp__claude-in-chrome', 'mcp__computer-use', 'mcp__playwright', 'mcp__puppeteer', 'mcp__chrome-devtools', 'mcp__browser'];
@@ -17,7 +17,7 @@ const EDITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Ba
 const EFFORTS = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'max' };
 const PERMISSION_MODES = new Set(['acceptEdits', 'auto', 'bypassPermissions', 'dontAsk']);
 // Deny rules hold even where a user allow rule or the permission mode skips the policy's prompt.
-const DEFAULT_OPTIONS = Object.freeze({ permissionMode: 'acceptEdits', allowedTools: [], disallowedTools: ['Bash(git push:*)', 'Bash(gh pr:*)'] });
+const DEFAULT_OPTIONS = Object.freeze({ permissionMode: 'acceptEdits', allowedTools: [], disallowedTools: ['Bash(git push:*)', ...GH_PR_WRITES.map(command => `Bash(gh pr ${command}:*)`)] });
 const RETAINED_TURNS = 4;
 const DIFF_DEBOUNCE_MS = 4_000;
 const RESULT_GRACE_MS = 15_000;
