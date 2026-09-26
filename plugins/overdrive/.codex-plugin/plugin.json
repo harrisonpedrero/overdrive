@@ -1,6 +1,6 @@
 {
   "name": "overdrive",
-  "version": "0.1.0+codex.20260925114802",
+  "version": "0.1.0+codex.20260926213201",
   "description": "OVERDRIVE runs parallel feature lanes against one repository from a single conversation: isolated clones and worker agents, QA agents in a decoupled test and integration lab, direct agent messaging, and worker boundaries the runtime enforces.",
   "author": {
     "name": "Harrison Pedrero"

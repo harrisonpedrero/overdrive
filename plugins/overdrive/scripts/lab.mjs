@@ -279,7 +279,7 @@ export async function getLab({ workspace_path, run: runId, suite, target, findin
 function findingMessage(finding, sender) {
   const reproduce = finding.repro_suite
     ? `Reproduce it with lab_run {"suite": "${finding.repro_suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`
-    : `There is no repro suite yet; ask ${sender} how to reproduce it.`;
+    : `There is no repro suite yet; your context packet names it once ${sender} adds it. Ask ${sender} only if the body above does not say how to reproduce it.`;
   return `Finding ${finding.id} (${finding.severity}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
 }
 
@@ -317,7 +317,7 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
       // A new or reopened finding is judged from the lane's current head, and a coordinator's resolution records where it was judged.
       if (opened) Object.assign(finding, { found_revision: head, resolved_revision: null, resolved_run: null });
       else if (finding.status !== existing?.status) Object.assign(finding, { resolved_revision: finding.status === 'resolved' ? head : null, resolved_run: null });
-      if (!existing && finding.repro_suite) {
+      if (finding.repro_suite && !finding.found_run) {
         finding.found_run = ctx.db.prepare("SELECT id FROM lab_runs WHERE target = ? AND suite = ? AND status = 'failed' ORDER BY created_at DESC LIMIT 1").get(slug, finding.repro_suite)?.id ?? null;
       }
       const columns = ['id', 'feature', 'title', 'body', 'severity', 'status', 'repro_suite', 'found_revision', 'found_run', 'resolved_revision', 'resolved_run', 'note', 'created_by', 'created_at', 'updated_at'];
@@ -436,25 +436,41 @@ async function markLanesDone(ctx, lanes, summary, details) {
   await writeIndex(ctx);
 }
 
+// Every suite's latest verdict at the commit, so integrate cites what was actually run there.
+function latestRunsBySuite(ctx, commit) {
+  const latest = new Map();
+  for (const row of ctx.db.prepare('SELECT id, suite, target, status FROM lab_runs WHERE revision = ? ORDER BY created_at DESC').all(commit)) {
+    if (!latest.has(row.suite)) latest.set(row.suite, row);
+  }
+  return [...latest.values()];
+}
+
+function unpassedRunsNote(runs) {
+  const suites = runs.filter(run => run.status !== 'passed').map(run => run.suite);
+  return suites.length ? `The latest runs of ${suites.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '';
+}
+
 // An adopted repository is never published to; a tested commit with no open blocking findings is
 // delivered, and the user publishes it with the returned push command.
-async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking) {
+async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs) {
   const delivered = Boolean(passing) && !blocking.length;
-  if (delivered) await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, run: passing.id });
+  if (delivered) await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, runs });
   const push = `git -C "${source}" push "${ctx.config.repository}" ${commit}:refs/heads/${branch ?? '<branch>'}`;
+  const unpassed = unpassedRunsNote(runs);
   return {
-    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, passingRun: passing?.id ?? null, openBlockingFindings: blocking.map(finding => finding.id), push,
-    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command${branch ? '' : ' after replacing <branch> with a new branch name'}, then merge the branch through the repository's normal review.`,
+    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, openBlockingFindings: blocking.map(finding => finding.id), push,
+    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command${branch ? '' : ' after replacing <branch> with a new branch name'}, then merge the branch through the repository's normal review.${unpassed ? ` ${unpassed}` : ''}`,
   };
 }
 
 async function promote(ctx, { target, commit, source, branch, lanes }) {
   const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
+  const runs = latestRunsBySuite(ctx, commit);
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
   const managed = ctx.config.managedProject;
-  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking);
+  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs);
   if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
   if (blocking.length) {
     throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
@@ -474,8 +490,12 @@ async function promote(ctx, { target, commit, source, branch, lanes }) {
     meta(ctx.db, 'default_revision', refreshed.defaultRevision);
     meta(ctx.db, 'default_branch', refreshed.defaultBranch);
   });
-  await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, run: passing.id });
-  return { integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, run: passing.id, project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit } };
+  await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, runs });
+  const unpassed = unpassedRunsNote(runs);
+  return {
+    integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, runs, project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit },
+    ...(unpassed ? { next: unpassed } : {}),
+  };
 }
 
 export async function integrate({ workspace_path, target, revision }) {

@@ -98,7 +98,7 @@ Feature agents may read the lab and run suites against their own lane only. QA a
 `integrate {target, revision?}` takes a lane or `integration` and only committed work, so test the exact commit you mean to integrate:
 
 - **Managed project:** fast-forwards `project/` when it is clean and on its default branch, the commit contains its HEAD, a lab run passed at that commit, and no blocking finding is open on the included lanes. The lanes become `done` and new lanes start from the new HEAD. `PROMOTION_NOT_FAST_FORWARD` means the commit does not contain the project HEAD; rebuild the integration on the current HEAD, which `integration_build` does by default.
-- **Adopted repository:** publishes nothing. It returns the commit, the checkout that holds it (`path`), the passing run, any open blocking findings, and a `push` command that pushes the commit from that checkout to the repository URL: to `feature/<slug>` for a lane, or to a branch name you fill in for the integration. When the commit has a passing run and no open blocking findings, the included lanes become `done`. With the user's authority, the coordinator runs the push.
+- **Adopted repository:** publishes nothing. It returns the commit, the checkout that holds it (`path`), the latest run of each suite at that commit, any open blocking findings, and a `push` command that pushes the commit from that checkout to the repository URL: to `feature/<slug>` for a lane, or to a branch name you fill in for the integration. When the commit has a passing run and no open blocking findings, the included lanes become `done`. With the user's authority, the coordinator runs the push.
 
 ## Recovery
 

@@ -7,7 +7,7 @@ description: Coordinate parallel coding agents with OVERDRIVE. Use when the user
 
 You are the coordinator and the only interface the user talks to. You own intent, specs, priorities, review and delivery decisions, and you carry the user's authority.
 
-- Feature agents implement one lane each in a full clone of the repository. They commit on the lane branch, run existing repository checks for quick feedback, and message `qa` when work is ready to test.
+- Feature agents implement one lane each in a full clone of the repository. They commit on the lane branch, run the existing checks closest to their change for quick feedback, and message `qa` when work is ready to test.
 - QA agents build reusable harnesses and suites in the workspace lab (`lab/`, a local Git repository that is never pushed). They run suites with `lab_run`, record findings that reach the owning lane, retest fixes, build integrations and report verdicts to you.
 - The runtime owns clones, state, message delivery, lab execution and Git mechanics, and enforces each agent's capabilities.
 
@@ -30,7 +30,7 @@ The control workspace is the directory that holds `overdrive.json`, normally thi
 - Split the request into the smallest set of independent lanes that can run in parallel. Give each a short slug, a concrete `outcome` and a spec covering user-visible behavior, constraints and non-goals, and acceptance criteria. Pass the spec to `feature_create`; an agent does not start without one.
 - A spec adds only lane-specific constraints to the quality bar below. Ask a lane for product-repository tests only when the user asked for them, and quote that request in the spec; a new project is no exception, because QA's lab suites are the evidence.
 - Push back on a request that is unsafe, contradicts the repository's direction or is too large for one coherent delivery. Say why and propose the narrower version.
-- Resolve routine choices yourself. Ask the user only about decisions that materially change the product.
+- Resolve routine choices yourself. Ask the user only about decisions that materially change the product. Dropping or weakening something the request states is such a decision: never write it into a spec's non-goals on your own, and when the user cannot answer, build what they stated (or the closest safe, feasible version) and report how you read it.
 - When lanes share a prerequisite (in a new or nearly empty project: structure, tooling and shared interfaces; in any project: a type change or a helper every lane will call), land it in a small foundation lane first, then fan out from its commit (`base_feature` with its `base_revision`) as soon as it is committed and reviewed, while QA tests it; parallel lanes that each build the prerequisite collide or duplicate it.
 - Settle shared seams before agents start. When lanes touch the same files or interface, give one lane ownership of the shared files, or write the agreed interface into both specs. Lanes can work out details with each other by message; you decide when they disagree.
 - A lane that truly needs another lane's code starts from that lane's commit (`base_feature` with its full `base_revision`).
@@ -87,7 +87,7 @@ The runtime and the agent contracts hold these. Explain them when they shape a p
 
 - Feature agents have the user's MCP servers, connectors and web access, but no browser or computer control. Work that needs a real browser or UI goes to QA.
 - QA agents have full capabilities, including browser and computer control.
-- Servers bind to 127.0.0.1, never all interfaces, which trigger firewall prompts on the user's machine. Hold yourself to this when you start one.
+- Servers, including those a project's own tests start, bind to 127.0.0.1, never all interfaces, which trigger firewall prompts on the user's machine. Hold yourself to this when you start one.
 - No agent publishes: pushes, pull requests, releases and package publishes need the user's authority, through you.
 - A feature agent's lab access covers only its own lane, and only QA agents record findings and build integrations. No agent can call your tools.
 

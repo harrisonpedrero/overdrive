@@ -130,8 +130,9 @@ async function ensureWorkspaceFiles(root, config) {
   }
 }
 
-const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only (binding all interfaces triggers firewall prompts on the user\'s machine), and stop it before your turn ends.';
+const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so, and stop every server before your turn ends.';
 const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
+const SPEC_GAPS = 'When the spec contradicts its own goal, or a result meets the spec but would look wrong to the person using it, send `coordinator` the concrete example instead of following or encoding it silently, and keep working on the rest while it decides.';
 
 function agentFiles(root, slug) {
   return `Before each turn, read ${contained(root, STATE_DIR, 'features', slug, 'context.md')} and ${contained(root, STATE_DIR, 'features', slug, 'spec.md')}; treat them as read-only. The context packet holds your work graph. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key.`;
@@ -144,15 +145,16 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 
 - Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions.
 - Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
-- Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. You may run existing repository checks for quick feedback.
+- Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. For quick feedback, run the existing checks closest to your change, not the full suite: lanes share this machine, and QA runs the full suite and any check that needs a harness (races, load, end-to-end journeys) in the lab. Report failures outside your change instead of chasing them.
 - Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
 - ${MESSAGES}
+- ${SPEC_GAPS}
 - No browser or computer use. When a change is ready to test, or you need a behavior verified, send \`qa\` a message saying what changed and what to test.
 - Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
 - Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
 - Your \`overdrive\` tools: message_send reaches \`qa\`, another lane or \`coordinator\`; lanes shows every lane and QA agent; lab_get and lab_run read and run lab suites against your own lane.
-- End each turn with a short handoff: the resulting commit or uncommitted state, what you ran and observed, and anything unresolved. Never include private reasoning.
+- End each turn with a short handoff: the resulting commit or uncommitted state, what you ran and observed, and anything unresolved. Leave out private reasoning and host notices unrelated to your work, such as connector sign-in.
 `;
 }
 
@@ -161,18 +163,19 @@ function qaAgentInstructions(root, agent) {
 
 You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
 
-- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. The lab README describes the suite format.
-- Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET.
-- Run suites with lab_run; only runs the runtime executed are evidence. Record findings with finding_record, with a repro suite where possible; it notifies the owning lane. Retest fixes.
+- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Wrap the repository's own checks (build, lint, existing tests) as a suite too, because lanes run only the checks nearest their change. The lab README describes the suite format.
+- Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
+- Run suites with lab_run; only runs the runtime executed are evidence. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes.
 - Build and test integration combinations with integration_build, and report verdicts to \`coordinator\` with message_send. A conflict you resolve and commit in the integration clone is replayed on later builds.
-- Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build to \`qa\` unless the coordinator assigns it to you.
-- Test a lane when it reports ready. Once one commit combines every lane you are verifying (an integration build, or a lane that merged the others), run your suites on that commit instead of on each lane again; go back to a lane head only to localize a failure.
+- Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
+- When every lane you are verifying is ready, test one commit that combines them (an integration build, or a lane that merged the others) instead of each lane. Test a lane head on its own when it is ready well before the others, or to localize a failure.
 - ${LOCAL_SERVERS}
 - ${MESSAGES}
+- ${SPEC_GAPS}
 - Never edit product code in lane checkouts; resolving a conflict in the integration clone is allowed.
 - Commit lab changes to the lab repository. Never publish anything without the user's authority, which comes through the coordinator.
 - lanes shows every lane with its checkout path, head and open findings.
-- End each turn with a short handoff: runs and verdicts, findings recorded, and anything unresolved. Never include private reasoning.
+- End each turn with a short handoff: runs and verdicts, findings recorded, and anything unresolved. Leave out private reasoning and host notices unrelated to your work, such as connector sign-in.
 `;
 }
 
@@ -361,7 +364,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const detailFiles = await writeWorkDetails(ctx, feature, work);
   const workLines = work.length
     ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}${detailFiles.has(item.item_key) ? `\n  - ${item.item_key} description and acceptance: ${detailFiles.get(item.item_key)}` : ''}`).join('\n')
-    : '- No work items yet.';
+    : '- None: the spec is your task.';
   // Only workspaces from before the lab have evidence rows; lab runs replaced them.
   const legacyEvidence = evidence.length
     ? `## Evidence\n\n${evidence.map(item => `- ${item.source === 'executed' ? 'EXECUTED' : 'REPORTED'} ${item.passed === true ? 'PASS' : item.passed === false ? 'FAIL' : 'NOTE'} · ${item.kind}: ${item.summary}${item.revision ? ` (${item.revision.slice(0, 12)})` : ''}`).join('\n')}\n\n`
@@ -574,7 +577,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Keep suites deterministic: the same revision gives the same verdict.
 - Set up dependencies in the target idempotently, for example install only when the lockfile hash changed. Ignored directories such as node_modules survive between runs against the same target.
 - Start every service a suite needs within the run, and stop it before the run ends.
-- Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. Use OVERDRIVE_PORT.
+- Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host (for Node, a --require preload that rewrites every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1) or leave those tests out and say so. Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
