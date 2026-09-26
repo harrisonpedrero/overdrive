@@ -181,10 +181,10 @@ export const TOOLS = [
     timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
   }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane or of the integration build, in a clean runtime-owned clone, and record its verdict, output tail and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
+  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output tail and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
     ...workspace,
     suite: suite('Suite to run.'),
-    target: target,
+    target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
     revision: string('Optional branch, tag or commit in the target checkout.'),
   }, ['workspace_path', 'suite', 'target']), { destructiveHint: false }),
 
@@ -192,7 +192,7 @@ export const TOOLS = [
     ...workspace,
     run: string('Run id to return in full.'),
     suite: suite('Only list runs of this suite.'),
-    target: { ...target, description: 'Only list runs and findings for this lane, or integration.' },
+    target: { ...target, description: 'Only list runs and findings for this lane, integration (its runs, and findings on the lanes it includes) or base (control runs).' },
     findings: string('Include findings: open, or all.', { enum: ['open', 'all'] }),
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 

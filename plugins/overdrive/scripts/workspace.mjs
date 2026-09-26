@@ -581,6 +581,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
+- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere.
 - Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
 `;
 

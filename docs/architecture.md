@@ -85,13 +85,13 @@ Delivery holds the agent's control lock, so two controllers never deliver the sa
 
 **Runs.** `lab_run {suite, target, revision?}` runs these steps:
 
-1. Resolve the revision: the given ref, a lane snapshot, or the integration HEAD.
-2. Under a per-target lock, fetch it into `.overdrive/lab/targets/<target>`, `checkout --detach -f`, and `git clean -fd`, which keeps ignored dependency directories.
+1. Resolve the revision: the given ref, a lane snapshot, the integration HEAD, or for the `base` control target the managed `project/` HEAD or the cached default revision.
+2. Under a per-target lock, fetch it into `.overdrive/lab/targets/<target>`, a clone whose `origin` is the repository as in lane clones, `checkout --detach -f`, and `git clean -fd`, which keeps ignored dependency directories.
 3. Snapshot the lab as `lab_revision`, then run the suite argv without a shell, with the environment contract, timeout and output cap, and record the `lab_runs` row.
 
 The output tail is redacted, and artifacts are listed with their path, size and sha256. A run whose processes cannot be confirmed stopped is `uncertain`, and its target directory is never reused; the next run uses a fresh sibling directory. Runs on different targets proceed in parallel.
 
-**Findings.** A pass resolves open findings whose repro suite is the suite that ran, on the tested lane or on a lane included in the tested integration. It resolves one only when the tested commit contains the revision the finding was found at and is not an ancestor of the failing run's revision. By hand, only the coordinator marks a finding `resolved`; QA agents and the coordinator may set `wontfix` with a note.
+**Findings.** A pass resolves open findings whose repro suite is the suite that ran, on the tested lane or on a lane included in the tested integration. It resolves one only when the tested commit contains the revision the finding was found at and is not an ancestor of the failing run's revision: the suite's latest failure on the lane or on integration when the finding was opened, reopened or given its repro suite. By hand, only the coordinator marks a finding `resolved`; QA agents and the coordinator may set `wontfix` with a note.
 
 **Integration.** `integration_build` resets `.overdrive/lab/integration` to its base: the managed `project/` HEAD, or else the refreshed default revision. It then merges each lane's snapshot or `slug@ref`, hooks disabled, under the OVERDRIVE identity; a lane that already contains the build so far is fast-forwarded, so a lane commit QA already tested can be the integration head. It stops at the first conflict and leaves it in place. Which lanes a commit contains is judged by Git ancestry, so a resolution an agent commits there is honored. rerere replays recorded resolutions on later builds, and a HEAD committed there after its build, such as a resolution, stays reachable under `refs/overdrive/integration/`. Uncommitted changes in the integration clone block a rebuild rather than being discarded.
 

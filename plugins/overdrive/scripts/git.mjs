@@ -77,12 +77,14 @@ async function assertOwnClone(clone) {
 }
 
 // A target clone is runtime-owned scratch: each sync discards tracked edits and untracked files but
-// keeps ignored dependency directories such as node_modules.
-export async function syncTarget(root, directory, source, commit) {
+// keeps ignored dependency directories such as node_modules. Its origin is the repository, as in a
+// lane clone, because builds such as SourceLink read it; fetches name their source explicitly.
+export async function syncTarget(root, directory, source, commit, origin) {
   const target = await ensureManagedPath(root, contained(root, STATE_DIR, 'lab', 'targets', directory));
   if (!await exists(target)) {
     await fs.mkdir(path.dirname(target), { recursive: true });
     await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', source, target], { cwd: root });
+    await git(target, 'remote', 'set-url', 'origin', origin);
   } else await assertOwnClone(target);
   await fetchCommit(target, source, commit);
   await run(['git', ...runtimeGitConfig(root), 'checkout', '--detach', '-f', commit], { cwd: target });
@@ -93,12 +95,13 @@ export async function syncTarget(root, directory, source, commit) {
 // Moves the integration clone to base. Its uncommitted changes, such as a conflict resolution in
 // progress, belong to an agent and are never discarded; a HEAD other than the last build's
 // (builtHead), such as a committed resolution, stays reachable under refs/overdrive/integration/.
-export async function resetIntegration(root, base, baseSource, builtHead = null) {
+export async function resetIntegration(root, base, baseSource, builtHead, origin) {
   const clone = await ensureManagedPath(root, integrationPath(root));
   const fresh = !await exists(clone);
   if (fresh) {
     await fs.mkdir(path.dirname(clone), { recursive: true });
     await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', mirrorPath(root), clone], { cwd: root });
+    await git(clone, 'remote', 'set-url', 'origin', origin);
   } else {
     await assertOwnClone(clone);
     const { clean, head } = await repositorySnapshot(clone);

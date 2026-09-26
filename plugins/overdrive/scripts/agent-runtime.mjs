@@ -257,7 +257,7 @@ function harnessParams(runtime) {
 // instruction or messages, the lane's next action directs the turn.
 function runPrompt(runtime, instruction, messages) {
   const { slug } = runtime.feature;
-  const direction = instruction || (messages.length ? null : runtime.feature.next_action || 'Choose and complete the highest-priority ready work.');
+  const direction = instruction || (messages.length ? null : runtime.feature.next_action || (runtime.profile === 'qa' ? 'Carry out your brief.' : 'Complete your spec.'));
   return [
     runtime.profile === 'qa' ? `Continue as the ${slug} QA agent.` : `Continue the ${slug} feature lane.`,
     messages.length ? `Messages for you:\n\n${messageBlock(messages)}` : null,

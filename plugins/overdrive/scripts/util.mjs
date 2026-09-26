@@ -58,7 +58,7 @@ export function safeSlug(value, name = 'feature') {
 // Message and lab addresses; refused only for new agents, so an older lane of that name stays reachable.
 export function newAgentSlug(value, name = 'feature') {
   const slug = safeSlug(value, name);
-  if (slug === 'coordinator' || slug === 'integration') throw new OverdriveError(`${name} ${slug} is reserved.`, 'INVALID_SLUG');
+  if (['coordinator', 'integration', 'base'].includes(slug)) throw new OverdriveError(`${name} ${slug} is reserved.`, 'INVALID_SLUG');
   return slug;
 }
 

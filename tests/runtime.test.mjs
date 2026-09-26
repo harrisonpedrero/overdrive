@@ -108,7 +108,7 @@ test('an invalid start instruction creates no native task and leaves the lane st
 
   const { nextAction } = (await getFeatureContext(args)).feature;
   await runtime.startFeatureAgent(args);
-  assert.ok(bridge.requests.findLast(request => request.method === 'turn/start').params.input[0].text.includes(`direction:\n${nextAction || 'Choose and complete the highest-priority ready work.'}\n`));
+  assert.ok(bridge.requests.findLast(request => request.method === 'turn/start').params.input[0].text.includes(`direction:\n${nextAction || 'Complete your spec.'}\n`));
 });
 
 test('short completion cannot be overwritten by its start response; private items are absent', async t => {

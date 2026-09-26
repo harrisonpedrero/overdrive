@@ -45,7 +45,7 @@ function suiteName(value, name = 'suite') {
   return suite;
 }
 
-const targetName = value => (value === 'integration' ? value : safeSlug(value, 'target'));
+const targetName = value => (value === 'integration' || value === 'base' ? value : safeSlug(value, 'target'));
 const agentName = value => (value === undefined || value === 'coordinator' ? 'coordinator' : safeSlug(value, 'from'));
 const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
 const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
@@ -174,17 +174,30 @@ async function integrationStatus(ctx) {
 
 // A pass resolves a finding only at a revision that contains the one it was found at and is not
 // part of the failing run's revision, such as the HEAD under a snapshot whose uncommitted change failed.
+// A failing integration commit exists only in the integration clone, so that check runs there.
 async function resolvableFindings(ctx, repository, suite, features, commit) {
   if (!features.length) return [];
-  const rows = ctx.db.prepare(`SELECT findings.id, feature, found_revision, lab_runs.revision AS failed_revision FROM findings LEFT JOIN lab_runs ON lab_runs.id = findings.found_run
+  const rows = ctx.db.prepare(`SELECT findings.id, feature, found_revision, lab_runs.revision AS failed_revision, lab_runs.target AS failed_target FROM findings LEFT JOIN lab_runs ON lab_runs.id = findings.found_run
     WHERE findings.status = 'open' AND repro_suite = ? AND feature IN (${features.map(() => '?').join(', ')})`).all(suite, ...features);
+  const integration = integrationPath(ctx.root);
   const resolved = [];
   for (const row of rows) {
     if (row.found_revision && !await isGitAncestor(repository, row.found_revision, commit)) continue;
-    if (row.failed_revision && await isGitAncestor(repository, commit, row.failed_revision)) continue;
+    const failedIn = row.failed_target === 'integration' && await exists(integration) ? integration : repository;
+    if (row.failed_revision && await isGitAncestor(failedIn, commit, row.failed_revision)) continue;
     resolved.push(row);
   }
   return resolved;
+}
+
+// What a run tests, and the lanes whose findings its pass can resolve; base belongs to no lane.
+async function runSubject(ctx, target, lane, requested) {
+  if (target === 'base' && !lane) return { ...await baseTarget(ctx, requested), features: [] };
+  const source = lane ? lane.checkout_path : await integrationClone(ctx.root);
+  const revision = requested ? await verifyCheckoutRevision(source, requested)
+    : lane ? await snapshotCommit(source) : (await git(source, 'rev-parse', 'HEAD')).stdout;
+  const features = lane ? [lane.slug] : (await integratedLanes(ctx, source, revision)).map(entry => entry.slug);
+  return { source, revision, features };
 }
 
 export async function runLabSuite({ workspace_path, suite, target, revision, from }) {
@@ -195,17 +208,15 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
   return await withContext(workspace_path, async ctx => {
     const lab = await ensureLab(ctx.root);
     const spec = await readSuite(ctx.root, lab, name);
-    const lane = targetSlug === 'integration' ? null : laneRow(ctx, targetSlug);
+    // A lane named base from before the control target keeps its lab address.
+    const lane = targetSlug === 'integration' || (targetSlug === 'base' && !featureId(ctx.db, 'base')) ? null : laneRow(ctx, targetSlug);
     return await withWorkspaceLock(ctx.root, labLock(targetSlug), async () => {
-      const source = lane ? lane.checkout_path : await integrationClone(ctx.root);
-      const commit = requested ? await verifyCheckoutRevision(source, requested)
-        : lane ? await snapshotCommit(source) : (await git(source, 'rev-parse', 'HEAD')).stdout;
-      const features = lane ? [lane.slug] : (await integratedLanes(ctx, source, commit)).map(entry => entry.slug);
+      const { source, revision: commit, features } = await runSubject(ctx, targetSlug, lane, requested);
       // Under this target's lock a run still marked running belongs to a runtime that exited mid-run.
       ctx.db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(targetSlug);
       // Processes of a run whose termination is uncertain may still use its target directory.
       const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(targetSlug).count);
-      const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit);
+      const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit, ctx.config.repository);
       const id = `run-${randomUUID().slice(0, 13)}`;
       const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
       await fs.mkdir(artifacts, { recursive: true });
@@ -242,7 +253,7 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
       return {
         run: { ...summary, outputTail: output.slice(-4_000), artifacts: artifactSummary },
         resolvedFindings: resolved.map(finding => finding.id),
-        ...(lane ? {} : { included: features }),
+        ...(targetSlug === 'integration' ? { included: features } : {}),
         next: `lab_get {"run": "${id}"} returns the full output and artifact list.`,
       };
     });
@@ -269,17 +280,25 @@ export async function getLab({ workspace_path, run: runId, suite, target, findin
       integration: await integrationStatus(ctx),
     };
     if (findings) {
-      result.findings = ctx.db.prepare("SELECT * FROM findings WHERE (? = 'all' OR status = 'open') AND (? IS NULL OR feature = ?) ORDER BY created_at DESC LIMIT 200")
-        .all(findings, targetFilter, targetFilter);
+      // Findings belong to lanes, so an integration shows those of the lanes it includes.
+      const lanes = targetFilter === 'integration' ? result.integration?.included ?? [] : targetFilter ? [targetFilter] : null;
+      const laneFilter = lanes ? `AND feature IN (${lanes.map(() => '?').join(', ')})` : '';
+      result.findings = ctx.db.prepare(`SELECT * FROM findings WHERE (? = 'all' OR status = 'open') ${laneFilter} ORDER BY created_at DESC LIMIT 200`)
+        .all(findings, ...(lanes ?? []));
     }
     return result;
   });
 }
 
-function findingMessage(finding, sender) {
-  const reproduce = finding.repro_suite
-    ? `Reproduce it with lab_run {"suite": "${finding.repro_suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`
-    : `There is no repro suite yet; your context packet names it once ${sender} adds it. Ask ${sender} only if the body above does not say how to reproduce it.`;
+function reproduction(finding, sender, foundRun, integration) {
+  const suite = finding.repro_suite;
+  if (!suite) return `There is no repro suite yet; your context packet names it once ${sender} adds it. Ask ${sender} only if the body above does not say how to reproduce it.`;
+  if (foundRun?.target !== 'integration') return `Reproduce it with lab_run {"suite": "${suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`;
+  return `Suite ${suite} failed on integration ${foundRun.revision.slice(0, 12)} (${foundRun.id}), which combines your lane with others, so a lab_run on your lane alone may not reproduce it; to reproduce it locally, fetch ${foundRun.revision} from ${integration} without merging it into your branch. A passing run of ${suite} on an integration build that includes your fix resolves this finding.`;
+}
+
+function findingMessage(finding, sender, foundRun, integration) {
+  const reproduce = reproduction(finding, sender, foundRun, integration);
   return `Finding ${finding.id} (${finding.severity}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
 }
 
@@ -314,15 +333,19 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
         updated_at: stamp,
       };
       const opened = finding.status === 'open' && existing?.status !== 'open';
-      // A new or reopened finding is judged from the lane's current head, and a coordinator's resolution records where it was judged.
-      if (opened) Object.assign(finding, { found_revision: head, resolved_revision: null, resolved_run: null });
+      // A new or reopened finding is judged from the lane's current head and latest failure, and a coordinator's resolution records where it was judged.
+      if (opened) Object.assign(finding, { found_revision: head, found_run: null, resolved_revision: null, resolved_run: null });
       else if (finding.status !== existing?.status) Object.assign(finding, { resolved_revision: finding.status === 'resolved' ? head : null, resolved_run: null });
+      // Many findings are first seen on an integration build, so its failing runs count too.
       if (finding.repro_suite && !finding.found_run) {
-        finding.found_run = ctx.db.prepare("SELECT id FROM lab_runs WHERE target = ? AND suite = ? AND status = 'failed' ORDER BY created_at DESC LIMIT 1").get(slug, finding.repro_suite)?.id ?? null;
+        finding.found_run = ctx.db.prepare("SELECT id FROM lab_runs WHERE target IN (?, 'integration') AND suite = ? AND status = 'failed' ORDER BY created_at DESC LIMIT 1").get(slug, finding.repro_suite)?.id ?? null;
       }
       const columns = ['id', 'feature', 'title', 'body', 'severity', 'status', 'repro_suite', 'found_revision', 'found_run', 'resolved_revision', 'resolved_run', 'note', 'created_by', 'created_at', 'updated_at'];
       ctx.db.prepare(`INSERT OR REPLACE INTO findings(${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`).run(...columns.map(column => finding[column] ?? null));
-      if (opened) ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, findingMessage(finding, sender), stamp);
+      if (opened) {
+        const foundRun = finding.found_run ? ctx.db.prepare('SELECT id, target, revision FROM lab_runs WHERE id = ?').get(finding.found_run) : null;
+        ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, findingMessage(finding, sender, foundRun, integrationPath(ctx.root)), stamp);
+      }
       return { finding, existing, opened };
     });
     await addEvent(ctx, {
@@ -353,6 +376,12 @@ async function integrationBase(ctx, ref) {
   return { source: mirrorPath(ctx.root), revision: ref ? await resolveMirrorRevision(ctx.root, ref) : refreshed.defaultRevision };
 }
 
+// Unlike an integration build, a control run does not fetch upstream; it tests the cached revision.
+async function baseTarget(ctx, ref) {
+  if (ctx.config.managedProject) return await integrationBase(ctx, ref);
+  return { source: mirrorPath(ctx.root), revision: await resolveMirrorRevision(ctx.root, ref) };
+}
+
 export async function buildIntegration({ workspace_path, features, base }) {
   if (!Array.isArray(features) || features.length < 1 || features.length > 50) throw new OverdriveError('features must list 1-50 lanes.', 'INVALID_INPUT');
   const requested = features.map(laneReference);
@@ -366,7 +395,7 @@ export async function buildIntegration({ workspace_path, features, base }) {
       lanes.push({ slug, checkout: lane.checkout_path, revision: ref ? await verifyCheckoutRevision(lane.checkout_path, ref) : await snapshotCommit(lane.checkout_path) });
     }
     const start = await integrationBase(ctx, baseRef);
-    const clone = await resetIntegration(ctx.root, start.revision, start.source, built);
+    const clone = await resetIntegration(ctx.root, start.revision, start.source, built, ctx.config.repository);
     // Recorded before merging, so a failed build never leaves an older composition describing this clone.
     const composition = { base: start.revision, features: lanes.map(({ slug, revision }) => ({ slug, revision })), head: null, built_at: now() };
     meta(ctx.db, 'integration', JSON.stringify(composition));
