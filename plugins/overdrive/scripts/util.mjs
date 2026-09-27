@@ -314,7 +314,7 @@ export function redactString(value) {
     .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[credentials-redacted]@')
     .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/-]+/gi, '$1 [redacted]')
     .replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|ctx7sk-[A-Za-z0-9-]{20,})\b/g, '[redacted]')
-    .replace(/\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[:=]\s*([^\s,;]+)/gi, '$1=[redacted]');
+    .replace(/\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[:=]\s*(?![<[])([^\s,;]+)/gi, '$1=[redacted]');
 }
 
 export async function normalizeRepositorySource(value) {

@@ -58,8 +58,9 @@ export function workerLaunchArgs(meta, effort) {
   args.push('--permission-mode', options.permissionMode, '--permission-prompt-tool', 'stdio');
   if (options.permissionMode === 'bypassPermissions') args.push('--allow-dangerously-skip-permissions');
   if (options.allowedTools.length) args.push('--allowedTools', ...options.allowedTools);
-  const disallowed = [...options.disallowedTools, ...(feature ? COMPUTER_USE_SERVERS : [])];
-  if (disallowed.length) args.push('--disallowedTools', ...disallowed);
+  // The CLI exits when the turn ends, so a scheduled wakeup could never fire.
+  const disallowed = [...options.disallowedTools, 'ScheduleWakeup', ...(feature ? COMPUTER_USE_SERVERS : [])];
+  args.push('--disallowedTools', ...disallowed);
   args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', WORKER_SETTINGS);
   // Without Chrome integration set up, --chrome adds no tools rather than failing.
   args.push(feature ? '--no-chrome' : '--chrome');
@@ -391,7 +392,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
     if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     meta.lingering = null;
-    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
+    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, answered: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
     turn.settled = new Promise(resolve => { turn.resolveSettled = resolve; });
     await this.#launch(meta, turn, { command: this.launch.command, args: [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)] });
     meta.active = turn;
@@ -620,6 +621,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     }
     if (message.type === 'assistant') {
       clearTimeout(turn.graceTimer);
+      turn.answered = true;
       for (const block of message.message?.content ?? []) {
         // Thinking blocks are private reasoning and are never forwarded or stored.
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
@@ -640,22 +642,28 @@ export class ClaudeWorkerBridge extends EventEmitter {
       return;
     }
     if (message.type === 'result') {
-      turn.pendingResults -= 1;
       for (const denial of Array.isArray(message.permission_denials) ? message.permission_denials : []) {
         if (typeof denial?.tool_name === 'string') turn.denials.push(denial.tool_name);
       }
-      turn.final = typeof message.result === 'string' ? message.result : null;
       const failed = message.is_error === true || (message.subtype && message.subtype !== 'success');
       if (failed) {
         this.#finishFailedResult(meta, turn, message);
         return;
       }
+      // The CLI also answers notifications it queues itself, such as a finished background task; a
+      // result with no assistant event since the previous result answers none of this turn's input.
+      if (turn.answered) {
+        turn.pendingResults -= 1;
+        turn.final = typeof message.result === 'string' ? message.result : null;
+      }
+      turn.answered = false;
       if (turn.pendingResults <= 0) {
         void this.#finish(meta, turn, 'completed');
         return;
       }
-      // A steer was queued; the CLI normally starts a new response for it. If nothing
-      // follows, the queued message was folded into this response and the turn is done.
+      // Input such as a queued steer is still unanswered; the CLI normally starts a new response for
+      // it. If nothing follows, it was folded into an earlier response and the turn is done.
+      clearTimeout(turn.graceTimer);
       turn.graceTimer = setTimeout(() => { if (!turn.interrupted) void this.#finish(meta, turn, 'completed'); }, RESULT_GRACE_MS);
     }
   }

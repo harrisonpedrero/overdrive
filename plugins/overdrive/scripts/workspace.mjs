@@ -131,6 +131,7 @@ async function ensureWorkspaceFiles(root, config) {
 }
 
 const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so. Stop every server you started before your turn ends, by its PID or process tree (on Windows, `taskkill /PID <pid> /T /F`, with doubled slashes in Git Bash), never by image name such as dotnet.exe or node.exe: other agents\' lab runs and the user\'s own programs share this machine.';
+const TURN_END = 'Background commands, subagents and scheduled wakeups you leave running when your turn ends are stopped or never report back, so wait for work whose result you need before your handoff.';
 const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
 const SPEC_GAPS = 'When the spec contradicts its own goal, or a result meets the spec but would look wrong to the person using it, send `coordinator` the concrete example instead of following or encoding it silently, and keep working on the rest while it decides.';
 
@@ -148,6 +149,7 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. For quick feedback, run the existing checks closest to your change, not the full suite: lanes share this machine, and QA runs the full suite and any check that needs a harness (races, load, end-to-end journeys) in the lab. Report failures outside your change instead of chasing them.
 - Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
+- ${TURN_END}
 - ${MESSAGES}
 - ${SPEC_GAPS}
 - No browser or computer use. When a change is ready to test, or you need a behavior verified, send \`qa\` a message saying what changed and what to test.
@@ -170,12 +172,13 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 - Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
 - When every lane you are verifying is ready, test one commit that combines them (an integration build, or a lane that merged the others) instead of each lane. Test a lane head on its own when it is ready well before the others, or to localize a failure.
 - ${LOCAL_SERVERS}
+- ${TURN_END}
 - ${MESSAGES}
 - ${SPEC_GAPS}
 - Never edit product code in lane checkouts; resolving a conflict in the integration clone is allowed.
 - Commit lab changes to the lab repository. Never publish anything without the user's authority, which comes through the coordinator.
-- lanes shows every lane with its checkout path, head and open findings.
-- End each turn with a short handoff: runs and verdicts, findings recorded, and anything unresolved. Leave out private reasoning and host notices unrelated to your work, such as connector sign-in.
+- lanes shows every lane with its checkout path, spec, head and open findings; check a lane's spec for a behavior before asking the coordinator about it.
+- End each turn with a short handoff: runs and verdicts, findings recorded, and anything unresolved; refer to what you already sent \`coordinator\` instead of repeating it. Leave out private reasoning and host notices unrelated to your work, such as connector sign-in.
 `;
 }
 
@@ -574,14 +577,14 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 ## Rules
 
 - Only lab_run produces evidence: the runtime runs the suite itself at an exact target revision and lab snapshot, and records the verdict, output and artifacts. A passing run resolves the open findings it is the repro suite for.
-- Keep suites deterministic: the same revision gives the same verdict.
-- Set up dependencies in the target idempotently, for example install only when the lockfile hash changed. Ignored directories such as node_modules survive between runs against the same target.
+- Keep suites deterministic: the same revision gives the same verdict. A suite whose verdict depends on timing or scheduling (concurrency, load, expiry) repeats its scenario within the run and reports how many repetitions passed.
+- Set up dependencies in the target idempotently, for example install only when the lockfile hash changed, and prefer toolchains and browser builds already on this machine (for Playwright, a version whose browser is already in its cache) to new downloads. Ignored directories such as node_modules survive between runs against the same target.
 - Start every service a suite needs within the run, and stop it by its PID or process tree, never by image name, before the run ends.
 - Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host (for Node, a --require preload that rewrites every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1) or leave those tests out and say so. Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
-- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere.
+- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit.
 - Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
 `;
 
@@ -935,7 +938,7 @@ export async function listLanes({ workspace_path }) {
       const git = await repositorySnapshot(row.checkout_path).catch(() => null);
       lanes.push({
         slug: row.slug, kind: row.kind, title: row.title, status: row.status, agentStatus: row.agent_status,
-        checkoutPath: row.checkout_path, head: git?.head ?? null, dirty: git ? !git.clean : null,
+        checkoutPath: row.checkout_path, spec: contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), head: git?.head ?? null, dirty: git ? !git.clean : null,
         openFindings: Number(openFindings.get(row.slug).count),
       });
     }

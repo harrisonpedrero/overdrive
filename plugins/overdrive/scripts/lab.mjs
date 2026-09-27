@@ -17,7 +17,7 @@ import {
   syncTarget,
   verifyCheckoutRevision,
 } from './git.mjs';
-import { featureBySlug, loadWorkspace, meta, parseJson, transaction } from './state.mjs';
+import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, transaction } from './state.mjs';
 import {
   OverdriveError,
   contained,
@@ -247,7 +247,10 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
         ctx.db.prepare('UPDATE lab_runs SET exit_code = ?, status = ?, output = ?, duration_ms = ?, artifacts_json = ? WHERE id = ?')
           .run(row.exit_code, row.status, row.output, row.duration_ms, row.artifacts_json, id);
         const resolve = ctx.db.prepare("UPDATE findings SET status = 'resolved', resolved_revision = ?, resolved_run = ?, updated_at = ? WHERE id = ? AND status = 'open'");
-        for (const finding of resolved) resolve.run(commit, id, stamp, finding.id);
+        for (const finding of resolved) {
+          resolve.run(commit, id, stamp, finding.id);
+          withdrawFindingMessage(ctx.db, finding);
+        }
       });
       if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
       for (const finding of resolved) {
@@ -306,6 +309,12 @@ function findingMessage(finding, sender, foundRun, integration) {
   return `Finding ${finding.id} (${finding.severity}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
 }
 
+// A closed finding's fix request that its lane has not received yet must never reach it.
+function withdrawFindingMessage(db, finding) {
+  const prefix = `Finding ${finding.id} (`;
+  db.prepare("UPDATE messages SET status = 'withdrawn' WHERE to_agent = ? AND status = 'pending' AND substr(body, 1, ?) = ?").run(finding.feature, prefix.length, prefix);
+}
+
 export async function recordFinding({ workspace_path, id, feature, title, body, severity, repro_suite, status, note, from }) {
   const slug = safeSlug(feature);
   const sender = agentName(from);
@@ -349,7 +358,7 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
       if (opened) {
         const foundRun = finding.found_run ? ctx.db.prepare('SELECT id, target, revision FROM lab_runs WHERE id = ?').get(finding.found_run) : null;
         ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, findingMessage(finding, sender, foundRun, integrationPath(ctx.root)), stamp);
-      }
+      } else if (existing?.status === 'open' && finding.status !== 'open') withdrawFindingMessage(ctx.db, finding);
       return { finding, existing, opened };
     });
     await addEvent(ctx, {
@@ -380,10 +389,26 @@ async function integrationBase(ctx, ref) {
   return { source: mirrorPath(ctx.root), revision: ref ? await resolveMirrorRevision(ctx.root, ref) : refreshed.defaultRevision };
 }
 
+// A commit only a lane holds, such as the foundation lane's commit that later lanes start from.
+// Only a commit ID counts: a lane checkout's own branch and remote names are not base.
+async function laneCommit(ctx, ref) {
+  for (const lane of listFeatureRows(ctx.db)) {
+    const revision = lane.kind === 'qa' ? null : await verifyCheckoutRevision(lane.checkout_path, ref).catch(() => null);
+    if (revision?.startsWith(ref.toLowerCase())) return { source: lane.checkout_path, revision };
+  }
+  return null;
+}
+
 // Unlike an integration build, a control run does not fetch upstream; it tests the cached revision.
 async function baseTarget(ctx, ref) {
-  if (ctx.config.managedProject) return await integrationBase(ctx, ref);
-  return { source: mirrorPath(ctx.root), revision: await resolveMirrorRevision(ctx.root, ref) };
+  try {
+    if (ctx.config.managedProject) return await integrationBase(ctx, ref);
+    return { source: mirrorPath(ctx.root), revision: await resolveMirrorRevision(ctx.root, ref) };
+  } catch (error) {
+    const found = error?.code === 'INVALID_REVISION' && ref ? await laneCommit(ctx, ref) : null;
+    if (!found) throw error;
+    return found;
+  }
 }
 
 export async function buildIntegration({ workspace_path, features, base }) {

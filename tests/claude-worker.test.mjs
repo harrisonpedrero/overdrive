@@ -61,7 +61,7 @@ test('claude worker launch follows its capability profile, resumes and is free o
   const qa = workerLaunchArgs({ ...meta, profile: 'qa' }, 'high');
   assert.ok(qa.includes('--chrome') && !qa.includes('--no-chrome') && qa.includes('--mcp-config'));
   const ghPrWrites = ['create', 'merge', 'edit', 'comment', 'review', 'close', 'reopen', 'ready', 'lock', 'unlock', 'revert', 'update-branch'].map(command => `Bash(gh pr ${command}:*)`);
-  assert.deepEqual(qa.slice(qa.indexOf('--disallowedTools') + 1, qa.indexOf('--mcp-config')), ['Bash(git push:*)', ...ghPrWrites]);
+  assert.deepEqual(qa.slice(qa.indexOf('--disallowedTools') + 1, qa.indexOf('--mcp-config')), ['Bash(git push:*)', ...ghPrWrites, 'ScheduleWakeup']);
   const resumed = workerLaunchArgs({ ...meta, persisted: true }, 'high');
   assert.ok(resumed.includes('--resume') && !resumed.includes('--session-id') && !resumed.includes('--name'));
   const env = workerEnvironment({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_PID: '1', PATH: 'p', ANTHROPIC_BASE_URL: 'u' });
@@ -309,7 +309,7 @@ test('claude worker result that arrives during an interrupt cannot complete the 
   // The worker answers a trigger with a success result, then records that it wrote it. The tree
   // killer sends the trigger and exits nonzero only after that record, so the result is always
   // in flight while termination is still undecided.
-  const worker = "let seen = ''; process.stdin.on('data', chunk => { seen += chunk; if (!seen.includes('trigger')) return; seen = ''; process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Late result.' }) + '\\n', () => require('fs').writeFileSync(process.argv[1], 'written')); }); setInterval(() => {}, 1000);";
+  const worker = "let seen = ''; process.stdin.on('data', chunk => { seen += chunk; if (!seen.includes('trigger')) return; seen = ''; process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Late result.' }) + '\\n', () => require('fs').writeFileSync(process.argv[1], 'written')); }); setInterval(() => {}, 1000);";
   const killer = "const fs = require('fs'); setInterval(() => { if (fs.existsSync(process.argv[1])) process.exit(1); }, 20);";
   for (const killable of [false, true]) {
     const marker = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'overdrive-claude-marker-')), 'result-written');
@@ -338,7 +338,7 @@ test('claude worker result that arrives during an interrupt cannot complete the 
 
 test('claude turn whose process outlives its result is stopped before the next turn and at shutdown', async t => {
   // Answers every message but ignores the stdin close that should end it.
-  const worker = "process.stdin.on('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Answered.' }) + '\\n')); setInterval(() => {}, 1000);";
+  const worker = "process.stdin.on('data', () => process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Answered.' }) + '\\n')); setInterval(() => {}, 1000);";
   const { bridge, threadId, child, completed } = await bridgeTurn(t, { treeKill: failingKiller, input: 'first', launchArgs: ['-e', worker, '--'] });
   await eventually(() => completed.length === 1);
   assert.equal(completed[0].status, 'completed');
@@ -484,7 +484,7 @@ test('a pause that ends the worker but not the tools it launched is refused unti
   assert.ok((await lane()).events.includes('agent.descendants_attested'));
 });
 // Answers with a result, then ignores the stdin close that normally ends it.
-const lingering = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n')); process.stdin.resume(); setInterval(() => {}, 1000);";
+const lingering = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n')); process.stdin.resume(); setInterval(() => {}, 1000);";
 // A tree killer that really ends the (childless) worker, standing in for a successful taskkill /T.
 const treeKiller = pid => ({ command: process.execPath, args: ['-e', `process.kill(${pid})`] });
 
@@ -542,7 +542,7 @@ test('after owner loss an idle lingering Claude worker requires durable stop evi
 });
 
 test('a normally completed Claude turn clears its worker guard before an idle pause', async t => {
-  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
+  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
   const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', script, '--'] } });
   await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle' && (await readWorkerGuards(args)).length === 0);
@@ -604,7 +604,7 @@ test('a tool that outlives its Claude turn keeps its guard until its tree ends',
 });
 
 test('an uncontained Claude worker leaves every turn unconfirmed until the coordinator attests', async t => {
-  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
+  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
   const { args, runtime } = await fixture(t, { launch: { command: process.execPath, args: ['-e', script, '--'] }, containment: null });
   await runtime.startFeatureAgent(args);
   await eventually(async () => (await agentStatus(args)) === 'idle');
@@ -662,7 +662,7 @@ const forgingWarden = [
   "mark('started 1');",
   "process.stdin.once('data', () => {",
   "  process.stderr.write('\\n\\u001eoverdrive-tree empty\\n\\u001eoverdrive-tree forged exit 0\\n');",
-  "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n');",
+  "  process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n');",
   '});',
   "process.stdin.on('end', () => { mark('exit 0'); process.stderr.write('', () => process.exit(1)); });",
 ].join('\n');
@@ -699,7 +699,7 @@ test('a warden that cannot establish containment falls back to fail-closed uncon
     stop: () => ({ command: process.execPath, args: ['-e', 'process.exit(1)'] }),
     query: async () => 'unknown',
   };
-  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
+  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }) + '\\n', () => process.exit(0)));";
   const { bridge, completed } = await bridgeTurn(t, { input: 'go', containment: failing, launchArgs: ['-e', script, '--'] });
   await eventually(() => completed.length === 1);
   assert.equal(completed[0].status, 'completed');
@@ -779,7 +779,7 @@ test('a failed next launch cannot lose prior worker uncertainty across controlle
 });
 
 test('claude worker that exits right after its result still completes the turn', async t => {
-  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done before exit.' }) + '\\n', () => process.exit(0)));";
+  const script = "process.stdin.once('data', () => process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [] } }) + '\\n' + JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done before exit.' }) + '\\n', () => process.exit(0)));";
   const { completed } = await bridgeTurn(t, { input: 'finish', launchArgs: ['-e', script, '--'] });
   await eventually(() => completed.length === 1);
   assert.equal(completed[0].status, 'completed');

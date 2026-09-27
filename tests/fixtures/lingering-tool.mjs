@@ -36,7 +36,7 @@ if (role === 'tool') {
     const started = setInterval(() => {
       if (!fs.existsSync(pidFile)) return;
       clearInterval(started);
-      process.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Started the tests.' })}\n`);
+      process.stdout.write(`${JSON.stringify({ type: 'assistant', message: { content: [] } })}\n${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Started the tests.' })}\n`);
     }, 50);
   });
   process.stdin.on('end', () => process.exit(0));

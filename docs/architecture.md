@@ -63,13 +63,13 @@ The profile comes from the agent's recorded `kind`, never from a tool argument.
 
 Each denial is appended to the turn's handoff.
 
-**Claude harness.** Each turn is one `claude -p` stream-json process resumed by session ID, with the contract appended to the system prompt. It runs with `--permission-mode <claude.permissionMode> --permission-prompt-tool stdio`, so prompted calls arrive as `can_use_tool` control requests that the policy answers. `--mcp-config` injects the worker server, and `--settings` disables the coordinator plugin. Feature agents get `--no-chrome` plus deny rules for the browser and computer-control servers; QA agents get `--chrome`. Auto-memory is off. On Windows the process tree runs inside a kill-on-close Job Object, so a turn's completion covers the tools it launched.
+**Claude harness.** Each turn is one `claude -p` stream-json process resumed by session ID, with the contract appended to the system prompt. It runs with `--permission-mode <claude.permissionMode> --permission-prompt-tool stdio`, so prompted calls arrive as `can_use_tool` control requests that the policy answers. `--mcp-config` injects the worker server, and `--settings` disables the coordinator plugin. Feature agents get `--no-chrome` plus deny rules for the browser and computer-control servers; QA agents get `--chrome`. Every worker gets a deny rule for `ScheduleWakeup`, because the process exits when the turn ends. Auto-memory is off. On Windows the process tree runs inside a kill-on-close Job Object, so a turn's completion covers the tools it launched.
 
 **Codex harness.** There is one app-server process per profile. The coordinator plugin and skill MCP dependency installs are disabled; for feature agents, the browser, computer-use and in-app browser features and the bundled browser and computer plugins are disabled too. Per thread, MCP servers the profile denies are replaced by disabled stand-ins, and the worker server is injected as `overdrive`. Threads run in the `workspace-write` sandbox with network access and approval policy `untrusted`. The runtime answers command, file-change and permission escalations with the policy; questions and MCP elicitations reach the coordinator as pending requests.
 
 ## Message delivery
 
-Messages are rows in `messages`, addressed to a lane, a QA agent or `coordinator`. Workers send them with `message_send`. The coordinator sends them with `agent_steer`, which is queued as a message when the agent cannot take it now. A `finding_record` that opens or reopens a finding messages the lane with how to reproduce it. No other notification is automatic; agents decide when to talk.
+Messages are rows in `messages`, addressed to a lane, a QA agent or `coordinator`. Workers send them with `message_send`. The coordinator sends them with `agent_steer`, which is queued as a message when the agent cannot take it now. A `finding_record` that opens or reopens a finding messages the lane with how to reproduce it; if the finding is closed (resolved or `wontfix`) while that message is still pending, it is marked `withdrawn` and never delivered. No other notification is automatic; agents decide when to talk.
 
 The coordinator's server sweeps pending messages about every 2 seconds while it runs agents, and again as soon as a turn completes. For each recipient that has a spec:
 
@@ -85,7 +85,7 @@ Delivery holds the agent's control lock, so two controllers never deliver the sa
 
 **Runs.** `lab_run {suite, target, revision?}` runs these steps:
 
-1. Resolve the revision: the given ref, a lane snapshot, the integration HEAD, or for the `base` control target the managed `project/` HEAD or the cached default revision.
+1. Resolve the revision: the given ref, a lane snapshot, the integration HEAD, or for the `base` control target the managed `project/` HEAD or the cached default revision. A `base` commit ID that neither holds, such as a foundation lane's commit, is resolved in the first feature lane checkout that has it.
 2. Under a per-target lock, fetch it into `.overdrive/lab/targets/<target>`, a clone whose `origin` is the repository as in lane clones, `checkout --detach -f`, and `git clean -fd`, which keeps ignored dependency directories.
 3. Snapshot the lab as `lab_revision`, then run the suite argv without a shell, with the environment contract, timeout and output cap, and record the `lab_runs` row.
 

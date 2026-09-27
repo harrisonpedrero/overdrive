@@ -185,7 +185,7 @@ export const TOOLS = [
     ...workspace,
     suite: suite('Suite to run.'),
     target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
-    revision: string('Optional branch, tag or commit in the target checkout.'),
+    revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from.'),
   }, ['workspace_path', 'suite', 'target']), { destructiveHint: false }),
 
   tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return only one run, in full with its output and artifacts.', object({
@@ -228,7 +228,7 @@ const WORKER_ONLY_TOOLS = [
     to: string('Recipient: a lane slug, a QA agent name, or coordinator.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }),
     body: string('What changed, what to test or fix, or what you need; self-contained.', { minLength: 1, maxLength: 20000 }),
   }, ['workspace_path', 'to', 'body']), { destructiveHint: false }),
-  tool('lanes', 'List lanes', 'Every lane and QA agent: kind, title, status, agent status, checkout path, head commit, whether the checkout is dirty, and open findings.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
+  tool('lanes', 'List lanes', 'Every lane and QA agent: kind, title, status, agent status, checkout path, spec path, head commit, whether the checkout is dirty, and open findings.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 ];
 
 const workerHandlers = { message_send: sendAgentMessage, lanes: listLanes };
