@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import {
+  committedChanges,
   integrationPath,
   isGitAncestor,
   mergeIntoIntegration,
@@ -663,7 +664,7 @@ async function laneTarget(ctx, slug, requested) {
   if (!requested && !snapshot.clean) throw new OverdriveError(`${slug} has uncommitted changes. Have its agent commit them, then test and integrate that commit.`, 'INTEGRATE_DIRTY');
   const commit = requested ? await verifyCheckoutRevision(lane.checkout_path, requested) : snapshot.head;
   await assertCommitted(lane, commit);
-  return { target: slug, commit, source: lane.checkout_path, branch: lane.branch, lanes: [slug] };
+  return { target: slug, base: lane.base_revision, commit, source: lane.checkout_path, branch: lane.branch, lanes: [slug] };
 }
 
 // The recorded composition describes only the current build, so an older commit is refused.
@@ -677,7 +678,8 @@ async function integrationTarget(ctx, requested) {
   }
   const lanes = await integratedLanes(ctx, clone, commit);
   for (const lane of lanes) await assertCommitted(laneRow(ctx, lane.slug), lane.revision);
-  return { target: 'integration', commit, source: clone, branch: null, lanes: lanes.map(lane => lane.slug) };
+  const base = parseJson(meta(ctx.db, 'integration'), null)?.base ?? null;
+  return { target: 'integration', base, commit, source: clone, branch: null, lanes: lanes.map(lane => lane.slug) };
 }
 
 async function markLanesDone(ctx, lanes, summary, details) {
@@ -713,7 +715,7 @@ function evidenceGapsNote(runs, suitesNotRun) {
 
 // An adopted repository is never published to; a tested commit with no open blocking findings is
 // delivered, and the user publishes it with the returned push command or fetches it into their own clone.
-async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun) {
+async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes) {
   const delivered = Boolean(passing) && !blocking.length;
   // The integration clone holds its commit only as a detached HEAD, which the next rebuild moves.
   await git(source, 'update-ref', `refs/overdrive/delivered/${commit}`, commit);
@@ -724,7 +726,7 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   const gaps = evidenceGapsNote(runs, suitesNotRun);
   return {
     published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
-    openBlockingFindings: blocking.map(finding => finding.id), push, fetch,
+    openBlockingFindings: blocking.map(finding => finding.id), committedChanges: changes, push, fetch,
     next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${gaps ? ` ${gaps}` : ''}`,
   };
 }
@@ -736,7 +738,8 @@ async function suitesNotRunAt(ctx, runs) {
     .filter(name => !baseOnly.has(name) && !runs.some(run => run.suite === name));
 }
 
-async function promote(ctx, { target, commit, source, branch, lanes }) {
+async function promote(ctx, { target, base, commit, source, branch, lanes }) {
+  const changes = await committedChanges(source, base, commit);
   const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
   const runs = latestRunsBySuite(ctx, commit);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
@@ -744,7 +747,7 @@ async function promote(ctx, { target, commit, source, branch, lanes }) {
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
   const managed = ctx.config.managedProject;
-  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun);
+  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes);
   if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
   if (blocking.length) {
     throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
@@ -769,6 +772,7 @@ async function promote(ctx, { target, commit, source, branch, lanes }) {
   return {
     integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
     project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit },
+    committedChanges: changes,
     ...(gaps ? { next: gaps } : {}),
   };
 }

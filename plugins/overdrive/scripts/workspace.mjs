@@ -25,6 +25,7 @@ import {
   writeJson, STATE_DIR, CONFIG_FILE,
 } from './util.mjs';
 import {
+  committedChanges,
   createFeatureCheckout,
   ensureCommitIdentity,
   initializeMirror,
@@ -948,10 +949,15 @@ export async function listLanes({ workspace_path }) {
   });
 }
 
-export async function getFeatureContext({ workspace_path, feature, timeline_limit = 20 }) {
+// committed_changes adds a lane's committed footprint from its base to the captured HEAD; QA agents' lab has none.
+export async function getFeatureContext({ workspace_path, feature, timeline_limit = 20, committed_changes = true }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     const projection = await writeFeatureContext(ctx, row);
+    const { snapshot } = projection;
+    const git = committed_changes && snapshot.head && workerProfile(row) !== 'qa'
+      ? { ...snapshot, committedChanges: await committedChanges(row.checkout_path, row.base_revision, snapshot.head) }
+      : snapshot;
     const spec = latestSpec(ctx.db, row.id);
     const timeline = timelineRows(ctx.db, row.id, timeline_limit);
     const summary = summarizeFeature(ctx, row);
@@ -964,7 +970,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       labRuns: recentRuns(ctx.db, row, 5),
       messages: projection.messages,
       pendingAgentRequests: projection.pending,
-      git: projection.snapshot,
+      git,
       commitIdentity: projection.commitIdentity,
       timeline,
       contextPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md'),

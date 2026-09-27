@@ -249,6 +249,9 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       if (next.length > maxOutput) overflow = true;
       return next.length > 2 * maxOutput ? next.slice(-maxOutput) : next;
     };
+    // Decoding per stream keeps a multibyte character split across two chunks intact.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => { stdout = (combinedTail ? keepTail : collect)(stdout, chunk); });
     child.stderr.on('data', chunk => { if (combinedTail) stdout = keepTail(stdout, chunk); else stderr = collect(stderr, chunk); });
     let timedOut = false;
@@ -307,7 +310,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       const uncertainty = deadline ?? (unconfirmed && `${unconfirmed}, so its process tree was not confirmed stopped`);
       if (uncertainty && confirmTermination) return reject(uncertain(uncertainty));
       const terminationUncertain = uncertainty ? `Passed its deadline and ${uncertainty}; processes it started may still be running.` : null;
-      if (allowFailure) return resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode: code, timedOut, overflow, durationMs, argv, ...(terminationUncertain ? { terminationUncertain } : {}) });
+      if (allowFailure) return resolve({ stdout: rawOutput ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim(), exitCode: code, timedOut, overflow, durationMs, argv, ...(terminationUncertain ? { terminationUncertain } : {}) });
       if (code === 0 && !overflow && !timedOut) return resolve({ stdout: rawOutput ? stdout : stdout.trim(), stderr: rawOutput ? stderr : stderr.trim() });
       const detail = stderr.trim().slice(-4_000) || stdout.trim().slice(-4_000) || 'No output';
       reject(new OverdriveError(`${commandDescription(argv)} failed${timedOut ? ' after its deadline' : overflow ? ' because its output was too large' : ` (exit ${code})`}${terminationUncertain ? ` (${terminationUncertain})` : ''}: ${detail}`, 'COMMAND_FAILED'));

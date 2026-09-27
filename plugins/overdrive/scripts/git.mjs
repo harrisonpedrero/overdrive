@@ -7,6 +7,7 @@ import {
   ensureManagedPath,
   exists,
   git,
+  redactString,
   run,
   safeSlug, STATE_DIR,
 } from './util.mjs';
@@ -460,12 +461,89 @@ export async function isGitAncestor(repository, ancestor, descendant) {
   }
 }
 
-export async function diffSummary(repository, fromRevision, toRevision = 'HEAD') {
-  await assertFullRepository(repository);
-  const output = (await git(repository, 'diff', '--stat', '--summary', `${fromRevision}..${toRevision}`)).stdout;
-  const names = (await git(repository, 'diff', '--name-status', `${fromRevision}..${toRevision}`)).stdout;
+const CHANGED_FILE_LIMIT = 100;
+const CHANGED_PATH_MAX = 300;
+const TREE_DIFF_OUTPUT_MAX = 16_000_000;
+
+const clipPath = text => `${text.slice(0, CHANGED_PATH_MAX - 1).replace(/[\uD800-\uDBFF]$/, '')}…`;
+
+// Paths are redacted before clipping, so clipping never cuts a secret the redactor would have recognized.
+function reviewFile(file) {
+  const path = redactString(file.path);
+  const previousPath = file.previousPath === undefined ? undefined : redactString(file.previousPath);
+  const clipped = path.length > CHANGED_PATH_MAX || previousPath?.length > CHANGED_PATH_MAX;
+  const fit = text => (text.length > CHANGED_PATH_MAX ? clipPath(text) : text);
+  return { ...file, path: fit(path), ...(previousPath === undefined ? {} : { previousPath: fit(previousPath) }), ...(clipped ? { pathClipped: true } : {}) };
+}
+
+// Parses diff-tree -z --raw --numstat: a raw record per file, then a numstat record per file in the
+// same order, a rename carrying both paths. Returns null unless the output parses completely.
+function parseTreeDiff(output) {
+  const tokens = output.split('\0');
+  const files = [];
+  let index = 0;
+  while (tokens[index]?.startsWith(':')) {
+    const status = tokens[index].slice(tokens[index].lastIndexOf(' ') + 1);
+    const renamed = /^[RC]/.test(status);
+    files.push(renamed
+      ? { status: status[0], path: tokens[index + 2], previousPath: tokens[index + 1], similarity: Number(status.slice(1)) }
+      : { status: status[0], path: tokens[index + 1] });
+    index += renamed ? 3 : 2;
+  }
+  for (const file of files) {
+    const counts = tokens[index]?.match(/^(-|\d+)\t(-|\d+)\t/);
+    if (!counts || file.path === undefined) return null;
+    index += file.previousPath === undefined ? 1 : 3;
+    if (counts[1] === '-') file.binary = true;
+    else Object.assign(file, { insertions: Number(counts[1]), deletions: Number(counts[2]) });
+  }
+  return index === tokens.length - 1 && tokens[index] === '' ? files : null;
+}
+
+// Best effort: a failed check names no revision, leaving Git's own error as the reason.
+async function missingCommit(repository, revisions) {
+  for (const revision of revisions) {
+    try {
+      const present = await run(['git', 'cat-file', '-e', `${revision}^{commit}`], { cwd: repository, allowFailure: true, timeoutMs: 10_000 });
+      if (present.exitCode === 1 || present.exitCode === 128) return revision;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// The committed change between two exact commits, compared tree to tree, so the index, working tree
+// and any merge-base stay out of it. Plumbing with --no-ext-diff and --no-textconv runs no configured helper.
+export async function committedChanges(repository, from, to) {
+  const unavailable = reason => ({ from: from ?? null, to, unavailable: reason });
+  if (!from) return unavailable('No base revision is recorded to compare with.');
+  let result;
+  try {
+    result = await run(['git', 'diff-tree', '-r', '-z', '-M', '--raw', '--numstat', '--no-ext-diff', '--no-textconv', from, to], { cwd: repository, rawOutput: true, allowFailure: true, maxOutput: TREE_DIFF_OUTPUT_MAX, timeoutMs: 60_000 });
+  } catch (error) {
+    return unavailable(`Git could not compare the commits: ${redactString(error.message).slice(0, 500)}`);
+  }
+  if (result.overflow) return unavailable('The change is too large to list exactly.');
+  if (result.timedOut) return unavailable('Comparing the commits did not finish in time.');
+  if (result.exitCode !== 0) {
+    const missing = await missingCommit(repository, [from, to]);
+    return unavailable(missing
+      ? `${missing.slice(0, 12)} is not a commit in this clone; it may have been pruned or rewritten.`
+      : `Git could not compare the commits: ${redactString(result.stderr.trim()).slice(-500)}`);
+  }
+  const files = parseTreeDiff(result.stdout);
+  if (!files) return unavailable('Git returned a change list that could not be read exactly.');
+  const total = key => files.reduce((sum, file) => sum + (file[key] ?? 0), 0);
+  const listed = files.slice(0, CHANGED_FILE_LIMIT).map(reviewFile);
   return {
-    stat: output,
-    files: names ? names.split(/\r?\n/).filter(Boolean).slice(0, 200) : [],
+    from, to,
+    fileCount: files.length,
+    insertions: total('insertions'),
+    deletions: total('deletions'),
+    binaryFiles: files.filter(file => file.binary).length,
+    files: listed,
+    // Any lossy list is marked: files left out, or a listed path clipped.
+    truncated: files.length > listed.length || listed.some(file => file.pathClipped),
   };
 }
