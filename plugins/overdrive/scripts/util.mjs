@@ -432,19 +432,60 @@ export function lineDiff(before = '', after = '') {
   return { added, removed };
 }
 
+const QUOTED_GIT_PATH = /^"((?:[^"\\]|\\.)*)"/;
+const GIT_ESCAPE_BYTES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 };
+
+// Git C-quotes a path with special or non-ASCII bytes, writing each such byte as a three-digit octal escape.
+function decodeQuotedGitPath(body) {
+  const parts = body.split(/(\\(?:[0-7]{3}|.))/);
+  const bytes = parts.map((part, index) => {
+    if (index % 2 === 0) return Buffer.from(part, 'utf8');
+    const code = part.slice(1);
+    return Buffer.from([code.length === 3 ? parseInt(code, 8) : GIT_ESCAPE_BYTES[code] ?? code.charCodeAt(0)]);
+  });
+  return Buffer.concat(bytes).toString('utf8');
+}
+
+function gitPath(text) {
+  const quoted = QUOTED_GIT_PATH.exec(text);
+  return quoted ? decodeQuotedGitPath(quoted[1]) : text;
+}
+
+// Takes the post-image side of a `diff --git a/<old> b/<new>` header, where each side is quoted
+// independently. Unquoted names never contain a quote, and unquoted equal sides split at their midpoint.
+function diffHeaderPath(header) {
+  const quotedOld = QUOTED_GIT_PATH.exec(header);
+  let side;
+  if (quotedOld) side = header.slice(quotedOld[0].length + 1);
+  else if (header.includes('"')) side = header.slice(header.indexOf('"'));
+  else {
+    const half = (header.length - 5) / 2;
+    const split = Number.isInteger(half) && header.slice(2, 2 + half) === header.slice(5 + half) && header.slice(2 + half, 5 + half) === ' b/'
+      ? 3 + half
+      : header.indexOf(' b/', 2) + 1;
+    side = split > 0 ? header.slice(split) : '';
+  }
+  const name = gitPath(side);
+  return name.startsWith('b/') && name.length > 2 ? name.slice(2) : null;
+}
+
+// A `rename to`/`copy to` line names the destination that an unquoted header containing ' b/' leaves ambiguous.
+// Redacted names can coincide, so fileCount counts distinct decoded paths while files lists redacted ones.
 export function summarizePatch(patch = '') {
-  const files = new Set();
+  const paths = [];
   let additions = 0;
   let deletions = 0;
   for (const line of patch.split(/\r?\n/)) {
-    const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-    if (match) files.add(match[2]);
+    const destination = /^(?:rename|copy) to (.+)$/.exec(line);
+    if (line.startsWith('diff --git ')) paths.push(diffHeaderPath(line.slice(11)));
+    else if (destination && paths.length) paths[paths.length - 1] = gitPath(destination[1]);
     else if (line.startsWith('+') && !line.startsWith('+++')) additions += 1;
     else if (line.startsWith('-') && !line.startsWith('---')) deletions += 1;
   }
+  const files = new Set(paths.filter(Boolean));
   return {
     fileCount: files.size,
-    files: [...files].slice(0, 50),
+    files: [...new Set([...files].map(redactString))].slice(0, 50),
     additions,
     deletions,
     digest: createHash('sha256').update(patch).digest('hex').slice(0, 16),
