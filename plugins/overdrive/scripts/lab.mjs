@@ -50,10 +50,12 @@ const agentName = value => (value === undefined || value === 'coordinator' ? 'co
 const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
 const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
 const runLog = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'output.log');
-// A run holds its target's lock for its whole suite, so a queued run waits as long as it can still finish
-// within the hour its MCP clients allow a call (tool_timeout_sec), and never less than the usual two minutes.
+// A call holds its target's lock while its runs there execute, so a queued call waits as long as those runs could
+// still finish within the hour its MCP clients allow a call (tool_timeout_sec), and never less than two minutes.
 const LAB_CALL_BUDGET_MS = 3_600_000;
-const labRunLockWait = suite => Math.max(120_000, LAB_CALL_BUDGET_MS - suite.timeout * 1_000);
+const labRunLockWait = seconds => Math.max(120_000, LAB_CALL_BUDGET_MS - seconds * 1_000);
+// Runs of one call on one target that execute at once, each in its own checkout.
+const LAB_SLOTS = 3;
 
 // Lock names allow 63 characters after the optional control- prefix, so a long lane slug is hashed.
 function labLock(target) {
@@ -219,76 +221,139 @@ function identicalRunSince(db, { target, suite, revision, lab_revision }, arrive
   return row && Date.parse(row.created_at) + row.duration_ms >= arrived ? row : null;
 }
 
-function runResponse(root, row, details, notes) {
+function runSummary(root, row) {
   const { argv: _argv, artifacts: { files: _files, ...artifacts }, ...summary } = presentRun(root, row, runLog(root, row.id));
-  return { run: { ...summary, artifacts }, ...details, next: [...notes, `Earlier output is in run.outputLog; lab_get {"run": "${row.id}"} lists its artifacts.`].join(' ') };
+  return { ...summary, artifacts };
 }
 
-export async function runLabSuite({ workspace_path, suite, target, revision, from }) {
-  const name = suiteName(suite);
-  const targetSlug = targetName(target);
-  const requested = optionalText(revision, 'revision', { max: 200 });
-  const creator = agentName(from);
-  const arrived = Date.now();
+function runResponse(root, { row, details, notes }) {
+  return { run: runSummary(root, row), ...details, next: [...notes, `Earlier output is in run.outputLog; lab_get {"run": "${row.id}"} lists its artifacts.`].join(' ') };
+}
+
+function batchResponse(root, requests, results) {
+  const notes = new Set();
+  const runs = results.map(({ value, error }, index) => {
+    if (error) return { suite: requests[index].name, target: requests[index].target, error: error.message, code: error.code ?? null };
+    value.notes.forEach(note => notes.add(note));
+    const run = runSummary(root, value.row);
+    return { ...run, outputTail: run.outputTail.slice(-1_000), ...value.details };
+  });
+  return { runs, next: [...notes, 'Each run\'s earlier output is in its outputLog; lab_get {"run": "<id>"} lists its artifacts.'].join(' ') };
+}
+
+// The single form is a batch of one.
+function labRequests({ suite, target, revision, batch }) {
+  if (batch === undefined) return [{ suite, target, revision }];
+  if (suite !== undefined || target !== undefined || revision !== undefined) throw new OverdriveError('Pass either suite, target and revision, or batch, not both.', 'INVALID_INPUT');
+  if (!Array.isArray(batch) || batch.length < 1 || batch.length > 8) throw new OverdriveError('batch must list 1-8 runs.', 'INVALID_INPUT');
+  return batch;
+}
+
+const settle = promise => promise.then(value => ({ value }), error => ({ error }));
+
+// One run on a synced checkout in the given slot: reuse an identical run, or execute and record it.
+async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call) {
+  const { source, revision: commit, features, uncommittedFiles } = subject;
+  // Processes of a run whose termination is uncertain may still use its target directory. Slugs never
+  // contain --, so slot directories never collide with a lane's.
+  const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(target).count);
+  const directory = `${uncertain ? `${target}--${uncertain}` : target}${slot ? `--s${slot}` : ''}`;
+  const checkout = await syncTarget(ctx.root, directory, source, commit, ctx.config.repository);
+  const labRevision = await call.labRevision();
+  const details = target === 'integration' ? { included: features } : {};
+  const notes = uncommittedFiles ? [`${target} has uncommitted changes that this run of its HEAD left out.`] : [];
+  const reused = identicalRunSince(ctx.db, { target, suite: name, revision: commit, lab_revision: labRevision }, call.arrived);
+  if (reused) return { row: reused, details: { reused: true, resolvedFindings: [], ...details }, notes: ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes] };
+  const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+  const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
+  await fs.mkdir(artifacts, { recursive: true });
+  const cwd = spec.cwd === 'target' ? checkout : spec.directory;
+  const env = {
+    ...process.env,
+    OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: call.lab, OVERDRIVE_SUITE: name,
+    OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
+  };
+  const row = {
+    id, suite: name, target, revision: commit, lab_revision: labRevision, argv_json: JSON.stringify(spec.argv), cwd,
+    status: 'running', created_by: call.creator, created_at: now(),
+  };
+  ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
+  const started = Date.now();
+  const result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000 });
+  const log = redactString(result.output.filter(Boolean).join('\n'));
+  await fs.writeFile(runLog(ctx.root, id), log, 'utf8');
+  Object.assign(row, {
+    exit_code: result.exitCode, status: result.status, output: log.slice(-24_000),
+    duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)),
+  });
+  const resolvable = row.status === 'passed' ? await resolvableFindings(ctx, source, name, features, commit) : [];
+  const stamp = now();
+  // A finding another run of this call resolved first stays credited to that run.
+  const resolved = transaction(ctx.db, () => {
+    ctx.db.prepare('UPDATE lab_runs SET exit_code = ?, status = ?, output = ?, duration_ms = ?, artifacts_json = ? WHERE id = ?')
+      .run(row.exit_code, row.status, row.output, row.duration_ms, row.artifacts_json, id);
+    const resolve = ctx.db.prepare("UPDATE findings SET status = 'resolved', resolved_revision = ?, resolved_run = ?, updated_at = ? WHERE id = ? AND status = 'open'");
+    const changed = resolvable.filter(finding => resolve.run(commit, id, stamp, finding.id).changes);
+    for (const finding of changed) withdrawFindingMessage(ctx.db, finding);
+    return changed;
+  });
+  if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
+  for (const finding of resolved) {
+    await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
+  }
+  return { row, details: { resolvedFindings: resolved.map(finding => finding.id), ...details }, notes };
+}
+
+// A call's runs on one target share its lock and run up to LAB_SLOTS at a time, each slot in its own checkout.
+async function runOnTarget(ctx, requests, call) {
+  const { target } = requests[0];
+  return await withWorkspaceLock(ctx.root, labLock(target), async () => {
+    // Under this target's lock a run still marked running belongs to a runtime that exited mid-run.
+    ctx.db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(target);
+    // One at a time, so two snapshots of one checkout never race on its refs.
+    const subjects = [];
+    for (const request of requests) subjects.push(await settle(runSubject(ctx, target, request.lane, request.requested, call.creator)));
+    const results = [];
+    let next = 0;
+    const slot = async index => {
+      while (next < requests.length) {
+        const at = next++;
+        results[at] = subjects[at].error ? subjects[at] : await settle(runOnSlot(ctx, requests[at], subjects[at].value, index, call));
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(requests.length, LAB_SLOTS) }, (_, index) => slot(index)));
+    return results;
+  }, { timeoutMs: labRunLockWait(Math.ceil(requests.length / LAB_SLOTS) * Math.max(...requests.map(request => request.spec.timeout))) });
+}
+
+export async function runLabSuite({ workspace_path, batch, from, ...single }) {
+  const requests = labRequests({ ...single, batch }).map(entry => ({
+    name: suiteName(entry?.suite), target: targetName(entry?.target), requested: optionalText(entry?.revision, 'revision', { max: 200 }),
+  }));
+  const keys = requests.map(({ name, target, requested }) => `${target} ${name} ${requested ?? ''}`);
+  if (new Set(keys).size !== keys.length) throw new OverdriveError('Each run can appear once in a batch; to repeat a scenario, repeat it inside its suite.', 'INVALID_INPUT');
+  const call = { creator: agentName(from), arrived: Date.now() };
   return await withContext(workspace_path, async ctx => {
-    const lab = await ensureLab(ctx.root);
-    const spec = await readSuite(ctx.root, lab, name);
-    // A lane named base from before the control target keeps its lab address.
-    const lane = targetSlug === 'integration' || (targetSlug === 'base' && !featureId(ctx.db, 'base')) ? null : laneRow(ctx, targetSlug);
-    return await withWorkspaceLock(ctx.root, labLock(targetSlug), async () => {
-      const { source, revision: commit, features, uncommittedFiles } = await runSubject(ctx, targetSlug, lane, requested, creator);
-      // Under this target's lock a run still marked running belongs to a runtime that exited mid-run.
-      ctx.db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(targetSlug);
-      // Processes of a run whose termination is uncertain may still use its target directory.
-      const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(targetSlug).count);
-      const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit, ctx.config.repository);
-      // Taken after the target sync, which can be slow, so the recorded snapshot matches the lab files the suite runs.
-      const labRevision = await snapshotCommit(lab);
-      const details = targetSlug === 'integration' ? { included: features } : {};
-      const notes = uncommittedFiles ? [`${targetSlug} has uncommitted changes that this run of its HEAD left out.`] : [];
-      const reused = identicalRunSince(ctx.db, { target: targetSlug, suite: name, revision: commit, lab_revision: labRevision }, arrived);
-      if (reused) {
-        return runResponse(ctx.root, reused, { reused: true, resolvedFindings: [], ...details }, ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes]);
-      }
-      const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
-      const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
-      await fs.mkdir(artifacts, { recursive: true });
-      const cwd = spec.cwd === 'target' ? checkout : spec.directory;
-      const env = {
-        ...process.env,
-        OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: lab, OVERDRIVE_SUITE: name,
-        OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
-      };
-      const row = {
-        id, suite: name, target: targetSlug, revision: commit, lab_revision: labRevision, argv_json: JSON.stringify(spec.argv), cwd,
-        status: 'running', created_by: creator, created_at: now(),
-      };
-      ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
-      const started = Date.now();
-      const result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000 });
-      const log = redactString(result.output.filter(Boolean).join('\n'));
-      await fs.writeFile(runLog(ctx.root, id), log, 'utf8');
-      Object.assign(row, {
-        exit_code: result.exitCode, status: result.status, output: log.slice(-24_000),
-        duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)),
-      });
-      const resolved = row.status === 'passed' ? await resolvableFindings(ctx, source, name, features, commit) : [];
-      const stamp = now();
-      transaction(ctx.db, () => {
-        ctx.db.prepare('UPDATE lab_runs SET exit_code = ?, status = ?, output = ?, duration_ms = ?, artifacts_json = ? WHERE id = ?')
-          .run(row.exit_code, row.status, row.output, row.duration_ms, row.artifacts_json, id);
-        const resolve = ctx.db.prepare("UPDATE findings SET status = 'resolved', resolved_revision = ?, resolved_run = ?, updated_at = ? WHERE id = ? AND status = 'open'");
-        for (const finding of resolved) {
-          resolve.run(commit, id, stamp, finding.id);
-          withdrawFindingMessage(ctx.db, finding);
-        }
-      });
-      if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
-      for (const finding of resolved) {
-        await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
-      }
-      return runResponse(ctx.root, row, { resolvedFindings: resolved.map(finding => finding.id), ...details }, notes);
-    }, { timeoutMs: labRunLockWait(spec) });
+    call.lab = await ensureLab(ctx.root);
+    // Taken once, after the first target sync, which can be slow, so the recorded snapshot matches the lab files suites run.
+    let snapshot;
+    call.labRevision = () => (snapshot ??= snapshotCommit(call.lab));
+    const byTarget = new Map();
+    for (const request of requests) {
+      request.spec = await readSuite(ctx.root, call.lab, request.name);
+      // A lane named base from before the control target keeps its lab address.
+      request.lane = request.target === 'integration' || (request.target === 'base' && !featureId(ctx.db, 'base')) ? null : laneRow(ctx, request.target);
+      byTarget.set(request.target, [...byTarget.get(request.target) ?? [], request]);
+    }
+    const results = new Map();
+    await Promise.all([...byTarget.values()].map(async group => {
+      const settled = await settle(runOnTarget(ctx, group, call));
+      group.forEach((request, index) => results.set(request, settled.error ? settled : settled.value[index]));
+    }));
+    const ordered = requests.map(request => results.get(request));
+    if (batch !== undefined) return batchResponse(ctx.root, requests, ordered);
+    if (ordered[0].error) throw ordered[0].error;
+    return runResponse(ctx.root, ordered[0].value);
   });
 }
 

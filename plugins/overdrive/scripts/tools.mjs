@@ -57,6 +57,11 @@ const feature = { feature: string('Feature slug, such as search-redesign.', { pa
 const agent = { agent: string('Lane slug or QA agent name, such as search-redesign or qa.', { pattern: SLUG }) };
 const suite = description => string(description, { pattern: '^[a-z0-9][a-z0-9_-]{0,62}$' });
 const target = string('A feature lane slug, or integration for the integration build.', { pattern: SLUG });
+const labRun = {
+  suite: suite('Suite to run.'),
+  target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
+  revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from.'),
+};
 export const TOOLS = [
   tool('workspace_init', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
@@ -181,12 +186,14 @@ export const TOOLS = [
     timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
   }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to its committed HEAD or, when its own agent runs it, to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes. Runs on one target wait for each other, because they share its checkout.', object({
+  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to its committed HEAD or, when its own agent runs it, to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes. An agent\'s calls run one at a time, so pass independent runs together in batch: runs on different targets execute at the same time, and up to three on one target in separate checkouts. Put timing-sensitive suites, such as benchmarks, and suites that need a fixed port or another machine-wide resource in a call of their own.', object({
     ...workspace,
-    suite: suite('Suite to run.'),
-    target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
-    revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from.'),
-  }, ['workspace_path', 'suite', 'target']), { destructiveHint: false }),
+    ...labRun,
+    batch: {
+      type: 'array', minItems: 1, maxItems: 8, items: object(labRun, ['suite', 'target']),
+      description: 'Several runs in one call, instead of suite, target and revision; each returns its own verdict.',
+    },
+  }, ['workspace_path']), { destructiveHint: false }),
 
   tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return one run with its output tail, the path of its output log and its artifacts.', object({
     ...workspace,
@@ -276,6 +283,11 @@ function workerSchema(tool) {
 const workerCaller = () => ({ from: safeSlug(workerAgent(), 'from'), workspace_path: process.env.OVERDRIVE_WORKSPACE });
 const callerProfile = caller => agentProfile({ workspace_path: caller.workspace_path, agent: caller.from });
 
+function ownLane(call, lane) {
+  if (call?.target !== undefined && call.target !== lane) throw forbidden(`A feature agent may only target its own lane, ${lane}.`);
+  return { ...call, target: lane };
+}
+
 // A worker lists the tools its kind may call, or every worker tool when its row cannot be read now;
 // calls are checked either way.
 export async function listTools() {
@@ -286,7 +298,7 @@ export async function listTools() {
 }
 
 // The caller's kind comes from its recorded row, never from an argument. A feature agent's lab
-// calls always target its own lane.
+// calls, and each run of its batch, always target its own lane.
 async function callWorkerTool(name, args) {
   const access = WORKER_TOOLS[name];
   const handler = access && (workerHandlers[name] ?? handlers[name]);
@@ -294,12 +306,11 @@ async function callWorkerTool(name, args) {
   const caller = workerCaller();
   const profile = await callerProfile(caller);
   if (!access.includes(profile)) throw forbidden(`${name} is available to QA agents only.`);
-  const call = { ...args, ...caller };
-  if (profile === 'feature' && name.startsWith('lab_')) {
-    if (call.target !== undefined && call.target !== caller.from) throw forbidden(`A feature agent may only target its own lane, ${caller.from}.`);
-    call.target = caller.from;
+  if (profile !== 'feature' || !name.startsWith('lab_')) return await handler({ ...args, ...caller });
+  if (name === 'lab_run' && args.batch !== undefined) {
+    return await handler({ ...args, ...caller, batch: Array.isArray(args.batch) ? args.batch.map(entry => ownLane(entry, caller.from)) : args.batch });
   }
-  return await handler(call);
+  return await handler(ownLane({ ...args, ...caller }, caller.from));
 }
 
 export async function callTool(name, args) {
