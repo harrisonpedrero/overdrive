@@ -162,15 +162,22 @@ async function artifactManifest(directory) {
 }
 
 const OUTPUT_LIMIT = 500_000;
+// Earlier output is dropped at a line end when one falls this close after the limit, so the kept output starts with a whole line.
+const LINE_CUT_SLACK = 1_000;
+const DROPPED_MARKER = '[earlier output dropped]';
 const LIVE_OUTPUT_INTERVAL_MS = 1_000;
 
-// redactString matches Bearer and credential keys across newlines, so output that follows discarded text ending in
+// redactString matches Bearer and credential keys across whitespace, so output that follows discarded text ending in
 // one, with its optional delimiter, may be that credential's value.
 const CREDENTIAL_KEY = /\b(?:bearer|token|password|passwd|secret|api[_-]?key|authorization)$/i;
-// The characters at the end of text that decide whether it opens a credential, with whitespace collapsed.
+// The last 24 characters of text with each whitespace run collapsed to one space, which decide whether it opens a credential.
 function credentialTail(text) {
-  const end = text.trimEnd();
-  return `${end.slice(-64).replace(/\s+/g, ' ').slice(-24)}${end.length < text.length ? ' ' : ''}`;
+  let tail = '';
+  for (let at = text.length - 1; at >= 0 && tail.length < 24; at--) {
+    if (!/\s/.test(text[at])) tail = text[at] + tail;
+    else if (!tail.startsWith(' ')) tail = ` ${tail}`;
+  }
+  return tail;
 }
 // The tail of text when it ends inside an unfinished credential, or ''.
 function openCredential(text) {
@@ -178,26 +185,27 @@ function openCredential(text) {
   const end = tail.trimEnd();
   return CREDENTIAL_KEY.test(/[:=]$/.test(end) ? end.slice(0, -1).trimEnd() : end) ? tail : '';
 }
-// Drops the lines of text that may continue a credential open in discarded output; returns what is still open and the rest.
-function skipCredentialContinuation(open, text) {
+// Skips the start of text that may continue discarded output whose tail is still open: the rest of a word it cut, then
+// any credential it opens. Returns the tail still open and the rest of text.
+function skipContinuation(open, text) {
+  const space = /\s/g;
   let at = 0;
   while (open && at < text.length) {
-    const end = text.indexOf('\n', at) + 1 || text.length;
-    open = openCredential(`${open}\n${text.slice(at, end)}`);
-    at = end;
+    space.lastIndex = at;
+    if (!space.exec(text)) return [credentialTail(open + text.slice(at)), ''];
+    open = openCredential(open + text.slice(at, space.lastIndex));
+    at = space.lastIndex;
   }
   return [open, text.slice(at)];
 }
 
-// Rewrites a running run's log with its latest complete lines, redacted, at most once per interval. Lines join both
-// streams in arrival order, as the final log does, so a credential split across chunks or streams is redacted alike.
-// Earlier output is dropped at a line boundary and a line longer than the limit is omitted entirely, each with any
-// lines continuing a credential it opened.
-function liveOutput(root, file) {
-  // While an omitted line is skipped, pending holds only its credential tail.
-  let pending = '';
-  let skipping = false;
-  let lines = '';
+// Keeps a run's newest output, both streams joined in arrival order, within OUTPUT_LIMIT characters. Earlier output is
+// dropped at a line end, or at whitespace inside a longer line, together with any kept output that may continue a word
+// or credential it cut, so redacting the kept output never needs what was dropped. While the run executes, its log is
+// rewritten with the complete lines kept, redacted, at most once per interval.
+function labOutput(root, file) {
+  let text = '';
+  // The tail of dropped output while arriving output may still continue it; text is empty until it closes.
   let open = '';
   let dropped = false;
   let timer = null;
@@ -205,19 +213,23 @@ function liveOutput(root, file) {
   let changed = false;
   let closed = false;
   let failure = null;
-  const dropEarlier = keep => {
-    const at = lines.indexOf('\n', lines.length - keep - 1) + 1 || lines.length;
-    const [front, kept] = skipCredentialContinuation(openCredential(lines.slice(0, at)), lines.slice(at));
-    lines = kept;
-    if (!lines) open ||= front;
+  const dropEarlier = () => {
+    const from = text.length - OUTPUT_LIMIT - 1;
+    const line = text.indexOf('\n', from);
+    const space = /\s/g;
+    space.lastIndex = from;
+    const at = line >= 0 && line <= from + LINE_CUT_SLACK ? line + 1 : space.exec(text) ? space.lastIndex : text.length;
+    const discarded = text.slice(0, at);
+    // A cut inside a word leaves its rest open whatever it is.
+    [open, text] = skipContinuation(/\s/.test(discarded.at(-1)) ? openCredential(discarded) : credentialTail(discarded), text.slice(at));
     dropped = true;
   };
   const flush = () => {
     timer = null;
     if (closed || failure || writing) return;
-    if (lines.length > OUTPUT_LIMIT) dropEarlier(OUTPUT_LIMIT);
+    if (text.length > OUTPUT_LIMIT) dropEarlier();
     changed = false;
-    writing = atomicWrite(root, file, redactString(`${dropped ? '[earlier output dropped]\n' : ''}${lines}`))
+    writing = atomicWrite(root, file, redactString(`${dropped ? `${DROPPED_MARKER}\n` : ''}${text.slice(0, text.lastIndexOf('\n') + 1)}`))
       .catch(error => { failure = error; })
       .finally(() => { writing = null; if (changed) schedule(); });
   };
@@ -225,37 +237,14 @@ function liveOutput(root, file) {
     changed = true;
     if (!closed && !failure && !writing) timer ??= setTimeout(flush, LIVE_OUTPUT_INTERVAL_MS);
   };
-  const add = text => {
-    lines += text;
-    if (lines.length > 2 * OUTPUT_LIMIT) dropEarlier(OUTPUT_LIMIT);
-    schedule();
-  };
-  const hold = text => {
-    pending += text;
-    if (skipping) pending = credentialTail(pending);
-    else if (pending.length > OUTPUT_LIMIT) {
-      pending = credentialTail(pending);
-      skipping = true;
-      add(`[an output line over ${OUTPUT_LIMIT} characters was omitted]\n`);
-    }
-  };
   return {
     write(chunk) {
       if (closed) return;
-      const end = chunk.lastIndexOf('\n') + 1;
-      if (!end) return hold(chunk);
-      let complete = pending + chunk.slice(0, end);
-      if (skipping) {
-        // The omitted line ends at the first newline and may open a credential that later lines continue.
-        const omitted = complete.indexOf('\n') + 1;
-        open = openCredential(`${open}\n${complete.slice(0, omitted)}`);
-        complete = complete.slice(omitted);
-        skipping = false;
-      }
-      pending = '';
-      [open, complete] = skipCredentialContinuation(open, complete);
-      if (complete) add(complete);
-      hold(chunk.slice(end));
+      let kept;
+      [open, kept] = skipContinuation(open, chunk);
+      text += kept;
+      if (text.length > 2 * OUTPUT_LIMIT) dropEarlier();
+      if (kept.includes('\n')) schedule();
     },
     // Stops writing and waits for a write in progress, so the final log is never overwritten afterward.
     async close() {
@@ -264,20 +253,26 @@ function liveOutput(root, file) {
       await writing;
       if (failure) throw failure;
     },
+    // The parts of the final log after close, the unfinished last line included, not yet redacted.
+    final() {
+      if (text.length > OUTPUT_LIMIT) dropEarlier();
+      return [dropped ? DROPPED_MARKER : '', text.trim()];
+    },
   };
 }
 
 async function execute(argv, options) {
   try {
-    const result = await run(argv, { ...options, maxOutput: OUTPUT_LIMIT, combinedTail: true, allowFailure: true, confirmTermination: true });
+    // The caller's onOutput keeps the output, so run buffers none of it.
+    const result = await run(argv, { ...options, maxOutput: 0, allowFailure: true, confirmTermination: true });
     return {
       status: result.exitCode === 0 && !result.timedOut ? 'passed' : 'failed',
       exitCode: result.exitCode,
-      output: [result.timedOut ? `[timed out after ${options.timeoutMs / 1000}s]` : '', result.overflow ? '[earlier output dropped]' : '', result.stdout],
+      note: result.timedOut ? `[timed out after ${options.timeoutMs / 1000}s]` : '',
     };
   } catch (error) {
     // A command that could not start failed; one whose processes may still be running is uncertain.
-    return { status: error?.code === 'COMMAND_TERMINATION_UNCERTAIN' ? 'uncertain' : 'failed', exitCode: null, output: [error.message, error.details?.output ?? ''] };
+    return { status: error?.code === 'COMMAND_TERMINATION_UNCERTAIN' ? 'uncertain' : 'failed', exitCode: null, note: error.message };
   }
 }
 
@@ -606,12 +601,12 @@ async function runOnSlot(ctx, { name, target, lane, spec, mutant }, subject, slo
   };
   ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
   const started = Date.now();
-  const progress = liveOutput(ctx.root, runLog(ctx.root, id));
+  const output = labOutput(ctx.root, runLog(ctx.root, id));
   let result;
   // A failed progress write fails the run like a failed final log, which leaves it running until marked uncertain.
-  try { result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000, onOutput: progress.write }); }
-  finally { await progress.close(); }
-  const log = redactString(result.output.filter(Boolean).join('\n'));
+  try { result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000, onOutput: output.write }); }
+  finally { await output.close(); }
+  const log = redactString([result.note, ...output.final()].filter(Boolean).join('\n'));
   await atomicWrite(ctx.root, runLog(ctx.root, id), log);
   Object.assign(row, {
     exit_code: result.exitCode, status: result.status, output: log.slice(-24_000),
