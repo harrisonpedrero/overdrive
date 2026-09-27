@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { WorkerBridge, finalVisibleMessage } from './app-server.mjs';
+import { WorkerBridge, finalVisibleMessage, turnFailureMessage } from './app-server.mjs';
 import { denialNote, workerServer } from './worker-policy.mjs';
 import { summarizePatch, OverdriveError, parseJsonObject, refusedRequest, requiredText, redactString, resolveWorkspace } from './util.mjs';
 import { adoptAgentObservation, agentBusy, withAgentControl, withLaneStop } from './ownership.mjs';
@@ -121,6 +121,17 @@ function requestSummary(method, params) {
   return `Codex agent needs a response for ${method}.`;
 }
 
+// Redacted before clipping and bounded below the stored summary limit; a failure reason leads, so
+// clipping a long visible message never drops it.
+function turnHandoff(turn, streamed = '') {
+  const reason = turnFailureMessage(turn);
+  const handoff = [
+    reason && `Agent turn failed: ${clip(redactString(reason), 2_000)}`,
+    finalVisibleMessage(turn) || streamed,
+  ].filter(Boolean).join('\n') || `Agent turn ${turn.status || 'completed'}.`;
+  return clip(redactString(turn.denials?.length ? `${handoff}\n${denialNote(turn.denials)}` : handoff), 99_000);
+}
+
 const descendantsSummary = turnId => `The worker process of turn ${turnId ?? 'unknown'} was stopped without its process tree, so tools it launched may still be running in the checkout. The lane cannot be paused or archived until the coordinator verifies that none is running.`;
 
 async function onServerRequest(message) {
@@ -195,8 +206,7 @@ async function onNotification({ method, params }) {
     if (turnId && completedTurns.has(completionKey)) return;
     // Recorded before the turn's end, so no reader sees the lane stopped without the marker.
     if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, thread_id: params.threadId, turn_id: turnId ?? null, summary: descendantsSummary(turnId) });
-    const handoff = finalVisibleMessage(turn) || turnMessages.get(turnId) || `Agent turn ${turn.status || 'completed'}.`;
-    const visible = redactString(clip(turn.denials?.length ? `${handoff}\n${denialNote(turn.denials)}` : handoff));
+    const visible = turnHandoff(turn, turnMessages.get(turnId));
     const diff = turnDiffs.get(turnId);
     const plan = turnPlans.get(turnId);
     if (plan) await recordAgentEvent({ ...base, thread_id: params.threadId, kind: 'agent.plan', summary: 'Agent updated its visible plan.', details: plan });
@@ -777,7 +787,7 @@ async function settleEndedTurn(runtime, turnId) {
   const base = { workspace_path: runtime.root, feature: runtime.feature.slug, thread_id: runtime.feature.thread_id, owner_token: ownerToken };
   await enqueueStateWork(async () => {
     if (turn.descendantsUnconfirmed) await markDescendantsUnconfirmed({ ...base, turn_id: turnId, summary: descendantsSummary(turnId) });
-    await saveAgentSession({ ...base, status: turn.status === 'completed' ? 'idle' : turn.status });
+    await saveAgentSession({ ...base, status: turn.status === 'completed' ? 'idle' : turn.status, summary: turn.status === 'failed' ? turnHandoff(turn) : undefined });
   });
   return true;
 }

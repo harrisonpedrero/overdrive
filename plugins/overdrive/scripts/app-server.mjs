@@ -414,3 +414,12 @@ export function finalVisibleMessage(turn) {
   if (!turn?.items || !Array.isArray(turn.items)) return '';
   return turn.items.filter(item => item?.type === 'agentMessage' && typeof item.text === 'string').map(item => item.text).join('\n').trim();
 }
+
+// Reads only the public turn.error.message of a failed turn; a message holding a JSON error body
+// yields its inner human-readable message.
+export function turnFailureMessage(turn) {
+  const message = turn?.status === 'failed' && typeof turn.error?.message === 'string' ? turn.error.message.trim() : '';
+  let inner;
+  try { inner = JSON.parse(message)?.error?.message; } catch { /* a plain-text message */ }
+  return typeof inner === 'string' && inner.trim() ? inner.trim() : message;
+}
