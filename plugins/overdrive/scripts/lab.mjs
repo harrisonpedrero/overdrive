@@ -895,7 +895,14 @@ async function markLanesDone(ctx, lanes, summary, details, repository, delivered
 
 function remainingWorkNote(remaining) {
   if (!remaining.length) return '';
-  return `Delivery of all work in ${remaining.map(work => work.lane).join(', ')} could not be confirmed, so they keep their status, summary and next action; review each lane's entry in remainingWork and continue the work that should ship, making a done lane active again first.`;
+  const names = works => works.map(work => work.lane).join(', ');
+  const observed = remaining.filter(work => !work.unavailable);
+  const unchecked = remaining.filter(work => work.unavailable);
+  return [
+    observed.length ? `Undelivered or uncommitted work remains in ${names(observed)}.` : '',
+    unchecked.length ? `Whether all work in ${names(unchecked)} was delivered could not be checked.` : '',
+    'Each of these lanes keeps its status, summary and next action; review its entry in remainingWork and continue the work that should ship, making a done lane active again first.',
+  ].filter(Boolean).join(' ');
 }
 
 // Every suite's latest verdict at the commit, so integrate cites what was actually run there.
