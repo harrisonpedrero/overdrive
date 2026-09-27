@@ -222,7 +222,7 @@ export const TOOLS = [
     base: string('Optional project or repository ref; a lane\'s commit joins through features (slug@ref) instead. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
   }, ['workspace_path', 'features']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains, then mark those lanes done. Never pushes. For an adopted repository it publishes nothing: it returns the commit, its checkout path, a push command to run with the user’s authority and a fetch command for the user’s own clone, and marks the included lanes done when the commit has a passing lab run and no open blocking findings.', object({
+  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains. Never pushes. For an adopted repository it publishes nothing: it returns the commit, its checkout path, a push command to run with the user’s authority and a fetch command for the user’s own clone, and delivers the commit when it has a passing lab run and no open blocking findings. On delivery it marks done each included lane whose checkout is clean and whose HEAD the delivered commit contains; the rest keep their status and next action and are listed in remainingWork.', object({
     ...workspace,
     target: target,
     revision: string('Optional exact revision. Defaults to the HEAD of a clean lane, or of the integration clone.'),

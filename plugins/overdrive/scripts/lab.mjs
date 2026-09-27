@@ -842,18 +842,60 @@ async function integrationTarget(ctx, requested) {
   return { target: 'integration', base, commit, source: clone, branch: null, lanes: lanes.map(lane => lane.slug) };
 }
 
-async function markLanesDone(ctx, lanes, summary, details) {
+// A lane's work as observed now, against the delivered commit in the repository that holds it.
+async function laneWork(ctx, slug, repository, delivered) {
+  const lane = laneRow(ctx, slug);
+  const work = { lane: slug, status: lane.status };
+  try {
+    const snapshot = await repositorySnapshot(lane.checkout_path);
+    Object.assign(work, { head: snapshot.head, uncommittedFiles: snapshot.changedFileCount });
+    // A HEAD the destination lacks fails the ancestry check, so it never counts as delivered.
+    work.headDelivered = await isGitAncestor(repository, snapshot.head, delivered);
+  } catch (error) {
+    work.unavailable = `The lane's checkout could not be compared with the delivered commit: ${redactString(error.message).slice(0, 300)}`;
+  }
+  return work;
+}
+
+const workRemains = work => work.uncommittedFiles !== 0 || work.headDelivered !== true;
+
+function remainingWorkSummary(work) {
+  if (work.unavailable) return `This lane stays ${work.status} because its work could not be checked.`;
+  const reasons = [
+    work.headDelivered ? '' : `its HEAD ${work.head.slice(0, 12)} is not in that commit`,
+    work.uncommittedFiles ? `it has ${work.uncommittedFiles} uncommitted files` : '',
+  ].filter(Boolean);
+  return `This lane stays ${work.status}: ${reasons.join(' and ')}.`;
+}
+
+// Only a lane whose clean HEAD the delivered commit contains is done; the rest keep their lifecycle and next action.
+// This observes the lanes near completion; it does not stop an agent from committing afterwards.
+async function markLanesDone(ctx, lanes, summary, details, repository, delivered) {
+  const observed = [];
+  for (const slug of lanes) observed.push(await laneWork(ctx, slug, repository, delivered));
+  const remaining = observed.filter(workRemains);
   const stamp = now();
   transaction(ctx.db, () => {
     // The agent's last handoff stays in the timeline; the lane summary says where its work went.
     const done = ctx.db.prepare("UPDATE features SET status = 'done', summary = ?, next_action = '', updated_at = ? WHERE slug = ? AND status <> 'archived'");
-    for (const slug of lanes) done.run(summary, stamp, slug);
+    for (const work of observed) if (!remaining.includes(work)) done.run(summary, stamp, work.lane);
   });
-  for (const slug of lanes) {
-    await addEvent(ctx, { featureId: featureId(ctx.db, slug), kind: 'lab.integrated', summary, details });
-    await writeFeatureContext(ctx, laneRow(ctx, slug));
+  for (const work of observed) {
+    const open = remaining.includes(work);
+    await addEvent(ctx, {
+      featureId: featureId(ctx.db, work.lane), kind: 'lab.integrated',
+      summary: open ? `${summary} ${remainingWorkSummary(work)}` : summary,
+      details: open ? { ...details, remainingWork: work } : details,
+    });
+    await writeFeatureContext(ctx, laneRow(ctx, work.lane));
   }
   await writeIndex(ctx);
+  return remaining;
+}
+
+function remainingWorkNote(remaining) {
+  if (!remaining.length) return '';
+  return `Not all lane work is in the delivered commit, so the lanes in remainingWork (${remaining.map(work => work.lane).join(', ')}) keep their status, summary and next action. Continue each, making a done lane active again first, then test and integrate its new commit.`;
 }
 
 // Every suite's latest verdict at the commit, so integrate cites what was actually run there.
@@ -879,7 +921,8 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   const delivered = Boolean(passing) && !blocking.length;
   // The integration clone holds its commit only as a detached HEAD, which the next rebuild moves.
   await git(source, 'update-ref', `refs/overdrive/delivered/${commit}`, commit);
-  if (delivered) await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, runs });
+  const remaining = delivered ? await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, runs }, source, commit) : [];
+  const lanesDone = delivered && !remaining.length;
   const ref = `${commit}:refs/heads/${branch ?? '<branch>'}`;
   const push = `git -C "${source}" push "${ctx.config.repository}" ${ref}`;
   const fetch = `git fetch "${source}" ${ref}`;
@@ -890,12 +933,13 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
     blocking.length ? `resolution of open blocking findings ${blocking.map(finding => finding.id).join(', ')}` : '',
   ].filter(Boolean).join(' and ');
   // Unfinished work stays exportable for review, but the prose must not present it as delivered.
+  const closed = lanesDone ? 'The included lanes are marked done.' : `This commit is delivered. ${remainingWorkNote(remaining)}`;
   const action = delivered
-    ? "The included lanes are marked done. With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone."
+    ? `${closed} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.`
     : `This commit is not delivered, so its lanes stay open. It still needs ${missing}; then call integrate with ${exact} to deliver it. A repair that changes code makes a new commit, so test and integrate that revision instead. Until then, with the user's authority, the push command (with their fork's URL instead when they cannot push to the repository) or the fetch command still exports this commit for interim review; present it as unfinished work, not a delivery.`;
   return {
-    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
-    openBlockingFindings: blocking.map(finding => finding.id), committedChanges: changes, push, fetch,
+    published: false, target, commit, branch, path: source, lanes, delivered, lanesDone, ...(remaining.length ? { remainingWork: remaining } : {}),
+    runs, ...(suitesNotRun.length ? { suitesNotRun } : {}), openBlockingFindings: blocking.map(finding => finding.id), committedChanges: changes, push, fetch,
     next: `OVERDRIVE never publishes to an adopted repository. ${action}${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${gaps ? ` ${gaps}` : ''}`,
   };
 }
@@ -936,13 +980,15 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
     meta(ctx.db, 'default_revision', refreshed.defaultRevision);
     meta(ctx.db, 'default_branch', refreshed.defaultBranch);
   });
-  await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, runs });
-  const gaps = evidenceGapsNote(runs, suitesNotRun);
+  const head = alreadyIncluded ? before.head : commit;
+  const remaining = await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, runs }, project, head);
+  const next = [remainingWorkNote(remaining), evidenceGapsNote(runs, suitesNotRun)].filter(Boolean).join(' ');
   return {
-    integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
-    project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit },
+    integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, lanesDone: !remaining.length, ...(remaining.length ? { remainingWork: remaining } : {}),
+    runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
+    project: { path: project, branch: managed.defaultBranch, head },
     committedChanges: changes,
-    ...(gaps ? { next: gaps } : {}),
+    ...(next ? { next } : {}),
   };
 }
 
