@@ -61,7 +61,7 @@ const labRun = {
   suite: suite('Suite to run.'),
   target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
   revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from.'),
-  mutant: string('Optional lab-relative path of a patch in the lab snapshot, applied to the target checkout before the suite runs. The run is a recorded mutant control: a failure kills the mutant. It never counts as evidence about the target, resolves no finding and is left out of integrate.'),
+  mutant: string('Optional lab-relative path of a patch in the lab snapshot, applied to the target checkout before the suite runs. The run is a recorded mutant control with its raw passed or failed status; a failure shows detection only beside a passing unmutated run and a failure caused by the patch. It never counts as evidence about the target, resolves no finding and is left out of integrate.'),
 };
 export const TOOLS = [
   tool('workspace_init', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({

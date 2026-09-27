@@ -299,12 +299,12 @@ async function attachedFailure(ctx, finding, cache) {
   return result(null, 'ancestry_unverified');
 }
 
-async function suiteTree(lab, revision, suite, cache) {
+async function labSnapshotTree(lab, revision, cache) {
   if (!revision) return null;
-  const key = JSON.stringify([lab, revision, suite]);
+  const key = JSON.stringify([lab, revision]);
   if (!cache.trees.has(key)) cache.trees.set(key, (async () => {
     try {
-      const result = await run(['git', 'rev-parse', '--verify', `${revision}:suites/${suite}`], { cwd: lab, allowFailure: true });
+      const result = await run(['git', 'rev-parse', '--verify', `${revision}^{tree}`], { cwd: lab, allowFailure: true });
       return result.exitCode === 0 ? result.stdout.trim() : null;
     } catch { return null; }
   })());
@@ -321,27 +321,27 @@ function passingReason(finding, passingRun, failure) {
   return omitsFailedLanes(failure, runLanes(passingRun)) ? 'failed_lanes_omitted' : null;
 }
 
-// suiteChanged compares only the repro suite's own directory, because harness and fixture edits are routine.
+// labSnapshotChanged compares the whole lab tree, because a suite can load harness and fixture files outside its directory.
 async function resolutionEvidence(ctx, finding, passingRun, lab, cache) {
   const failure = await attachedFailure(ctx, finding, cache);
   const failedLabRevision = failure.run?.status === 'failed' ? failure.run.lab_revision ?? null : null;
   const passing = passingReason(finding, passingRun, failure);
   const passingLabRevision = passing ? null : passingRun.lab_revision ?? null;
-  let suiteChanged = null;
-  let suiteChangedReason = null;
-  if (failure.noFailingRun !== false) suiteChangedReason = 'no_verified_failure';
-  else if (passing) suiteChangedReason = passing;
-  else if (!failedLabRevision || !passingLabRevision) suiteChangedReason = 'revision_unavailable';
+  let labSnapshotChanged = null;
+  let labSnapshotReason = null;
+  if (failure.noFailingRun !== false) labSnapshotReason = 'no_verified_failure';
+  else if (passing) labSnapshotReason = passing;
+  else if (!failedLabRevision || !passingLabRevision) labSnapshotReason = 'revision_unavailable';
   else {
     const [failedTree, passingTree] = await Promise.all([
-      suiteTree(lab, failedLabRevision, finding.repro_suite, cache), suiteTree(lab, passingLabRevision, finding.repro_suite, cache),
+      labSnapshotTree(lab, failedLabRevision, cache), labSnapshotTree(lab, passingLabRevision, cache),
     ]);
-    if (failedTree && passingTree) suiteChanged = failedTree !== passingTree;
-    else suiteChangedReason = 'snapshot_unavailable';
+    if (failedTree && passingTree) labSnapshotChanged = failedTree !== passingTree;
+    else labSnapshotReason = 'snapshot_unavailable';
   }
   return {
     finding: finding.id, noFailingRun: failure.noFailingRun, failureReason: failure.failureReason, passingReason: passing,
-    suiteChanged, suiteChangedReason, failedLabRevision, passingLabRevision,
+    labSnapshotChanged, labSnapshotReason, failedLabRevision, passingLabRevision,
   };
 }
 
@@ -418,12 +418,13 @@ function inconsistentVerdicts(db, { suite = null, target = null, revision = null
     GROUP BY suite, revision, lab_revision HAVING passed > 0 AND failed > 0 ORDER BY MAX(created_at) DESC LIMIT 20`).all(suite, suite, target, target, revision, revision);
 }
 
-// Recorded mutant controls, latest first: a failing run killed its mutant and a passing one let it survive.
+// Recorded mutant controls, latest first, with their raw status: a failure alone does not show the suite detected
+// the mutant, which also takes a passing unmutated run and a failure caused by the injected defect.
 function mutantRuns(db, { suite = null, target = null, revision = null }) {
   return db.prepare(`SELECT id, suite, mutant, target, revision, status FROM lab_runs WHERE mutant IS NOT NULL AND status IN ('passed', 'failed')
     AND (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) AND (? IS NULL OR revision = ?) ORDER BY created_at DESC, id DESC LIMIT 50`)
     .all(suite, suite, target, target, revision, revision)
-    .map(({ id, status, ...mutant }) => ({ run: id, ...mutant, result: status === 'failed' ? 'killed' : 'survived' }));
+    .map(({ id, ...mutant }) => ({ run: id, ...mutant }));
 }
 
 function runSummary(root, row) {
@@ -1054,7 +1055,7 @@ async function evidenceFlags(ctx, commit, lanes) {
   for (const finding of resolved) evidence.push(await recordedResolutionEvidence(ctx, finding, lab, cache));
   return {
     inconsistent: [...new Set(inconsistentVerdicts(ctx.db, { revision: commit }).map(row => row.suite))],
-    suiteChanged: evidence.filter(item => item.suiteChanged).map(item => item.finding),
+    labChangedOrUnknown: evidence.filter(item => item.noFailingRun === false && item.labSnapshotChanged !== false).map(item => item.finding),
     noFailingRun: evidence.filter(item => item.noFailingRun === true).map(item => item.finding),
   };
 }
@@ -1067,7 +1068,7 @@ function evidenceGapsNote(runs, suitesNotRun, flags) {
     suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it.` : '',
     regressed.length ? `${regressed.join(', ')} regressed tests that passed on base (runs[].vsBase.regressions); report them whatever the exit code.` : '',
     flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed at this commit with one lab snapshot, so neither verdict stands alone.` : '',
-    flags.suiteChanged.length ? `Findings ${flags.suiteChanged.join(', ')} were resolved after their repro suite changed since it failed: before reporting them fixed, read the suite's diff between failedLabRevision and passingLabRevision (lab_get {"findings": "all"}), and reopen any whose check was weakened.` : '',
+    flags.labChangedOrUnknown.length ? `Findings ${flags.labChangedOrUnknown.join(', ')} were resolved after the lab changed since their failure, or with no comparison (labSnapshotReason): before reporting them fixed, read the lab diff between failedLabRevision and passingLabRevision (lab_get {"findings": "all"}), suite, harness and fixtures alike, and reopen any whose check was weakened.` : '',
     flags.noFailingRun.length ? `Findings ${flags.noFailingRun.join(', ')} were resolved with no recorded failing run, so no run showed the defect before its fix.` : '',
   ].filter(Boolean).join(' ');
 }
