@@ -39,6 +39,8 @@ function workerConfigOverrides(profile) {
 // Codex's node_repl does.
 const BROWSER_ENV = /^(?:BROWSER_USE_|SKY_CUA_|CODEX_BROWSER_USE_)/;
 const serverVariables = server => [...Object.keys(server.transport?.env ?? {}), ...(Array.isArray(server.transport?.env_vars) ? server.transport.env_vars : [])];
+// Every file a patch item writes, a rename's destination included.
+const patchTargets = item => (Array.isArray(item.changes) ? item.changes.flatMap(change => [change?.path, change?.kind?.move_path ?? undefined]).filter(value => value !== undefined) : []);
 
 // Credential-free stand-ins for the MCP servers a profile denies. They are applied per thread,
 // because a process-wide override does not reach servers that plugins provide.
@@ -97,6 +99,8 @@ export class CodexAppServer extends EventEmitter {
     this.pending = new Map();
     this.serverRequests = new Map();
     this.denials = new Map();
+    this.writeRoots = new Map();
+    this.patchPaths = new Map();
   }
 
   async ensureStarted() {
@@ -145,6 +149,7 @@ export class CodexAppServer extends EventEmitter {
     this.pending.clear();
     this.serverRequests.clear();
     this.denials.clear();
+    this.patchPaths.clear();
     this.emit('exit', error);
   }
 
@@ -180,15 +185,19 @@ export class CodexAppServer extends EventEmitter {
         const key = String(message.params?.requestId);
         if (this.serverRequests.get(key)?.params.threadId === message.params?.threadId) this.serverRequests.delete(key);
       }
+      if (message.method === 'item/started' && message.params?.item?.type === 'fileChange') this.patchPaths.set(message.params.item.id, patchTargets(message.params.item));
+      if (message.method === 'item/completed') this.patchPaths.delete(message.params?.item?.id);
       if (message.method === 'turn/completed') this.#attachDenials(message.params);
       if (message.method) this.emit('notification', { method: message.method, params: message.params ?? {} });
     }
   }
 
+  // Under approval policy untrusted every patch asks first, and its item/started names the files it writes.
   #answerByPolicy({ id, method, params = {} }) {
     const approval = POLICY_APPROVALS[method];
     if (!approval) return false;
-    const { allow } = workerToolDecision(this.profile, approval.tool, params);
+    const input = method === 'item/fileChange/requestApproval' ? { file_paths: this.patchPaths.get(params.itemId) } : params;
+    const { allow } = workerToolDecision(this.profile, approval.tool, input, { writeRoots: this.writeRoots.get(params.threadId) ?? null });
     if (!allow) this.denials.set(params.turnId, [...(this.denials.get(params.turnId) ?? []), approval.tool]);
     if (this.child?.stdin?.writable) this.child.stdin.write(`${JSON.stringify({ id, result: approval.answer(allow, params) })}\n`);
     return true;
@@ -254,7 +263,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   // Thread config needs the denied-server inventory, which is taken when the app-server starts.
-  async startThread({ cwd, runtimeWorkspaceRoots, developerInstructions, workerServer, model = 'gpt-6-sol', effort = 'high' }) {
+  async startThread({ cwd, runtimeWorkspaceRoots, writeRoots, developerInstructions, workerServer, model = 'gpt-6-sol', effort = 'high' }) {
     await this.#ready();
     const response = await this.request('thread/start', {
       cwd,
@@ -267,11 +276,13 @@ export class CodexAppServer extends EventEmitter {
       personality: 'pragmatic',
       ephemeral: false,
     });
+    this.writeRoots.set(response.thread.id, writeRoots);
     return { ...response, requestedEffort: effort };
   }
 
-  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, developerInstructions, workerServer, model = 'gpt-6-sol' }) {
+  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, writeRoots, developerInstructions, workerServer, model = 'gpt-6-sol' }) {
     await this.#ready();
+    this.writeRoots.set(threadId, writeRoots);
     return await this.request('thread/resume', {
       threadId,
       cwd,

@@ -31,6 +31,7 @@ import {
   initializeMirror,
   initializeRepository,
   inspectMirror,
+  integrationPath,
   labPath,
   mirrorPath,
   profileRepository,
@@ -55,7 +56,7 @@ import {
   transaction,
   workItems,
 } from './state.mjs';
-import { agentUsage, endTurnUsage, recordTurnUsage, startTurnUsage } from './usage.mjs';
+import { agentUsage, endTurnUsage, recordTurnUsage, startTurnUsage, workerSpend } from './usage.mjs';
 
 const FEATURE_STATUSES = new Set(['planned', 'active', 'paused', 'blocked', 'review', 'done', 'archived']);
 const WORK_STATUSES = new Set(['planned', 'ready', 'running', 'blocked', 'review', 'done', 'failed', 'cancelled']);
@@ -188,13 +189,6 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 }
 
 const agentInstructions = (root, row) => (workerProfile(row) === 'qa' ? qaAgentInstructions : featureAgentInstructions)(root, row);
-
-// A QA agent works in the lab, so no harness would read a file here; its instructions reach it directly.
-async function writeFeatureAgentFile(ctx, feature) {
-  if (workerProfile(feature) === 'qa') return;
-  const file = contained(ctx.root, 'features', feature.slug, 'AGENTS.md');
-  await atomicWrite(ctx.root, file, agentInstructions(ctx.root, feature));
-}
 
 async function writeEventLog(ctx, event) {
   const file = contained(ctx.root, STATE_DIR, 'events.ndjson');
@@ -760,7 +754,6 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const row = featureBySlug(ctx.db, slug);
       const specBody = initialSpec || `# ${cleanTitle}\n\n## Outcome\n\n${cleanOutcome}\n\n## User-visible behavior\n\n## Constraints and compatibility\n\n## Acceptance criteria\n\n## Out of scope\n\n## Open decisions\n`;
       await atomicWrite(root, contained(root, STATE_DIR, 'features', slug, 'spec.md'), `${specBody.trim()}\n`);
-      await writeFeatureAgentFile(ctx, row);
       const { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } = clone.commitIdentity;
       await addEvent(ctx, { featureId: id, kind: 'feature.created', summary: `Created ${slug} from ${base.slice(0, 12)}.`, details: { branch: clone.branch, checkout: clone.destination, baseFeature: baseSlug, baseRevision: base, commitIdentity: { author, committer, origin: identityOrigin, scope: identityScope, source: identitySource, overridden } } });
       await writeFeatureContext(ctx, featureBySlug(ctx.db, slug));
@@ -816,6 +809,7 @@ export async function createQaAgent({ workspace_path, name = 'qa', brief }) {
 }
 
 function summarizeFeature(ctx, feature) {
+  const spend = workerSpend(ctx.db, feature.id);
   return {
     slug: feature.slug,
     kind: feature.kind,
@@ -838,6 +832,7 @@ function summarizeFeature(ctx, feature) {
       harness: feature.thread_id ? feature.thread_harness ?? 'unknown' : null,
       activeTurnId: feature.active_turn_id ?? null,
     },
+    ...(spend ? { spend } : {}),
   };
 }
 
@@ -881,8 +876,10 @@ export async function listFeatures({ workspace_path, include_archived = false, r
       }
       features.push(result);
     }
-    if (messages.mode === 'recent') return { workspace: overview(ctx), features, ...coordinatorMessageHistory(ctx.db, messages.before) };
-    return { workspace: overview(ctx), features, coordinatorMessages: takeCoordinatorRows(ctx.db, 'list') };
+    const spend = workerSpend(ctx.db);
+    const workspace = { ...overview(ctx), ...(spend ? { spend } : {}) };
+    if (messages.mode === 'recent') return { workspace, features, ...coordinatorMessageHistory(ctx.db, messages.before) };
+    return { workspace, features, coordinatorMessages: takeCoordinatorRows(ctx.db, 'list') };
   });
 }
 
@@ -1213,7 +1210,6 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new OverdriveError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
     const packet = await writeFeatureContext(ctx, row);
-    await writeFeatureAgentFile(ctx, row);
     const contextPath = contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md');
     const profile = workerProfile(row);
     return {
@@ -1222,9 +1218,10 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
       profile,
       cwd: row.checkout_path,
       roots: [row.checkout_path, ...(profile === 'qa' ? await qaRoots(ctx) : []), path.dirname(contextPath)],
+      // Where the agent's file tools may write: its own checkout, and for QA the integration clone too.
+      writeRoots: [row.checkout_path, ...(profile === 'qa' ? [integrationPath(ctx.root)] : [])],
       contextPath,
       specPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'),
-      agentFile: contained(ctx.root, 'features', row.slug, 'AGENTS.md'),
       work: packet.work,
       developerInstructions: agentInstructions(ctx.root, row),
       ...sessionHarness(ctx.config, row, force_new_session),

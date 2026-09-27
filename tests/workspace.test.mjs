@@ -54,7 +54,6 @@ test('initializes a repository and creates independent feature lanes', async t =
   assert.equal(alpha.feature.status, 'active');
   assert.match(alpha.feature.branch, /^feature\/search-redesign$/);
   assert.equal((await fs.readFile(path.join(workspace, 'features', 'search-redesign', 'repo', 'app.js'), 'utf8')).replaceAll('\r\n', '\n'), 'export const value = 1;\n');
-  assert.ok(await fs.stat(path.join(workspace, 'features', 'search-redesign', 'AGENTS.md')));
 
   const repeat = await initializeWorkspace({ workspace_path: workspace, repository: source });
   assert.equal(repeat.alreadyInitialized, true);
