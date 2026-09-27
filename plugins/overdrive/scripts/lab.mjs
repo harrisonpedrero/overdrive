@@ -199,37 +199,57 @@ function skipContinuation(open, text) {
   return [open, text.slice(at)];
 }
 
-// Keeps a run's newest output, both streams joined in arrival order, within OUTPUT_LIMIT characters. Earlier output is
-// dropped at a line end, or at whitespace inside a longer line, together with any kept output that may continue a word
-// or credential it cut, so redacting the kept output never needs what was dropped. While the run executes, its log is
-// rewritten with the complete lines kept, redacted, at most once per interval.
+// The index after the first line end within LINE_CUT_SLACK characters from `from`, else after the first whitespace, else the end.
+function cutIndex(text, from) {
+  const line = text.indexOf('\n', from);
+  if (line >= 0 && line <= from + LINE_CUT_SLACK) return line + 1;
+  const space = /\s/g;
+  space.lastIndex = from;
+  return space.exec(text) ? space.lastIndex : text.length;
+}
+
+// Keeps a run's newest output, both streams joined in arrival order: complete lines and the unfinished line, each
+// bounded, within OUTPUT_LIMIT characters in the final log. Earlier lines are dropped at a line end, or at whitespace
+// inside a longer line, and the start of an overlong unfinished line at whitespace, each with any kept output that may
+// continue a word or credential it cut, so redacting the kept output never needs what was dropped. While the run
+// executes, its log is rewritten with the complete lines kept, redacted, at most once per interval.
 function labOutput(root, file) {
-  let text = '';
-  // The tail of dropped output while arriving output may still continue it; text is empty until it closes.
+  let lines = '';
+  let pending = '';
+  // The tail of dropped output while arriving output may still continue it.
   let open = '';
   let dropped = false;
+  let cutLine = false;
   let timer = null;
   let writing = null;
   let changed = false;
   let closed = false;
   let failure = null;
-  const dropEarlier = () => {
-    const from = text.length - OUTPUT_LIMIT - 1;
-    const line = text.indexOf('\n', from);
-    const space = /\s/g;
-    space.lastIndex = from;
-    const at = line >= 0 && line <= from + LINE_CUT_SLACK ? line + 1 : space.exec(text) ? space.lastIndex : text.length;
-    const discarded = text.slice(0, at);
-    // A cut inside a word leaves its rest open whatever it is.
-    [open, text] = skipContinuation(/\s/.test(discarded.at(-1)) ? openCredential(discarded) : credentialTail(discarded), text.slice(at));
+  // Lines always end with a line end, so the cut never falls inside a word.
+  const dropLines = keep => {
+    const at = cutIndex(lines, lines.length - keep - 1);
+    let rest;
+    [rest, lines] = skipContinuation(openCredential(lines.slice(0, at)), lines.slice(at));
+    if (!lines) {
+      [rest, pending] = skipContinuation(rest, pending);
+      if (!pending) open ||= rest;
+    }
     dropped = true;
+  };
+  const cutPending = keep => {
+    const at = cutIndex(pending, pending.length - keep - 1);
+    const discarded = `${credentialTail(lines)}${pending.slice(0, at)}`;
+    // A cut inside a word leaves its rest open whatever it is.
+    [open, pending] = skipContinuation(/\s/.test(discarded.at(-1)) ? openCredential(discarded) : credentialTail(discarded), pending.slice(at));
+    if (!cutLine) lines += `[the start of a line over ${OUTPUT_LIMIT} characters was dropped]\n`;
+    cutLine = true;
   };
   const flush = () => {
     timer = null;
     if (closed || failure || writing) return;
-    if (text.length > OUTPUT_LIMIT) dropEarlier();
+    if (lines.length > OUTPUT_LIMIT) dropLines(OUTPUT_LIMIT);
     changed = false;
-    writing = atomicWrite(root, file, redactString(`${dropped ? `${DROPPED_MARKER}\n` : ''}${text.slice(0, text.lastIndexOf('\n') + 1)}`))
+    writing = atomicWrite(root, file, redactString(`${dropped ? `${DROPPED_MARKER}\n` : ''}${lines}`))
       .catch(error => { failure = error; })
       .finally(() => { writing = null; if (changed) schedule(); });
   };
@@ -242,9 +262,17 @@ function labOutput(root, file) {
       if (closed) return;
       let kept;
       [open, kept] = skipContinuation(open, chunk);
-      text += kept;
-      if (text.length > 2 * OUTPUT_LIMIT) dropEarlier();
-      if (kept.includes('\n')) schedule();
+      const end = kept.lastIndexOf('\n') + 1;
+      pending += kept;
+      if (end) {
+        const complete = pending.length - kept.length + end;
+        lines += pending.slice(0, complete);
+        pending = pending.slice(complete);
+        cutLine = false;
+        schedule();
+      }
+      if (lines.length > 2 * OUTPUT_LIMIT) dropLines(OUTPUT_LIMIT);
+      if (pending.length > 2 * OUTPUT_LIMIT) cutPending(OUTPUT_LIMIT);
     },
     // Stops writing and waits for a write in progress, so the final log is never overwritten afterward.
     async close() {
@@ -255,8 +283,9 @@ function labOutput(root, file) {
     },
     // The parts of the final log after close, the unfinished last line included, not yet redacted.
     final() {
-      if (text.length > OUTPUT_LIMIT) dropEarlier();
-      return [dropped ? DROPPED_MARKER : '', text.trim()];
+      if (pending.length > OUTPUT_LIMIT) cutPending(OUTPUT_LIMIT);
+      if (lines.length + pending.length > OUTPUT_LIMIT) dropLines(OUTPUT_LIMIT - pending.length);
+      return [dropped ? DROPPED_MARKER : '', `${lines}${pending}`.trim()];
     },
   };
 }
