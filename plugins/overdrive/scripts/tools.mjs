@@ -96,10 +96,12 @@ export const TOOLS = [
     brief: string('What to test: the user journeys, interfaces, environments and priorities this agent covers.'),
   }, ['workspace_path', 'brief']), { destructiveHint: false }),
 
-  tool('feature_list', 'List feature lanes', 'Return a compact progress view of every lane and QA agent without loading their specifications, plus the messages agents sent the coordinator since they were last returned.', object({
+  tool('feature_list', 'List feature lanes', 'Return a compact progress view of every lane and QA agent without loading their specifications, plus the messages agents sent the coordinator since they were last returned (coordinatorMessages, each returned once). With coordinator_messages set to recent it returns messageHistory instead: the 10 newest messages to the coordinator from any sender, pending and delivered alike, with their status and when and how the runtime handed them over (delivered records that handoff, not that anyone read it), and delivers none of them. When older messages remain, nextBeforeMessage holds the before_message value for the next page; otherwise it is null.', object({
     ...workspace,
     include_archived: boolean('Include archived lanes.'),
     refresh_git: boolean('Refresh Git status for each clone; slower on many features.'),
+    coordinator_messages: string('pending (the default) returns and delivers new messages; recent pages earlier messages without delivering any, to recover ones a lost response or compaction dropped.', { enum: ['pending', 'recent'] }),
+    before_message: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: 'Message id from nextBeforeMessage: list the 10 messages before it. Only with coordinator_messages recent.' },
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
   tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, safe timeline, Git facts, recorded evidence history, and pending agent requests.', object({

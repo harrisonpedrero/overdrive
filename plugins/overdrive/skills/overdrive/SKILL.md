@@ -98,7 +98,7 @@ The runtime and the agent contracts hold these. Explain them when they shape a p
 ## Recover
 
 - After a restart or compaction, call `feature_list`, then `feature_get` for the lanes you are about to act on; `lab_get` shows runs, findings and the current integration. Do not reconstruct earlier deliberation.
-- `feature_list` returns the messages agents sent you since the last read, and only once; act on them.
+- `feature_list` returns the messages agents sent you since the last read, and only once; act on them. When a lost response or compaction dropped some, page earlier ones with `coordinator_messages: "recent"` and `before_message`; this delivers nothing.
 - In a new host session, resume lanes that have work left with `agent_start`; it continues each saved session.
 - Runtime refusals such as `STOP_UNCONFIRMED`, `WORKERS_UNCONFIRMED` and `DISPATCH_UNCERTAIN` name their next step. Pass `prior_turn_attestation` only with process facts you actually checked.
 - When another live coordinator session owns a lane, act on it from that session.

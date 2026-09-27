@@ -841,7 +841,30 @@ function summarizeFeature(ctx, feature) {
   };
 }
 
-export async function listFeatures({ workspace_path, include_archived = false, refresh_git = false }) {
+const MESSAGE_PAGE_SIZE = 10;
+
+// Checked before the workspace is read, so a refused call delivers nothing.
+function coordinatorMessageMode(mode = 'pending', before) {
+  if (mode !== 'pending' && mode !== 'recent') throw new OverdriveError('coordinator_messages must be pending or recent.', 'INVALID_INPUT');
+  if (before === undefined) return { mode, before: null };
+  if (mode !== 'recent') throw new OverdriveError('before_message pages message history; pass it with coordinator_messages: recent.', 'INVALID_INPUT');
+  if (!Number.isSafeInteger(before) || before < 1) throw new OverdriveError('before_message must be a positive integer message id.', 'INVALID_INPUT');
+  return { mode, before };
+}
+
+// The coordinator's messages newest first, pending and delivered alike; reading them delivers none.
+function coordinatorMessageHistory(db, before) {
+  const rows = db.prepare("SELECT id, from_agent, body, status, created_at, delivered_at, delivered_how FROM messages WHERE to_agent = 'coordinator' AND id < ? ORDER BY id DESC LIMIT ?")
+    .all(before ?? Number.MAX_SAFE_INTEGER, MESSAGE_PAGE_SIZE + 1);
+  const messageHistory = rows.slice(0, MESSAGE_PAGE_SIZE).map(row => ({
+    id: row.id, from: row.from_agent, body: redactString(row.body), createdAt: row.created_at,
+    status: row.status, deliveredAt: row.delivered_at, deliveredHow: row.delivered_how,
+  }));
+  return { messageHistory, nextBeforeMessage: rows.length > MESSAGE_PAGE_SIZE ? messageHistory.at(-1).id : null };
+}
+
+export async function listFeatures({ workspace_path, include_archived = false, refresh_git = false, coordinator_messages, before_message }) {
+  const messages = coordinatorMessageMode(coordinator_messages, before_message);
   return await withContext(workspace_path, async ctx => {
     const features = [];
     const openFindings = ctx.db.prepare(OPEN_FINDING_COUNT);
@@ -858,6 +881,7 @@ export async function listFeatures({ workspace_path, include_archived = false, r
       }
       features.push(result);
     }
+    if (messages.mode === 'recent') return { workspace: overview(ctx), features, ...coordinatorMessageHistory(ctx.db, messages.before) };
     return { workspace: overview(ctx), features, coordinatorMessages: takeCoordinatorRows(ctx.db, 'list') };
   });
 }
