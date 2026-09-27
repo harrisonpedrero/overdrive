@@ -226,7 +226,7 @@ async function integrationStatus(ctx) {
   const head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
   const included = (await integratedLanes(ctx, clone, head)).map(lane => lane.slug);
   const pending = built.features.map(lane => lane.slug).filter(slug => !included.includes(slug));
-  const conflictFiles = (await git(clone, 'diff', '--name-only', '--diff-filter=U')).stdout.split('\n').filter(Boolean);
+  const conflictFiles = (await git(clone, 'diff', '--name-only', '--diff-filter=U')).stdout.split('\n').filter(Boolean).map(redactString);
   const conflict = await lastConflict(clone, built, head, pending);
   return {
     base: built.base, head, built_at: built.built_at, path: clone, included, pending,
