@@ -152,9 +152,8 @@ function pathspecChunks(paths) {
   return chunks;
 }
 
-// The paths at or under `paths` where commit's tree differs from its unique merge base with base, so a lane that
-// is only behind base shows nothing there. Fetches commit from source when the clone lacks it; every step stops at
-// deadline (epoch ms). Literal pathspecs and --no-renames keep every original path, including a renamed-away one.
+// Paths at or under `paths` where commit differs from its unique merge base with base, so a lane only behind base shows none.
+// Literal pathspecs and --no-renames keep every original path, and each step stops at deadline (epoch ms).
 export async function changesSinceMergeBase(clone, source, base, commit, paths, deadline) {
   const step = async (args, exitCodes = [0]) => {
     const timeoutMs = deadline - Date.now();
