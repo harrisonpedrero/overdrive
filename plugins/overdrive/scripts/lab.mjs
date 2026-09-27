@@ -24,6 +24,7 @@ import {
 import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, transaction } from './state.mjs';
 import {
   OverdriveError,
+  atomicWrite,
   contained,
   ensureManagedPath,
   exists,
@@ -160,9 +161,114 @@ async function artifactManifest(directory) {
   return files;
 }
 
+const OUTPUT_LIMIT = 500_000;
+const LIVE_OUTPUT_INTERVAL_MS = 1_000;
+
+// redactString matches Bearer and credential keys across newlines, so output that follows discarded text ending in
+// one, with its optional delimiter, may be that credential's value.
+const CREDENTIAL_KEY = /\b(?:bearer|token|password|passwd|secret|api[_-]?key|authorization)$/i;
+// The characters at the end of text that decide whether it opens a credential, with whitespace collapsed.
+function credentialTail(text) {
+  const end = text.trimEnd();
+  return `${end.slice(-64).replace(/\s+/g, ' ').slice(-24)}${end.length < text.length ? ' ' : ''}`;
+}
+// The tail of text when it ends inside an unfinished credential, or ''.
+function openCredential(text) {
+  const tail = credentialTail(text);
+  const end = tail.trimEnd();
+  return CREDENTIAL_KEY.test(/[:=]$/.test(end) ? end.slice(0, -1).trimEnd() : end) ? tail : '';
+}
+// Drops the lines of text that may continue a credential open in discarded output; returns what is still open and the rest.
+function skipCredentialContinuation(open, text) {
+  let at = 0;
+  while (open && at < text.length) {
+    const end = text.indexOf('\n', at) + 1 || text.length;
+    open = openCredential(`${open}\n${text.slice(at, end)}`);
+    at = end;
+  }
+  return [open, text.slice(at)];
+}
+
+// Rewrites a running run's log with its latest complete lines, redacted, at most once per interval. Lines stay
+// whole per stream, so a credential split across chunks is redacted. Earlier output is dropped at a line boundary
+// and a line longer than the limit is omitted entirely, each with any lines continuing a credential it opened.
+function liveOutput(root, file) {
+  // While a stream skips an omitted line, its pending text is only that line's credential tail.
+  const pending = { stdout: '', stderr: '' };
+  const skipping = { stdout: false, stderr: false };
+  let lines = '';
+  let open = '';
+  let dropped = false;
+  let timer = null;
+  let writing = null;
+  let changed = false;
+  let closed = false;
+  let failure = null;
+  const dropEarlier = keep => {
+    const at = lines.indexOf('\n', lines.length - keep - 1) + 1 || lines.length;
+    const [front, kept] = skipCredentialContinuation(openCredential(lines.slice(0, at)), lines.slice(at));
+    lines = kept;
+    if (!lines) open ||= front;
+    dropped = true;
+  };
+  const flush = () => {
+    timer = null;
+    if (closed || failure || writing) return;
+    if (lines.length > OUTPUT_LIMIT) dropEarlier(OUTPUT_LIMIT);
+    changed = false;
+    writing = atomicWrite(root, file, redactString(`${dropped ? '[earlier output dropped]\n' : ''}${lines}`))
+      .catch(error => { failure = error; })
+      .finally(() => { writing = null; if (changed) schedule(); });
+  };
+  const schedule = () => {
+    changed = true;
+    if (!closed && !failure && !writing) timer ??= setTimeout(flush, LIVE_OUTPUT_INTERVAL_MS);
+  };
+  const add = text => {
+    lines += text;
+    if (lines.length > 2 * OUTPUT_LIMIT) dropEarlier(OUTPUT_LIMIT);
+    schedule();
+  };
+  const hold = (stream, text) => {
+    pending[stream] += text;
+    if (skipping[stream]) pending[stream] = credentialTail(pending[stream]);
+    else if (pending[stream].length > OUTPUT_LIMIT) {
+      pending[stream] = credentialTail(pending[stream]);
+      skipping[stream] = true;
+      add(`[an output line over ${OUTPUT_LIMIT} characters was omitted]\n`);
+    }
+  };
+  return {
+    write(chunk, stream) {
+      if (closed) return;
+      const end = chunk.lastIndexOf('\n') + 1;
+      if (!end) return hold(stream, chunk);
+      let complete = pending[stream] + chunk.slice(0, end);
+      if (skipping[stream]) {
+        // The omitted line ends at the first newline and may open a credential that later lines continue.
+        const omitted = complete.indexOf('\n') + 1;
+        open = openCredential(`${open}\n${complete.slice(0, omitted)}`);
+        complete = complete.slice(omitted);
+        skipping[stream] = false;
+      }
+      pending[stream] = '';
+      [open, complete] = skipCredentialContinuation(open, complete);
+      if (complete) add(complete);
+      hold(stream, chunk.slice(end));
+    },
+    // Stops writing and waits for a write in progress, so the final log is never overwritten afterward.
+    async close() {
+      closed = true;
+      clearTimeout(timer);
+      await writing;
+      if (failure) throw failure;
+    },
+  };
+}
+
 async function execute(argv, options) {
   try {
-    const result = await run(argv, { ...options, maxOutput: 500_000, combinedTail: true, allowFailure: true, confirmTermination: true });
+    const result = await run(argv, { ...options, maxOutput: OUTPUT_LIMIT, combinedTail: true, allowFailure: true, confirmTermination: true });
     return {
       status: result.exitCode === 0 && !result.timedOut ? 'passed' : 'failed',
       exitCode: result.exitCode,
@@ -499,9 +605,13 @@ async function runOnSlot(ctx, { name, target, lane, spec, mutant }, subject, slo
   };
   ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
   const started = Date.now();
-  const result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000 });
+  const progress = liveOutput(ctx.root, runLog(ctx.root, id));
+  let result;
+  // A failed progress write fails the run like a failed final log, which leaves it running until marked uncertain.
+  try { result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000, onOutput: progress.write }); }
+  finally { await progress.close(); }
   const log = redactString(result.output.filter(Boolean).join('\n'));
-  await fs.writeFile(runLog(ctx.root, id), log, 'utf8');
+  await atomicWrite(ctx.root, runLog(ctx.root, id), log);
   Object.assign(row, {
     exit_code: result.exitCode, status: result.status, output: log.slice(-24_000),
     duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)),
@@ -643,7 +753,10 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
         row = knownRun(ctx.db, runKey);
       }
       const log = runLog(ctx.root, row.id);
-      return { run: presentRun(ctx.root, row, await exists(log) ? log : null) };
+      if (!await exists(log)) return { run: presentRun(ctx.root, row, null) };
+      // A running run records no output yet; its executing call keeps the log current.
+      const output = row.status === 'running' ? await fs.readFile(log, 'utf8').catch(() => '') : row.output;
+      return { run: presentRun(ctx.root, { ...row, output }, log) };
     }
     const before = beforeKey ? knownRun(ctx.db, beforeKey, 'id, created_at') : null;
     const lab = await ensureLab(ctx.root);
