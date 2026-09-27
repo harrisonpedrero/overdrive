@@ -21,6 +21,7 @@ import {
   syncLabCheckout,
   verifyCheckoutRevision,
 } from './git.mjs';
+import { AGENT_BUSY_SQL, agentBusy } from './ownership.mjs';
 import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, transaction } from './state.mjs';
 import {
   OverdriveError,
@@ -303,6 +304,11 @@ function presentRun(root, row, outputLog) {
   };
 }
 
+// The composition of the latest build that ended at this head; a commit made in the clone after a build has none.
+function recordedBuild(db, head) {
+  return parseJson(db.prepare("SELECT details_json FROM events WHERE kind = 'integration.built' AND json_extract(details_json, '$.head') = ? ORDER BY id DESC LIMIT 1").get(head)?.details_json, null);
+}
+
 // The lanes an integration commit contains, judged by Git ancestry rather than by the recorded build.
 async function integratedLanes(ctx, clone, commit) {
   const lanes = [];
@@ -500,19 +506,55 @@ async function testResults(root, row) {
   return valid ? { tests } : { incomplete: 'tests.json is not {"<test id>": "passed|failed|error|skipped"}' };
 }
 
-// A lane or integration run compared test by test with the latest base run of its suite at the same lab snapshot, such as
-// one in the same batch, and at baseRevision, where the lane or the build started. A test that passed on base and is
-// missing here counts as a regression.
-async function compareWithBase(ctx, row, baseRevision) {
-  if (row.target === 'base' || row.mutant || !baseRevision) return null;
-  const base = ctx.db.prepare("SELECT id, status, revision FROM lab_runs WHERE target = 'base' AND suite = ? AND lab_revision = ? AND mutant IS NULL AND status <> 'running' ORDER BY revision = ? DESC, created_at DESC, id DESC LIMIT 1")
-    .get(row.suite, row.lab_revision, baseRevision);
-  if (!base) return null;
+const LAB_DIFF_LIMIT = 20;
+// Lab files that do not change a suite's own tests: other suites, mutant patches and the lab's notes.
+const OUTSIDE_SUITE = /^(?:suites\/|mutants\/|README\.md$|ENVIRONMENT\.md$)/;
+
+// Each lab snapshot's tree of the suite directory, read in one call; empty when Git cannot read them all.
+async function suiteTrees(lab, suite, snapshots) {
+  const result = await run(['git', 'rev-parse', ...snapshots.map(snapshot => `${snapshot}:suites/${suite}`)], { cwd: lab, allowFailure: true }).catch(() => null);
+  const trees = result?.exitCode === 0 ? result.stdout.split(/\r?\n/) : [];
+  return new Map(trees.length === snapshots.length ? snapshots.map((snapshot, index) => [snapshot, trees[index]]) : []);
+}
+
+// The base run of the run's suite to compare with: preferably at baseRevision, then at the run's own lab snapshot, then the
+// latest, among runs whose snapshot holds the same suite directory. labDiffers lists other lab files the two snapshots differ in.
+async function pairedBaseRun(ctx, row, baseRevision, lab) {
+  const candidates = ctx.db.prepare(`SELECT id, status, revision, lab_revision FROM lab_runs WHERE target = 'base' AND suite = ? AND mutant IS NULL
+    AND status <> 'running' AND lab_revision IS NOT NULL ORDER BY revision = ? DESC, lab_revision = ? DESC, created_at DESC, id DESC LIMIT 20`)
+    .all(row.suite, baseRevision, row.lab_revision);
+  let trees = null;
+  for (const base of candidates) {
+    if (base.lab_revision === row.lab_revision) return { base, labDiffers: [] };
+    trees ??= await suiteTrees(lab, row.suite, [...new Set([row.lab_revision, ...candidates.map(candidate => candidate.lab_revision)])]);
+    if (!trees.has(row.lab_revision) || trees.get(base.lab_revision) !== trees.get(row.lab_revision)) continue;
+    const diff = await run(['git', 'diff', '--name-only', '--no-renames', '-z', base.lab_revision, row.lab_revision], { cwd: lab, rawOutput: true, allowFailure: true }).catch(() => null);
+    if (diff?.exitCode !== 0) return null;
+    return { base, labDiffers: diff.stdout.split('\0').filter(file => file && !OUTSIDE_SUITE.test(file)).slice(0, LAB_DIFF_LIMIT).map(redactString) };
+  }
+  return null;
+}
+
+// Where a run's subject started: its lane's base revision, or the base of the build it tested, which for a commit made in
+// the clone after its build is the current build's.
+function runBase(db, row) {
+  if (row.target !== 'integration') return db.prepare('SELECT base_revision FROM features WHERE slug = ?').get(row.target)?.base_revision ?? null;
+  return (recordedBuild(db, row.revision) ?? parseJson(meta(db, 'integration'), null))?.base ?? null;
+}
+
+// A lane or integration run compared test by test with a base run of its suite at baseRevision, where the lane or the build
+// started. A test that passed on base and is missing here counts as a regression.
+async function compareWithBase(ctx, row, baseRevision, lab) {
+  if (row.target === 'base' || row.mutant || !baseRevision || !row.lab_revision) return null;
+  const paired = await pairedBaseRun(ctx, row, baseRevision, lab);
+  if (!paired) return null;
+  const { base, labDiffers } = paired;
   const [here, there] = await Promise.all([testResults(ctx.root, row), testResults(ctx.root, base)]);
   if (here.missing && there.missing) return null;
-  if (base.revision !== baseRevision) return { baseRun: base.id, incomplete: `base ran at ${base.revision.slice(0, 12)}, not at ${baseRevision.slice(0, 12)} where this run's subject started` };
+  const pair = { baseRun: base.id, baseStatus: base.status, ...(labDiffers.length ? { labDiffers } : {}) };
+  if (base.revision !== baseRevision) return { ...pair, incomplete: `base ran at ${base.revision.slice(0, 12)}, not at ${baseRevision.slice(0, 12)} where this run's subject started` };
   if (!here.tests || !there.tests) {
-    return { baseRun: base.id, incomplete: [here.tests ? '' : `this run: ${here.incomplete}`, there.tests ? '' : `base: ${there.incomplete}`].filter(Boolean).join('; ') };
+    return { ...pair, incomplete: [here.tests ? '' : `this run: ${here.incomplete}`, there.tests ? '' : `base: ${there.incomplete}`].filter(Boolean).join('; ') };
   }
   const lists = {
     regressions: Object.keys(there.tests).filter(id => there.tests[id] === 'passed' && here.tests[id] !== 'passed'),
@@ -521,7 +563,7 @@ async function compareWithBase(ctx, row, baseRevision) {
   const omitted = Object.fromEntries(Object.entries(lists).filter(([, ids]) => ids.length > TEST_LIST_LIMIT).map(([name, ids]) => [name, ids.length - TEST_LIST_LIMIT]));
   // An empty regressions list is itself the fact a report cites; an empty fixed list says nothing.
   return {
-    baseRun: base.id, regressions: lists.regressions.slice(0, TEST_LIST_LIMIT).map(redactString),
+    ...pair, regressions: lists.regressions.slice(0, TEST_LIST_LIMIT).map(redactString),
     ...(lists.fixed.length ? { fixed: lists.fixed.slice(0, TEST_LIST_LIMIT).map(redactString) } : {}),
     ...(Object.keys(omitted).length ? { omitted } : {}),
   };
@@ -700,9 +742,8 @@ export async function runLabSuite({ workspace_path, batch, from, ...single }) {
     }));
     const ordered = requests.map(request => results.get(request));
     // Compared once every run has finished, so a base run in the same batch pairs with the others.
-    const buildBase = parseJson(meta(ctx.db, 'integration'), null)?.base ?? null;
-    for (const [index, { value }] of ordered.entries()) {
-      const vsBase = value && await compareWithBase(ctx, value.row, requests[index].lane?.base_revision ?? buildBase);
+    for (const { value } of ordered) {
+      const vsBase = value && await compareWithBase(ctx, value.row, runBase(ctx.db, value.row), call.lab);
       if (vsBase) value.details.vsBase = vsBase;
     }
     if (batch !== undefined) return batchResponse(ctx.root, requests, ordered);
@@ -754,10 +795,12 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
         row = knownRun(ctx.db, runKey);
       }
       const log = runLog(ctx.root, row.id);
-      if (!await exists(log)) return { run: presentRun(ctx.root, row, null) };
-      // A running run records no output yet; its executing call keeps the log current.
+      // A running run has no comparison yet; its executing call keeps the log current.
+      const vsBase = row.status === 'running' ? null : await compareWithBase(ctx, row, runBase(ctx.db, row), await ensureLab(ctx.root));
+      const comparison = vsBase ? { vsBase } : {};
+      if (!await exists(log)) return { run: presentRun(ctx.root, row, null), ...comparison };
       const output = row.status === 'running' ? await fs.readFile(log, 'utf8').catch(() => '') : row.output;
-      return { run: presentRun(ctx.root, { ...row, output }, log) };
+      return { run: presentRun(ctx.root, { ...row, output }, log), ...comparison };
     }
     const before = beforeKey ? knownRun(ctx.db, beforeKey, 'id, created_at') : null;
     const lab = await ensureLab(ctx.root);
@@ -800,10 +843,13 @@ function reproduction(finding, sender, foundRun, integration) {
   return `Suite ${suite} failed on integration ${foundRun.revision.slice(0, 12)} (${foundRun.id}), which combines your lane with others, so a lab_run on your lane alone may not reproduce it; to reproduce it locally, fetch ${foundRun.revision} from ${integration} without merging it into your branch. A passing run of ${suite} on an integration build that includes your fix and ${others.join(', ')} resolves this finding.`;
 }
 
-function findingMessage(finding, sender, foundRun, integration) {
+function findingMessage(finding, sender, foundRun, integration, head) {
   const reproduce = reproduction(finding, sender, foundRun, integration);
   const reopened = finding.reopens ? `, reopened ${finding.reopens === 1 ? 'once' : `${finding.reopens} times`}` : '';
-  return `Finding ${finding.id} (${finding.severity}${reopened}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
+  const newer = finding.found_revision && finding.found_revision !== head
+    ? ` It was found at ${finding.found_revision.slice(0, 12)}; your HEAD ${head.slice(0, 12)} is newer, so if a later commit already fixes it, run the repro and tell ${sender}.`
+    : '';
+  return `Finding ${finding.id} (${finding.severity}${reopened}): ${finding.title}\n\n${finding.body}\n\n${reproduce}${newer} Fix it at the root cause, commit, and tell ${sender} what changed.`;
 }
 
 // How often a finding was set open again after it was closed; each reopen records its event.
@@ -834,9 +880,20 @@ function reissueFindingMessage(db, finding, message, stamp) {
 
 // The latest failure of the suite that tested the lane, on its own target or in an integration known to include it.
 function latestLaneFailure(db, slug, suite) {
-  return db.prepare(`SELECT id FROM lab_runs WHERE suite = ? AND status = 'failed' AND mutant IS NULL AND (target = ?
+  return db.prepare(`SELECT id, target, revision, created_at FROM lab_runs WHERE suite = ? AND status = 'failed' AND mutant IS NULL AND (target = ?
     OR (target = 'integration' AND EXISTS (SELECT 1 FROM json_each(lab_runs.lanes_json) WHERE value = ?)))
-    ORDER BY created_at DESC, id DESC LIMIT 1`).get(suite, slug, slug)?.id ?? null;
+    ORDER BY created_at DESC, id DESC LIMIT 1`).get(suite, slug, slug) ?? null;
+}
+
+// The lane revision a failure tested, older than head once the lane has moved past it: a lane run's merge base with head (for
+// a working-tree snapshot, its parent), or the revision an integration run's recorded build merged; otherwise head.
+async function testedLaneRevision(db, lane, head, failure) {
+  if (!failure || failure.revision === head) return head;
+  try {
+    if (failure.target !== 'integration') return (await git(lane.checkout_path, 'merge-base', head, failure.revision)).stdout;
+    const built = recordedBuild(db, failure.revision)?.features?.find(entry => entry.slug === lane.slug)?.revision;
+    return built && await isGitAncestor(lane.checkout_path, built, head) ? built : head;
+  } catch { return head; }
 }
 
 export async function recordFinding({ workspace_path, id, feature, title, body, severity, repro_suite, status, note, from }) {
@@ -858,6 +915,10 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
     const lane = laneRow(ctx, slug);
     if (changes.repro_suite) await readSuite(ctx.root, await ensureLab(ctx.root), changes.repro_suite);
     const head = (await git(lane.checkout_path, 'rev-parse', 'HEAD')).stdout;
+    // Read ahead of the transaction, which cannot wait for Git; it is used only if the transaction attaches the same run.
+    const suite = changes.repro_suite ?? (findingId === undefined ? null : ctx.db.prepare('SELECT repro_suite FROM findings WHERE id = ?').get(findingId)?.repro_suite);
+    const failure = suite ? latestLaneFailure(ctx.db, slug, suite) : null;
+    const testedRevision = await testedLaneRevision(ctx.db, lane, head, failure);
     const stamp = now();
     const { finding, existing, messaged, reopened } = transaction(ctx.db, () => {
       const existing = findingId === undefined ? null : ctx.db.prepare('SELECT * FROM findings WHERE id = ?').get(findingId);
@@ -880,11 +941,16 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
       else if (finding.status !== existing?.status) Object.assign(finding, { resolved_revision: finding.status === 'resolved' ? head : null, resolved_run: null });
       // An open finding's failure is always a run of its current suite.
       if (finding.status === 'open' && finding.repro_suite !== existing?.repro_suite) finding.found_run = null;
-      if (finding.repro_suite && !finding.found_run) finding.found_run = latestLaneFailure(ctx.db, slug, finding.repro_suite);
+      if (finding.repro_suite && !finding.found_run) {
+        finding.found_run = latestLaneFailure(ctx.db, slug, finding.repro_suite)?.id ?? null;
+        // The failure, not the lane's newer HEAD, is where the finding was found, unless it predates the closing this reopens.
+        const stale = reopened && failure?.created_at <= existing.updated_at;
+        if (finding.found_run && finding.found_run === failure?.id && !stale) finding.found_revision = testedRevision;
+      }
       const columns = ['id', 'feature', 'title', 'body', 'severity', 'status', 'repro_suite', 'found_revision', 'found_run', 'resolved_revision', 'resolved_run', 'note', 'created_by', 'created_at', 'updated_at'];
       ctx.db.prepare(`INSERT OR REPLACE INTO findings(${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`).run(...columns.map(column => finding[column] ?? null));
       const foundRun = finding.found_run ? ctx.db.prepare('SELECT id, suite, target, revision, lanes_json, status FROM lab_runs WHERE id = ?').get(finding.found_run) : null;
-      const message = from => redactString(findingMessage(finding, from, foundRun, integrationPath(ctx.root)));
+      const message = from => redactString(findingMessage(finding, from, foundRun, integrationPath(ctx.root), head));
       let messaged = false;
       if (opened) {
         ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, message(sender), stamp);
@@ -1005,6 +1071,27 @@ function laterConflictNote(conflicts = []) {
   return lanes.length ? [`Later lanes ${lanes.join(', ')} would also conflict merged onto the build so far (conflict.laterConflicts, before any recorded resolution replays), so reconcile them in the same round rather than one build at a time.`] : [];
 }
 
+// Whether the clone still holds the recorded build of these lane revisions on this base, in any order; merging them again
+// would only reproduce its tree.
+async function holdsBuild(ctx, recorded, start, lanes) {
+  if (!recorded?.head || recorded.base !== start.revision || recorded.features.length !== lanes.length) return false;
+  if (!lanes.every(lane => recorded.features.some(built => built.slug === lane.slug && built.revision === lane.revision))) return false;
+  const clone = await ensureManagedPath(ctx.root, integrationPath(ctx.root));
+  if (!await exists(path.join(clone, '.git'))) return false;
+  const { head, clean } = await repositorySnapshot(clone);
+  return clean && head === recorded.head;
+}
+
+// Notes on lanes whose uncommitted files a build left out and on runs already recorded at its head.
+function buildResponse(ctx, composition, clone, lanes, notes, reused = false) {
+  const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
+  if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
+  // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
+  const runs = composition.head ? latestRunsBySuite(ctx, composition.head) : [];
+  if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); a suite with a lane or integration pass at this commit (a base control never counts) needs no rerun unless it changed since.`);
+  return { integration: composition, path: clone, ...(reused ? { reused } : {}), ...(runs.length ? { runs } : {}), ...(notes.length ? { next: notes.join(' ') } : {}) };
+}
+
 export async function buildIntegration({ workspace_path, features, base, from }) {
   if (!Array.isArray(features) || features.length < 1 || features.length > 50) throw new OverdriveError('features must list 1-50 lanes.', 'INVALID_INPUT');
   const requested = features.map(laneReference);
@@ -1012,14 +1099,17 @@ export async function buildIntegration({ workspace_path, features, base, from })
   const baseRef = optionalText(base, 'base', { max: 200 });
   const caller = agentName(from);
   return await withContext(workspace_path, ctx => withWorkspaceLock(ctx.root, labLock('integration'), async () => {
-    const built = parseJson(meta(ctx.db, 'integration'), null)?.head ?? null;
+    const recorded = parseJson(meta(ctx.db, 'integration'), null);
     const lanes = [];
     for (const { slug, ref } of requested) {
       const checkout = laneRow(ctx, slug).checkout_path;
       lanes.push({ slug, checkout, ...await laneRevision(checkout, ref) });
     }
     const start = await integrationBase(ctx, baseRef);
-    const clone = await resetIntegration(ctx.root, start.revision, start.source, built, ctx.config.repository);
+    if (await holdsBuild(ctx, recorded, start, lanes)) {
+      return buildResponse(ctx, recorded, integrationPath(ctx.root), lanes, ['The integration clone already holds this build of these lane revisions on this base, so it was not rebuilt.'], true);
+    }
+    const clone = await resetIntegration(ctx.root, start.revision, start.source, recorded?.head ?? null, ctx.config.repository);
     // Recorded before merging, so a failed build never leaves an older composition describing this clone.
     const composition = { base: start.revision, features: lanes.map(({ checkout, ...lane }) => lane), head: null, built_at: now() };
     meta(ctx.db, 'integration', JSON.stringify(composition));
@@ -1050,12 +1140,7 @@ export async function buildIntegration({ workspace_path, features, base, from })
       notes.push(`The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`);
     }
     if (composition.conflict) notes.push(...laterConflictNote(composition.conflict.laterConflicts), ...laterLaneNote(composition.conflict.laterLanes, composition.conflict.laterConflicts));
-    const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
-    if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
-    // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
-    const runs = composition.head ? latestRunsBySuite(ctx, composition.head) : [];
-    if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); a suite with a lane or integration pass at this commit (a base control never counts) needs no rerun unless it changed since.`);
-    return { integration: composition, path: clone, ...(runs.length ? { runs } : {}), ...(notes.length ? { next: notes.join(' ') } : {}) };
+    return buildResponse(ctx, composition, clone, lanes, notes);
   }));
 }
 
@@ -1093,7 +1178,7 @@ async function integrationTarget(ctx, requested) {
 // A lane's work as observed now, against the delivered commit in the repository that holds it.
 async function laneWork(ctx, slug, repository, delivered) {
   const lane = laneRow(ctx, slug);
-  const work = { lane: slug, status: lane.status };
+  const work = { lane: slug, status: lane.status, ...(agentBusy(lane) ? { agentRunning: true } : {}) };
   try {
     const snapshot = await repositorySnapshot(lane.checkout_path);
     Object.assign(work, { head: snapshot.head, uncommittedFiles: snapshot.changedFileCount });
@@ -1105,19 +1190,20 @@ async function laneWork(ctx, slug, repository, delivered) {
   return work;
 }
 
-const workRemains = work => work.uncommittedFiles !== 0 || work.headDelivered !== true;
+const workRemains = work => work.agentRunning || work.uncommittedFiles !== 0 || work.headDelivered !== true;
 
 function remainingWorkSummary(work) {
   if (work.unavailable) return `This lane stays ${work.status} because its work could not be checked.`;
   const reasons = [
+    work.agentRunning ? 'its agent is still in a turn' : '',
     work.headDelivered ? '' : `its HEAD ${work.head.slice(0, 12)} is not delivered`,
     work.uncommittedFiles ? `it has ${work.uncommittedFiles} uncommitted files` : '',
   ].filter(Boolean);
   return `This lane stays ${work.status}: ${reasons.join(' and ')}.`;
 }
 
-// Only a lane whose clean HEAD the delivered commit contains is done; the rest keep their lifecycle and next action.
-// This observes the lanes near completion; it does not stop an agent from committing afterwards.
+// Only a lane whose agent is not in a turn and whose clean HEAD the delivered commit contains is done; the rest keep their
+// lifecycle and next action. This observes the lanes near completion; it does not stop an agent from committing afterwards.
 async function markLanesDone(ctx, lanes, summary, details, repository, delivered) {
   const observed = [];
   for (const slug of lanes) observed.push(await laneWork(ctx, slug, repository, delivered));
@@ -1146,11 +1232,25 @@ function remainingWorkNote(remaining) {
   const names = works => works.map(work => work.lane).join(', ');
   const observed = remaining.filter(work => !work.unavailable);
   const unchecked = remaining.filter(work => work.unavailable);
+  const running = remaining.filter(work => work.agentRunning);
   return [
-    observed.length ? `Undelivered or uncommitted work remains in ${names(observed)}.` : '',
+    observed.length ? `Undelivered or uncommitted work, or a running turn, remains in ${names(observed)}.` : '',
     unchecked.length ? `Whether all work in ${names(unchecked)} was delivered could not be checked.` : '',
     'Each of these lanes keeps its status, summary and next action; review its entry in remainingWork and continue the work that should ship, making a done lane active again first.',
+    running.length ? `After the running turns in ${names(running)} end (agents_wait), integrate this commit again to close lanes with nothing left.` : '',
   ].filter(Boolean).join(' ');
+}
+
+// Other agents still in a turn and unread messages to the coordinator can still change what a delivery report should say.
+function pendingActivityNote(db, remaining) {
+  const listed = new Set(remaining.map(work => work.lane));
+  const busy = db.prepare(`SELECT slug FROM features WHERE ${AGENT_BUSY_SQL} ORDER BY slug`).all().map(row => row.slug).filter(slug => !listed.has(slug));
+  const unread = Number(db.prepare("SELECT COUNT(*) AS count FROM messages WHERE to_agent = 'coordinator' AND status = 'pending'").get().count);
+  const parts = [
+    busy.length ? `${busy.join(', ')} ${busy.length > 1 ? 'are' : 'is'} still in a turn` : '',
+    unread ? `${unread} message${unread > 1 ? 's' : ''} to you ${unread > 1 ? 'are' : 'is'} unread` : '',
+  ].filter(Boolean);
+  return parts.length ? `${parts.join(' and ')}; read them with agents_wait before reporting this delivery.` : '';
 }
 
 // Every suite's latest verdict at the commit, so integrate cites what was actually run there.
@@ -1164,9 +1264,10 @@ function latestRunsBySuite(ctx, commit) {
 
 // The latest runs with their per-test comparison against the delivery's base and the mutant controls run at the same commit.
 async function deliveredRuns(ctx, commit, base) {
+  const lab = await ensureLab(ctx.root);
   const runs = [];
   for (const run of latestRunsBySuite(ctx, commit)) {
-    const vsBase = await compareWithBase(ctx, knownRun(ctx.db, run.id, 'id, suite, target, status, lab_revision, mutant'), base);
+    const vsBase = await compareWithBase(ctx, knownRun(ctx.db, run.id, 'id, suite, target, status, lab_revision, mutant'), base, lab);
     const mutants = mutantRuns(ctx.db, { suite: run.suite, revision: commit }).map(({ suite: _suite, revision: _revision, ...control }) => control);
     runs.push({ ...run, ...(vsBase ? { vsBase } : {}), ...(mutants.length ? { mutants } : {}) });
   }
@@ -1189,11 +1290,18 @@ async function evidenceFlags(ctx, { target, commit, lanes }) {
   };
 }
 
+// Base failing too is a fact, not an all-clear: a control that fails on base by design still has to pass here.
+const failedOnBaseToo = run => run.status === 'failed' && run.vsBase?.baseStatus === 'failed' && run.vsBase.regressions?.length === 0;
+
 function evidenceGapsNote(runs, suitesNotRun, flags) {
   const unpassed = runs.filter(run => run.status !== 'passed').map(run => run.suite);
+  const onBaseToo = runs.filter(failedOnBaseToo).map(run => `${run.suite} (base run ${run.vsBase.baseRun})`);
   const regressed = runs.filter(run => run.vsBase?.regressions?.length).map(run => run.suite);
+  const labDiffers = runs.filter(run => run.vsBase?.labDiffers).map(run => run.suite);
   return [
     unpassed.length ? `The latest runs of ${unpassed.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '',
+    onBaseToo.length ? `Of these, ${onBaseToo.join(', ')} also failed on base, and no test that passed there fails here (vsBase).` : '',
+    labDiffers.length ? `The base runs that ${labDiffers.join(', ')} were compared with come from a lab snapshot that differs outside the suite (vsBase.labDiffers); rerun base with the current snapshot if those files could change the suite's tests.` : '',
     suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it.` : '',
     regressed.length ? `${regressed.join(', ')} regressed tests that passed on base (runs[].vsBase.regressions); report them whatever the exit code.` : '',
     flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed on this target at this commit with one lab snapshot, so neither verdict stands alone.` : '',
@@ -1209,6 +1317,7 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   // The integration clone holds its commit only as a detached HEAD, which the next rebuild moves.
   await git(source, 'update-ref', `refs/overdrive/delivered/${commit}`, commit);
   const remaining = delivered ? await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, runs }, source, commit) : [];
+  const notes = [gaps, pendingActivityNote(ctx.db, remaining)].filter(Boolean).join(' ');
   const lanesDone = delivered && !remaining.length;
   const ref = `${commit}:refs/heads/${branch ?? '<branch>'}`;
   const push = `git -C "${source}" push "${ctx.config.repository}" ${ref}`;
@@ -1226,7 +1335,7 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   return {
     published: false, target, commit, branch, path: source, lanes, delivered, lanesDone, ...(remaining.length ? { remainingWork: remaining } : {}),
     runs, ...(suitesNotRun.length ? { suitesNotRun } : {}), openBlockingFindings: blocking.map(finding => finding.id), committedChanges: changes, push, fetch,
-    next: `OVERDRIVE never publishes to an adopted repository. ${action}${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${gaps ? ` ${gaps}` : ''}`,
+    next: `OVERDRIVE never publishes to an adopted repository. ${action}${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${notes ? ` ${notes}` : ''}`,
   };
 }
 
@@ -1271,7 +1380,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   });
   const head = alreadyIncluded ? before.head : commit;
   const remaining = await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, runs }, project, head);
-  const next = [remainingWorkNote(remaining), gaps].filter(Boolean).join(' ');
+  const next = [remainingWorkNote(remaining), gaps, pendingActivityNote(ctx.db, remaining)].filter(Boolean).join(' ');
   return {
     integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, lanesDone: !remaining.length, ...(remaining.length ? { remainingWork: remaining } : {}),
     runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),

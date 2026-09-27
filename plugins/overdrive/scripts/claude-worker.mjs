@@ -97,9 +97,10 @@ export function workerLaunchArgs(meta, effort) {
 // Auto-memory lives outside OVERDRIVE state and would carry notes across replaced sessions or
 // reused checkouts, so it is forced off regardless of any inherited value or key casing.
 // OVERDRIVE_WORKER leaves any copy of the OVERDRIVE plugin server that the worker loads without tools.
+// A -p session moves a long MCP call, such as lab_run, to the background only with CLAUDE_AUTO_BACKGROUND_TASKS.
 export function workerEnvironment(env = process.env) {
   const inherited = Object.entries(env).filter(([key]) => !NESTED_SESSION_ENV.test(key) && key.toUpperCase() !== 'CLAUDE_CODE_DISABLE_AUTO_MEMORY');
-  return { ...Object.fromEntries(inherited), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' };
+  return { ...Object.fromEntries(inherited), CLAUDE_AUTO_BACKGROUND_TASKS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' };
 }
 
 // The Claude Code executable a worker launch would use: CLAUDE_CLI_PATH, then the PATH, then the
@@ -428,7 +429,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
     if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     meta.lingering = null;
-    const turn = { id: `turn_${randomUUID()}`, guardId, resumed: Boolean(meta.persisted), cliVersion: null, mainLoop: {}, seenResultIds: new Set(), status: 'inProgress', startedAt: now(), text: [], tail: [], denials: [], pendingResults: 1, answered: false, liveTasks: new Set(), backgroundTasks: new Set(), unreadNotifications: 0, notificationReplies: 0, inputClosed: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
+    const turn = { id: `turn_${randomUUID()}`, guardId, resumed: Boolean(meta.persisted), cliVersion: null, mainLoop: {}, seenResultIds: new Set(), status: 'inProgress', startedAt: now(), text: [], tail: [], denials: [], pendingResults: 1, answered: false, liveTasks: new Set(), backgroundTasks: new Map(), unreadNotifications: 0, notificationReplies: 0, inputClosed: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
     turn.settled = new Promise(resolve => { turn.resolveSettled = resolve; });
     await this.#launch(meta, turn, { command: this.launch.command, args: [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)] });
     meta.active = turn;
@@ -727,7 +728,9 @@ export class ClaudeWorkerBridge extends EventEmitter {
       // Each report lists every live background task; ambient ones are the CLI's own housekeeping.
       const tasks = Array.isArray(message.tasks) ? message.tasks.filter(task => typeof task?.task_id === 'string' && !task.ambient) : [];
       turn.liveTasks = new Set(tasks.map(task => task.task_id));
-      for (const id of turn.liveTasks) turn.backgroundTasks.add(id);
+      for (const id of turn.liveTasks) if (!turn.backgroundTasks.has(id)) turn.backgroundTasks.set(id, Date.now());
+      const live = tasks.map(task => ({ task: redactString(String(task.description ?? '')).slice(0, 120), type: task.task_type ?? null, since: turn.backgroundTasks.get(task.task_id) }));
+      this.emit('notification', { method: 'worker/backgroundTasks', params: { threadId: meta.id, turnId: turn.id, tasks: live } });
     } else if (message.subtype === 'task_notification') {
       // A stopped task gets no reply from the model; foreground tasks never enter the live set.
       if (turn.backgroundTasks.has(message.task_id) && !message.ambient && message.status === 'stopped') turn.lastResultTotals = false;
