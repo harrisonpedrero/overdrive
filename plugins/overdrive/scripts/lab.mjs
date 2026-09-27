@@ -205,18 +205,33 @@ async function integrationRunLanes(ctx, clone, revision) {
   return (await integratedLanes(ctx, clone, head)).map(lane => lane.slug).sort();
 }
 
+// A stopped build's recorded conflict; builds before later-lane advisories stored its files unredacted and without laterLanes.
+function recordedConflict({ feature, files, laterLanes }) {
+  return { feature, files: (files ?? []).slice(0, CONFLICT_FILE_LIMIT).map(redactString), ...(laterLanes ? { laterLanes } : {}) };
+}
+
+// The recorded conflict still describes the clone only while its lane is pending on a HEAD built from the recorded base.
+async function lastConflict(clone, built, head, pending) {
+  if (!built.conflict || !built.base || !pending.includes(built.conflict.feature)) return null;
+  return await isGitAncestor(clone, built.base, head).catch(() => false) ? recordedConflict(built.conflict) : null;
+}
+
 // The recorded build is where the clone started; an agent may since have resolved and committed a conflict.
 async function integrationStatus(ctx) {
   const built = parseJson(meta(ctx.db, 'integration'), null);
   const clone = integrationPath(ctx.root);
-  if (!built || !await exists(path.join(clone, '.git'))) return built;
+  if (!built) return null;
+  // Without the clone nothing establishes that the recorded conflict still applies, so it stays history.
+  if (!await exists(path.join(clone, '.git'))) return built.conflict ? { ...built, conflict: recordedConflict(built.conflict) } : built;
   const head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
   const included = (await integratedLanes(ctx, clone, head)).map(lane => lane.slug);
-  const conflictFiles = (await git(clone, 'diff', '--name-only', '--diff-filter=U')).stdout.split('\n').filter(Boolean);
+  const pending = built.features.map(lane => lane.slug).filter(slug => !included.includes(slug));
+  const conflictFiles = (await git(clone, 'diff', '--name-only', '--diff-filter=U')).stdout.split('\n').filter(Boolean).map(redactString);
+  const conflict = await lastConflict(clone, built, head, pending);
   return {
-    base: built.base, head, built_at: built.built_at, path: clone, included,
-    pending: built.features.map(lane => lane.slug).filter(slug => !included.includes(slug)),
+    base: built.base, head, built_at: built.built_at, path: clone, included, pending,
     ...(conflictFiles.length ? { conflictFiles } : {}),
+    ...(conflict ? { lastConflict: conflict } : {}),
   };
 }
 
