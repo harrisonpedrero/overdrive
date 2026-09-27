@@ -724,10 +724,19 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   const push = `git -C "${source}" push "${ctx.config.repository}" ${ref}`;
   const fetch = `git fetch "${source}" ${ref}`;
   const gaps = evidenceGapsNote(runs, suitesNotRun);
+  const exact = `target ${target} and revision ${commit.slice(0, 12)}`;
+  const missing = [
+    passing ? '' : `a passing lab_run of the relevant suites with ${exact}`,
+    blocking.length ? `resolution of open blocking findings ${blocking.map(finding => finding.id).join(', ')}` : '',
+  ].filter(Boolean).join(' and ');
+  // Unfinished work stays exportable for review, but the prose must not present it as delivered.
+  const action = delivered
+    ? "The included lanes are marked done. With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone."
+    : `This commit is not delivered, so its lanes stay open. It still needs ${missing}; then call integrate with ${exact} to deliver it. A repair that changes code makes a new commit, so test and integrate that revision instead. Until then, with the user's authority, the push command (with their fork's URL instead when they cannot push to the repository) or the fetch command still exports this commit for interim review; present it as unfinished work, not a delivery.`;
   return {
     published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
     openBlockingFindings: blocking.map(finding => finding.id), committedChanges: changes, push, fetch,
-    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${gaps ? ` ${gaps}` : ''}`,
+    next: `OVERDRIVE never publishes to an adopted repository. ${action}${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${gaps ? ` ${gaps}` : ''}`,
   };
 }
 
