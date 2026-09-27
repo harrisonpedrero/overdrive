@@ -79,7 +79,7 @@ export const TOOLS = [
     ...feature,
     title: string('Human-readable feature title.'),
     outcome: string('Concrete outcome this lane must enable.'),
-    base_revision: string('Optional branch, tag, or commit. Required full commit ID when base_feature is supplied; otherwise defaults to the refreshed canonical revision.'),
+    base_revision: string('Optional branch, tag, or commit. Required commit ID (full, or at least 7 hex digits) when base_feature is supplied; otherwise defaults to the refreshed canonical revision.'),
     base_feature: string('Optional existing lane supplying the explicitly selected base_revision. Reads committed objects from that clone without publishing them to canonical source or selecting its current HEAD. Seeds from the cached canonical mirror without refreshing it, so canonical source may be unavailable.', { pattern: SLUG }),
     priority: integer('Relative feature priority.', -100, 100),
     spec: string('Optional complete initial Markdown specification.'),
@@ -181,7 +181,7 @@ export const TOOLS = [
     timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
   }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes. Runs on one target wait for each other, because they share its checkout.', object({
+  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to its committed HEAD or, when its own agent runs it, to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes. Runs on one target wait for each other, because they share its checkout.', object({
     ...workspace,
     suite: suite('Suite to run.'),
     target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
@@ -211,7 +211,7 @@ export const TOOLS = [
   tool('integration_build', 'Build an integration', 'Reset the runtime-owned integration clone to base and merge the listed lanes in order. A lane contributes its committed HEAD (uncommitted files are left out and counted), or slug@ref an exact revision. Stops at the first conflict; a QA agent\'s conflicted merge stays in place for it to resolve, and the coordinator\'s is aborted.', object({
     ...workspace,
     features: { type: 'array', minItems: 1, maxItems: 50, items: string('Lane slug, or slug@ref.') },
-    base: string('Optional base ref. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
+    base: string('Optional project or repository ref; a lane\'s commit joins through features (slug@ref) instead. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
   }, ['workspace_path', 'features']), { destructiveHint: false, openWorldHint: true }),
 
   tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains, then mark those lanes done. Never pushes. For an adopted repository it publishes nothing: it returns the commit, its checkout path, a push command to run with the user’s authority and a fetch command for the user’s own clone, and marks the included lanes done when the commit has a passing lab run and no open blocking findings.', object({

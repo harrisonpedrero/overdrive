@@ -144,15 +144,15 @@ function featureAgentInstructions(root, feature) {
 
 You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checkout_path} on branch ${feature.branch}. ${agentFiles(root, feature.slug)} Follow the repository's own instructions (AGENTS.md, CLAUDE.md and similar).
 
-- Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions.
+- Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions. Keep lane names, ownership notes and notes to other agents out of product files.
 - Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
-- Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. For quick feedback, run the existing checks closest to your change, not the full suite: lanes share this machine, and QA runs the full suite and any check that needs a harness (races, load, end-to-end journeys) in the lab. Report failures outside your change instead of chasing them.
+- Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. Updating an existing assertion that your change necessarily alters is part of the change. For quick feedback, run the existing checks closest to your change, not the full suite: lanes share this machine, and QA runs the full suite and any check that needs a harness (races, load, end-to-end journeys) in the lab. For broader verification of your own work, such as a differential comparison or fuzzing, run QA's suite for your lane with lab_run (lab_get lists the suites) instead of building your own harness, and ask \`qa\` when none covers it yet. Report failures outside your change instead of chasing them.
 - Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
 - ${TURN_END}
 - ${MESSAGES}
 - ${SPEC_GAPS}
-- No browser or computer use. When a change is ready to test, or you need a behavior verified, send \`qa\` a message saying what changed and what to test.
+- No browser or computer use. When a change is ready to test, or you need a behavior verified, commit it and send \`qa\` a message saying what changed and what to test.
 - Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
 - Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
 - Your \`overdrive\` tools: message_send reaches \`qa\`, another lane or \`coordinator\`; lanes shows every lane and QA agent; lab_get and lab_run read and run lab suites against your own lane.
@@ -167,7 +167,7 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 
 - Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Where expected results would otherwise come only from the spec, add an independent oracle when one exists: an established tool or reference implementation to compare against, or real-world inputs. Wrap the repository's own checks (build, lint, existing tests and the CI jobs that gate merges) as suites too, because lanes run only the checks nearest their change. When a check's runner is missing, look for an equivalent this machine can run before leaving the check out, and name any check you leave out in your handoff. The lab README describes the suite format.
 - Use browser and computer control where rendering or interaction matters, and check first what lanes said they could not verify themselves, such as rendering (feature agents have no browser), so those findings reach the lanes early. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
-- Run suites with lab_run; only runs the runtime executed are evidence. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes.
+- Run suites with lab_run; only runs the runtime executed are evidence. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes. When a suite covering a lane first works while that lane is still in progress, tell it the suite's name, so it can run the suite itself with lab_run.
 - Build and test integration combinations with integration_build. Your handoff reaches the coordinator, so message \`coordinator\` only when it must act before your turn ends. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
 - When every lane you are verifying is ready, test one commit that combines them (an integration build, or a lane that merged the others) instead of each lane. Test a lane head on its own when it is ready well before the others, or to localize a failure.
@@ -578,7 +578,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Keep suites deterministic: the same revision gives the same verdict. A suite whose verdict depends on timing or scheduling (concurrency, load, expiry) repeats its scenario within the run and reports how many repetitions passed.
 - Set up dependencies in the target idempotently, for example install only when the lockfile hash changed, and prefer toolchains and browser builds already on this machine (for Playwright, a version whose browser is already in its cache) to new downloads. Ignored directories such as node_modules survive between runs against the same target.
 - Start every service a suite needs within the run, and stop it by its PID or process tree, never by image name, before the run ends.
-- Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host (for Node, a --require preload that rewrites every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1) or leave those tests out and say so. Use OVERDRIVE_PORT.
+- Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host or leave those tests out and say so. For Node, a --require preload can rewrite every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1, but it must still bind synchronously, as Node's Server#_listen2 does: passing a host makes listen() resolve it asynchronously, and callers such as supertest read address() right after listen(0). Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
@@ -711,8 +711,8 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
   const cleanOutcome = requiredText(outcome, 'outcome', { max: 10_000 });
   const initialSpec = optionalText(spec, 'spec', { max: 500_000 });
   const baseSlug = base_feature === undefined ? null : safeSlug(base_feature, 'base feature');
-  if (baseSlug && (typeof base_revision !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(base_revision))) {
-    throw new OverdriveError('base_feature requires an explicitly selected full commit ID in base_revision.', 'INVALID_REVISION');
+  if (baseSlug && (typeof base_revision !== 'string' || !/^[a-f0-9]{7,64}$/i.test(base_revision))) {
+    throw new OverdriveError('base_feature requires an explicitly selected commit ID (at least 7 hex digits) in base_revision.', 'INVALID_REVISION');
   }
   if (!Number.isInteger(priority) || priority < -100 || priority > 100) throw new OverdriveError('priority must be an integer from -100 to 100.', 'INVALID_INPUT');
   return await withWorkspaceLock(root, 'features', async () => {
@@ -722,7 +722,7 @@ export async function createFeature({ workspace_path, feature, title, outcome, b
       const baseSource = baseSlug ? featureBySlug(ctx.db, baseSlug) : null;
       const baseRepository = baseSource ? await ensureManagedPath(root, baseSource.checkout_path) : mirrorPath(root);
       const selectedBase = baseSource ? await verifyCheckoutRevision(baseRepository, base_revision) : null;
-      if (selectedBase && selectedBase.toLowerCase() !== base_revision.toLowerCase()) {
+      if (selectedBase && !selectedBase.toLowerCase().startsWith(base_revision.toLowerCase())) {
         throw new OverdriveError('base_revision must identify the exact source commit, not a hexadecimal ref name.', 'INVALID_REVISION');
       }
       // An exact sibling commit needs the cache only as a clone seed, so canonical source may be unavailable;

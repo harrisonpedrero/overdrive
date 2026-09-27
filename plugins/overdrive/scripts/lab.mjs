@@ -199,13 +199,29 @@ async function resolvableFindings(ctx, repository, suite, features, commit) {
 }
 
 // What a run tests, and the lanes whose findings its pass can resolve; base belongs to no lane.
-async function runSubject(ctx, target, lane, requested) {
+// By default only a lane's own agent tests its working tree; anyone else tests what the lane committed.
+async function runSubject(ctx, target, lane, requested, creator) {
   if (target === 'base' && !lane) return { ...await baseTarget(ctx, requested), features: [] };
-  const source = lane ? lane.checkout_path : await integrationClone(ctx.root);
-  const revision = requested ? await verifyCheckoutRevision(source, requested)
-    : lane ? await snapshotCommit(source) : (await git(source, 'rev-parse', 'HEAD')).stdout;
-  const features = lane ? [lane.slug] : (await integratedLanes(ctx, source, revision)).map(entry => entry.slug);
-  return { source, revision, features };
+  if (lane) {
+    const subject = !requested && lane.slug === creator ? { revision: await snapshotCommit(lane.checkout_path) } : await laneRevision(lane.checkout_path, requested);
+    return { source: lane.checkout_path, features: [lane.slug], ...subject };
+  }
+  const source = await integrationClone(ctx.root);
+  const revision = requested ? await verifyCheckoutRevision(source, requested) : (await git(source, 'rev-parse', 'HEAD')).stdout;
+  return { source, revision, features: (await integratedLanes(ctx, source, revision)).map(entry => entry.slug) };
+}
+
+// An identical run (target, suite, revision and lab snapshot) that ended after this call arrived ran while
+// it waited for the target's lock, so it answers this call too; one that ended earlier never does.
+function identicalRunSince(db, { target, suite, revision, lab_revision }, arrived) {
+  const row = db.prepare("SELECT * FROM lab_runs WHERE target = ? AND suite = ? AND revision = ? AND lab_revision = ? AND status IN ('passed', 'failed') ORDER BY created_at DESC LIMIT 1")
+    .get(target, suite, revision, lab_revision);
+  return row && Date.parse(row.created_at) + row.duration_ms >= arrived ? row : null;
+}
+
+function runResponse(root, row, details, notes) {
+  const { argv: _argv, artifacts: { files: _files, ...artifacts }, ...summary } = presentRun(root, row, runLog(root, row.id));
+  return { run: { ...summary, artifacts }, ...details, next: [...notes, `Earlier output is in run.outputLog; lab_get {"run": "${row.id}"} lists its artifacts.`].join(' ') };
 }
 
 export async function runLabSuite({ workspace_path, suite, target, revision, from }) {
@@ -213,18 +229,27 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
   const targetSlug = targetName(target);
   const requested = optionalText(revision, 'revision', { max: 200 });
   const creator = agentName(from);
+  const arrived = Date.now();
   return await withContext(workspace_path, async ctx => {
     const lab = await ensureLab(ctx.root);
     const spec = await readSuite(ctx.root, lab, name);
     // A lane named base from before the control target keeps its lab address.
     const lane = targetSlug === 'integration' || (targetSlug === 'base' && !featureId(ctx.db, 'base')) ? null : laneRow(ctx, targetSlug);
     return await withWorkspaceLock(ctx.root, labLock(targetSlug), async () => {
-      const { source, revision: commit, features } = await runSubject(ctx, targetSlug, lane, requested);
+      const { source, revision: commit, features, uncommittedFiles } = await runSubject(ctx, targetSlug, lane, requested, creator);
       // Under this target's lock a run still marked running belongs to a runtime that exited mid-run.
       ctx.db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(targetSlug);
       // Processes of a run whose termination is uncertain may still use its target directory.
       const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(targetSlug).count);
       const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit, ctx.config.repository);
+      // Taken after the target sync, which can be slow, so the recorded snapshot matches the lab files the suite runs.
+      const labRevision = await snapshotCommit(lab);
+      const details = targetSlug === 'integration' ? { included: features } : {};
+      const notes = uncommittedFiles ? [`${targetSlug} has uncommitted changes that this run of its HEAD left out.`] : [];
+      const reused = identicalRunSince(ctx.db, { target: targetSlug, suite: name, revision: commit, lab_revision: labRevision }, arrived);
+      if (reused) {
+        return runResponse(ctx.root, reused, { reused: true, resolvedFindings: [], ...details }, ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes]);
+      }
       const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
       const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
       await fs.mkdir(artifacts, { recursive: true });
@@ -235,7 +260,7 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
         OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
       };
       const row = {
-        id, suite: name, target: targetSlug, revision: commit, lab_revision: await snapshotCommit(lab), argv_json: JSON.stringify(spec.argv), cwd,
+        id, suite: name, target: targetSlug, revision: commit, lab_revision: labRevision, argv_json: JSON.stringify(spec.argv), cwd,
         status: 'running', created_by: creator, created_at: now(),
       };
       ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
@@ -262,13 +287,7 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
       for (const finding of resolved) {
         await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
       }
-      const { argv: _argv, artifacts: { files: _files, ...artifactSummary }, ...summary } = presentRun(ctx.root, row, runLog(ctx.root, id));
-      return {
-        run: { ...summary, artifacts: artifactSummary },
-        resolvedFindings: resolved.map(finding => finding.id),
-        ...(targetSlug === 'integration' ? { included: features } : {}),
-        next: `Earlier output is in run.outputLog; lab_get {"run": "${id}"} lists its artifacts.`,
-      };
+      return runResponse(ctx.root, row, { resolvedFindings: resolved.map(finding => finding.id), ...details }, notes);
     }, { timeoutMs: labRunLockWait(spec) });
   });
 }
@@ -466,7 +485,10 @@ export async function buildIntegration({ workspace_path, features, base, from })
     }
     const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
     if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
-    return { integration: composition, path: clone, ...(notes.length ? { next: notes.join(' ') } : {}) };
+    // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
+    const runs = composition.head ? latestRunsBySuite(ctx, composition.head) : [];
+    if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); integrate counts a pass at this commit on any target, so a suite that passed here needs no rerun unless it changed since.`);
+    return { integration: composition, path: clone, ...(runs.length ? { runs } : {}), ...(notes.length ? { next: notes.join(' ') } : {}) };
   }));
 }
 
