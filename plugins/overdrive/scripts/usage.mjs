@@ -127,12 +127,12 @@ export function endTurnUsage(db, { featureId, threadId, turnId, ended, final }) 
 function assess(row, state, totals, baseline, delta, baselineMoved) {
   if (!totals) return ['unknown', 'no_usage_reported'];
   if (!baseline) return ['unknown', 'baseline_unknown'];
+  if (baselineMoved) return ['unknown', 'baseline_moved'];
   if (!delta) return ['unknown', 'counters_reset'];
   if (state === 'running') return ['partial', 'turn_running'];
   if (state === 'ended') return ['partial', 'turn_end_unobserved'];
   if (state !== 'completed') return ['partial', `turn_${state}`];
   if (row.rejected) return ['partial', 'snapshot_rejected'];
-  if (baselineMoved) return ['partial', 'baseline_moved'];
   if (!row.final) return ['partial', 'final_unconfirmed'];
   return ['complete', null];
 }

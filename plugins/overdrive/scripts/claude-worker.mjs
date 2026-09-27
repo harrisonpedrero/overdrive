@@ -644,11 +644,13 @@ export class ClaudeWorkerBridge extends EventEmitter {
 
   #event(meta, turn, message) {
     if (message.type === 'control_request') return this.#answerControl(turn, message);
-    // Result totals are captured before a failed result ends the turn. A replay is not a new response.
+    // Capture usage before a failed result ends the turn; a repeated ID has no new usage.
     if (message.type === 'result') {
-      if (typeof message.uuid === 'string' && turn.seenResultIds.has(message.uuid)) return;
-      if (typeof message.uuid === 'string') turn.seenResultIds.add(message.uuid);
-      this.#reportUsage(meta, turn, message);
+      const duplicate = typeof message.uuid === 'string' && turn.seenResultIds.has(message.uuid);
+      if (!duplicate) {
+        if (typeof message.uuid === 'string') turn.seenResultIds.add(message.uuid);
+        this.#reportUsage(meta, turn, message);
+      } else turn.lastResultTotals = false;
     }
     if (turn.status !== 'inProgress' || turn.interrupted || turn.failedResult) return;
     if (message.type === 'system') return this.#systemEvent(meta, turn, message);
@@ -718,6 +720,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
       for (const id of turn.liveTasks) turn.backgroundTasks.add(id);
     } else if (message.subtype === 'task_notification') {
       // A stopped task gets no reply from the model; foreground tasks never enter the live set.
+      if (turn.backgroundTasks.has(message.task_id) && !message.ambient && message.status === 'stopped') turn.lastResultTotals = false;
       if (turn.backgroundTasks.has(message.task_id) && !message.ambient && message.status !== 'stopped') turn.unreadNotifications += 1;
       this.#closeInputWhenSettled(turn);
     }
