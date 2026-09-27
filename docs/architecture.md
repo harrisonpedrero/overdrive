@@ -50,6 +50,7 @@ The profile comes from the agent's recorded `kind`, never from a tool argument.
 | OVERDRIVE worker tools | `message_send`, `lanes`, `lab_get`, `lab_run` (its own lane only) | the same on any target, plus `finding_record` and `integration_build` |
 | Browser and computer control | denied | allowed |
 | Publishing | denied | denied |
+| Global or system Git configuration | denied | denied |
 | User MCP servers, connectors, plugins, skills, hooks, web tools | available | available |
 
 **Worker-mode server.** Each worker session gets its own copy of `server.mjs` with `OVERDRIVE_AGENT=<slug>` and `OVERDRIVE_WORKSPACE=<root>`. It lists only the tools that agent's kind may call and refuses others with `WORKER_TOOL_FORBIDDEN`. Workers also get `OVERDRIVE_WORKER=1`, which leaves any copy of the coordinator plugin they load with no tools, and the coordinator plugin is disabled in their host.
@@ -59,7 +60,8 @@ The profile comes from the agent's recorded `kind`, never from a tool argument.
 1. Deny OVERDRIVE coordinator tools (plugin copies, or `overdrive` tools beyond the worker set).
 2. For the feature profile, deny MCP tools whose server name matches `chrome|browser|computer|playwright|puppeteer|cua_repl`.
 3. For every profile, deny shell commands whose text publishes: `git push` (with any options, including `subtree push`), `gh pr` and `gh issue` subcommands that write (such as `create`, `merge`, `edit`, `comment`, `review`, `close`; reads such as `view`, `list` and `diff` stay allowed), `gh release`, `gh repo create`, `gh api` with a writing method, `npm|pnpm|yarn|cargo publish`, `dotnet nuget push`, `twine upload`, `docker push`.
-4. Allow everything else.
+4. For every profile, deny writes to Git configuration outside the repository: `git config` with `--global` or `--system` (reads such as `--get` and `--list` stay allowed) and edits of a `.gitconfig` file. A worker once renamed the user's global Git identity.
+5. Allow everything else.
 
 Each denial is appended to the turn's handoff.
 

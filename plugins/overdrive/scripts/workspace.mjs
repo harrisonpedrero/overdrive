@@ -132,6 +132,7 @@ async function ensureWorkspaceFiles(root, config) {
 
 const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so. Give each server you start a port the OS picks (port 0) or a random high port, never a fixed or memorable number: parallel agents choose the same numbers, and on Windows a server that sets SO_REUSEADDR binds a port already in use and answers another agent\'s requests. Stop every server you started before your turn ends, by its PID or process tree (on Windows, `taskkill /PID <pid> /T /F`; in Git Bash `$!` is not a Windows PID, so use `taskkill //PID $(cat /proc/$!/winpid) //T //F`), never by image name such as dotnet.exe or node.exe: other agents\' lab runs and the user\'s own programs share this machine.';
 const TURN_END = 'Background commands, subagents and scheduled wakeups you leave running when your turn ends are stopped or never report back, so wait for work whose result you need before your handoff.';
+const USER_CONFIG = 'Never change the user\'s machine-wide settings, such as git config --global or --system; if Git needs an identity, set it with repository-local git config.';
 const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
 const SPEC_GAPS = 'When the spec contradicts its own goal, or a result meets the spec but would look wrong to the person using it, send `coordinator` the concrete example instead of following or encoding it silently, and keep working on the rest while it decides.';
 
@@ -151,6 +152,7 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - ${LOCAL_SERVERS}
 - ${TURN_END}
 - ${MESSAGES}
+- ${USER_CONFIG}
 - ${SPEC_GAPS}
 - No browser or computer use. When a change is ready to test, or you need a behavior verified, commit it and send \`qa\` a message saying what changed and what to test.
 - Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
@@ -174,6 +176,7 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 - ${LOCAL_SERVERS}
 - ${TURN_END}
 - ${MESSAGES}
+- ${USER_CONFIG}
 - ${SPEC_GAPS}
 - Never edit product code in lane checkouts; resolving a conflict in the integration clone is allowed.
 - Commit lab changes to the lab repository. Never publish anything without the user's authority, which comes through the coordinator.

@@ -27,6 +27,15 @@ const PUBLISH_COMMAND = new RegExp(String.raw`\b(?:${GIT_PUSH}|${GH_WRITE}|${GH_
 const ALLOW = Object.freeze({ allow: true });
 const deny = message => ({ allow: false, message });
 
+// Git configuration outside the repository is the user's (a worker once renamed the user's global identity); reads stay allowed.
+function writesUserGitConfig(input) {
+  if (typeof input?.file_path === 'string' && /[\\/]\.gitconfig$/i.test(input.file_path)) return true;
+  if (typeof input?.command !== 'string') return false;
+  return input.command.split(/[;&|\n]/).some(part => /\bgit\b.*\bconfig\b/i.test(part)
+    && /\s--(?:global|system)\b/i.test(part)
+    && !/\s(?:--get(?:-all|-regexp)?|--list|-l|get|list)\b/i.test(part));
+}
+
 // A lane row's capability profile; anything but an explicit QA agent gets the restricted profile.
 export const workerProfile = row => (row.kind === 'qa' ? 'qa' : 'feature');
 
@@ -44,6 +53,7 @@ export function workerToolDecision(profile, toolName, input) {
   }
   if (profile !== 'qa' && server && BROWSER_CONTROL.test(server)) return deny('Browser and computer control belong to QA; ask qa with message_send to verify it.');
   if (typeof input?.command === 'string' && PUBLISH_COMMAND.test(input.command)) return deny("Publishing needs the user's authority; ask the coordinator.");
+  if (writesUserGitConfig(input)) return deny('Global and system Git configuration belongs to the user; use repository-local git config instead.');
   return ALLOW;
 }
 
