@@ -36,14 +36,28 @@ const DELIVERY_RETRY_MS = 60_000;
 // Where a steer cannot reach the agent now, the message waits in its inbox instead.
 const QUEUED_WHEN = new Set(['INVALID_TRANSITION', 'DISPATCH_UNCERTAIN', 'AGENT_OWNED', 'TURN_MISMATCH']);
 
+// Codex runs commands through a shell named by its full path and prefixes PowerShell scripts with a UTF-8
+// preamble; both can fill the label, so they are shortened after redaction and before clipping.
+const SHELL_PATH = /^(?:"[^"]*[\\/]([^"\\/]+)"|'[^']*[\\/]([^'\\/]+)'|[^\s"']*[\\/]([^\s"'\\/]+))(?=\s|$)/;
+const SHELL_NAME = /^(?:powershell|pwsh|cmd|bash|zsh|sh)(?:\.exe)?$/i;
+const POWERSHELL_PREAMBLE = /^((?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-Command\s+["']?)try \{ \[Console\]::OutputEncoding=\[System\.Text\.Encoding\]::UTF8 \} catch \{\}[;\s]*/i;
+const TOOL_LABEL_MAX = 120;
+
+const shortShellPath = command => command.replace(SHELL_PATH, (path, ...names) => {
+  const name = names.find(Boolean);
+  return SHELL_NAME.test(name) ? name : path;
+});
+const commandLabel = command => shortShellPath(redactString(command ?? '').trim()).replace(POWERSHELL_PREAMBLE, '$1') || 'shell command';
+const clipLabel = label => label.length > TOOL_LABEL_MAX ? `${label.slice(0, TOOL_LABEL_MAX - 1).replace(/[\uD800-\uDBFF]$/, '')}…` : label;
+
 // Tool items whose running call is shown, with the label each gets; their results are never read.
 const TOOL_LABELS = new Map([
-  ['commandExecution', item => item.command],
+  ['commandExecution', item => commandLabel(item.command)],
   ['mcpToolCall', item => `${item.server}.${item.tool}`],
   ['dynamicToolCall', item => item.tool],
   ['toolCall', item => [item.tool, item.summary].filter(Boolean).join(': ')],
 ]);
-const toolLabel = item => redactString(String(TOOL_LABELS.get(item.type)(item) ?? '')).replace(/\s+/g, ' ').slice(0, 120);
+const toolLabel = item => clipLabel(redactString(String(TOOL_LABELS.get(item.type)(item) ?? '')).replace(/\s+/g, ' ').trim());
 
 const messageText = message => `Message from ${message.from_agent} (${message.created_at}):\n${message.body}`;
 const messageBlock = messages => messages.map(messageText).join('\n\n');
