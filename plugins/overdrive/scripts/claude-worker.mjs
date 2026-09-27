@@ -52,7 +52,8 @@ export function normalizeWorkerOptions(raw = {}) {
 export function workerLaunchArgs(meta, effort) {
   const options = meta.options;
   const feature = meta.profile !== 'qa';
-  const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose', meta.persisted ? '--resume' : '--session-id', meta.id];
+  // Replayed user messages show where the model takes in a background-task notification.
+  const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose', '--replay-user-messages', meta.persisted ? '--resume' : '--session-id', meta.id];
   if (meta.model) args.push('--model', meta.model);
   if (effort && EFFORTS[effort]) args.push('--effort', EFFORTS[effort]);
   args.push('--permission-mode', options.permissionMode, '--permission-prompt-tool', 'stdio');
@@ -137,6 +138,16 @@ export function failedResultDiagnostic(message, stderrTail = '') {
   const stderr = stderrExcerpt(stderrTail);
   if (stderr) return `Claude Code reported a failed result${kind}; its stderr ended with:\n${stderr}`;
   return `Claude Code reported a failed result${kind} without diagnostic detail.`;
+}
+
+// The latest visible report in stream order: text after the last result, else that result's report.
+const latestReport = turn => (turn.tail.some(text => text.trim()) ? turn.tail.join('\n') : turn.final ?? '');
+
+// Only the report of a finished response follows the exit diagnostic; unfinished progress does not.
+function exitFailure(turn, code) {
+  const outstanding = turn.liveTasks.size || turn.unreadNotifications || turn.notificationReplies ? ' Background work it started had not delivered its report.' : '';
+  const head = turn.inputClosed ? `Claude worker exited (${code}) after its final report.` : `Claude worker exited (${code}) before completing the turn.${outstanding}`;
+  return [`${head} ${stderrExcerpt(turn.stderrTail)}`.trim(), turn.final].filter(Boolean).join('\n');
 }
 
 const exited = child => child.exitCode !== null || child.signalCode !== null;
@@ -392,7 +403,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
     if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     meta.lingering = null;
-    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], denials: [], pendingResults: 1, answered: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
+    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], tail: [], denials: [], pendingResults: 1, answered: false, liveTasks: new Set(), backgroundTasks: new Set(), unreadNotifications: 0, notificationReplies: 0, inputClosed: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
     turn.settled = new Promise(resolve => { turn.resolveSettled = resolve; });
     await this.#launch(meta, turn, { command: this.launch.command, args: [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)] });
     meta.active = turn;
@@ -535,7 +546,8 @@ export class ClaudeWorkerBridge extends EventEmitter {
       // finish waits for stderr.
       if (turn.interrupted) return this.#finishInterrupted(meta, turn);
       if (turn.failedResult) return;
-      void this.#finish(meta, turn, 'failed', `Claude worker exited (${code}) before completing the turn. ${stderrExcerpt(turn.stderrTail)}`.trim());
+      if (turn.inputClosed && code === 0) return void this.#finish(meta, turn, 'completed');
+      void this.#finish(meta, turn, 'failed', exitFailure(turn, code));
     };
     if (child.stdout.readableEnded) return settle();
     const timer = setTimeout(settle, EXIT_DRAIN_MS);
@@ -565,7 +577,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   #steer({ threadId, expectedTurnId, input }) {
     const meta = this.#thread(threadId);
     const turn = meta.active;
-    if (!turn || turn.id !== expectedTurnId || turn.interrupted || turn.failedResult) throw new OverdriveError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
+    if (!turn || turn.id !== expectedTurnId || turn.interrupted || turn.failedResult || turn.inputClosed) throw new OverdriveError(`Turn ${expectedTurnId} is no longer active.`, 'TURN_MISMATCH');
     turn.pendingResults += 1;
     clearTimeout(turn.graceTimer);
     this.#send(turn, textOf(input));
@@ -614,11 +626,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   #event(meta, turn, message) {
     if (message.type === 'control_request') return this.#answerControl(turn, message);
     if (turn.status !== 'inProgress' || turn.interrupted || turn.failedResult) return;
-    if (message.type === 'system' && message.subtype === 'init') {
-      meta.persisted = true;
-      clearTimeout(turn.graceTimer);
-      return;
-    }
+    if (message.type === 'system') return this.#systemEvent(meta, turn, message);
     if (message.type === 'assistant') {
       clearTimeout(turn.graceTimer);
       turn.answered = true;
@@ -626,6 +634,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
         // Thinking blocks are private reasoning and are never forwarded or stored.
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
           turn.text.push(block.text);
+          turn.tail.push(block.text);
           this.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: meta.id, turnId: turn.id, delta: `${block.text}\n` } });
         } else if (block?.type === 'tool_use') {
           this.emit('notification', { method: 'item/started', params: { threadId: meta.id, turnId: turn.id, startedAtMs: Date.now(), item: { id: block.id, type: 'toolCall', tool: block.name, summary: block.input?.description ?? block.input?.command } } });
@@ -636,7 +645,8 @@ export class ClaudeWorkerBridge extends EventEmitter {
     }
     // Only which call returned is forwarded, never its result.
     if (message.type === 'user') {
-      for (const block of message.message?.content ?? []) {
+      if (message.isReplay && message.origin?.kind === 'task-notification') return this.#notificationTakenIn(turn);
+      for (const block of Array.isArray(message.message?.content) ? message.message.content : []) {
         if (block?.type === 'tool_result') this.emit('notification', { method: 'item/completed', params: { threadId: meta.id, turnId: turn.id, completedAtMs: Date.now(), item: { id: block.tool_use_id, type: 'toolCall' } } });
       }
       return;
@@ -650,22 +660,59 @@ export class ClaudeWorkerBridge extends EventEmitter {
         this.#finishFailedResult(meta, turn, message);
         return;
       }
-      // The CLI also answers notifications it queues itself, such as a finished background task; a
-      // result with no assistant event since the previous result answers none of this turn's input.
-      if (turn.answered) {
-        turn.pendingResults -= 1;
-        turn.final = typeof message.result === 'string' ? message.result : null;
+      const report = typeof message.result === 'string' && message.result.trim() ? message.result : turn.tail.join('\n');
+      if (report.trim()) turn.final = report;
+      turn.tail = [];
+      if (message.origin?.kind === 'task-notification') {
+        // A reply to a notification taken in as its own response was counted when it was replayed.
+        if (turn.notificationReplies > 0) turn.notificationReplies -= 1;
+        else turn.unreadNotifications = Math.max(0, turn.unreadNotifications - 1);
+      } else {
+        turn.notificationReplies = 0;
+        // A result with no assistant event since the previous result answers none of this turn's input.
+        if (turn.answered) turn.pendingResults -= 1;
       }
       turn.answered = false;
-      if (turn.pendingResults <= 0) {
-        void this.#finish(meta, turn, 'completed');
-        return;
-      }
-      // Input such as a queued steer is still unanswered; the CLI normally starts a new response for
-      // it. If nothing follows, it was folded into an earlier response and the turn is done.
       clearTimeout(turn.graceTimer);
-      turn.graceTimer = setTimeout(() => { if (!turn.interrupted) void this.#finish(meta, turn, 'completed'); }, RESULT_GRACE_MS);
+      // Input such as a queued steer is still unanswered; the CLI normally starts a new response for
+      // it. If nothing follows, it was folded into an earlier response.
+      if (turn.pendingResults > 0) turn.graceTimer = setTimeout(() => { turn.pendingResults = 0; this.#closeInputWhenSettled(turn); }, RESULT_GRACE_MS);
+      this.#closeInputWhenSettled(turn);
     }
+  }
+
+  #systemEvent(meta, turn, message) {
+    if (message.subtype === 'init') {
+      meta.persisted = true;
+      clearTimeout(turn.graceTimer);
+    } else if (message.subtype === 'background_tasks_changed') {
+      // Each report lists every live background task; ambient ones are the CLI's own housekeeping.
+      const tasks = Array.isArray(message.tasks) ? message.tasks.filter(task => typeof task?.task_id === 'string' && !task.ambient) : [];
+      turn.liveTasks = new Set(tasks.map(task => task.task_id));
+      for (const id of turn.liveTasks) turn.backgroundTasks.add(id);
+    } else if (message.subtype === 'task_notification') {
+      // A stopped task gets no reply from the model; foreground tasks never enter the live set.
+      if (turn.backgroundTasks.has(message.task_id) && !message.ambient && message.status !== 'stopped') turn.unreadNotifications += 1;
+      this.#closeInputWhenSettled(turn);
+    }
+  }
+
+  // Before any output since the last result, a notification opens a response of its own, which
+  // ends with a notification result; later, it is folded into the running response.
+  #notificationTakenIn(turn) {
+    turn.unreadNotifications = Math.max(0, turn.unreadNotifications - 1);
+    if (!turn.answered) turn.notificationReplies += 1;
+  }
+
+  // Closing input ends the CLI's session, which stops its background tasks, so it waits for a
+  // response boundary with every input answered and every background task reported. The turn
+  // then completes only at the CLI's exit.
+  #closeInputWhenSettled(turn) {
+    if (turn.inputClosed || turn.interrupted || turn.failedResult || turn.status !== 'inProgress') return;
+    if (turn.answered || turn.pendingResults > 0 || turn.unreadNotifications || turn.notificationReplies || turn.liveTasks.size) return;
+    turn.inputClosed = true;
+    clearTimeout(turn.graceTimer);
+    try { turn.child?.stdin?.end(); } catch { /* process already gone */ }
   }
 
   // A nonblank result string is the whole failure report. Otherwise the diagnostic precedes the
@@ -746,7 +793,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     const patch = await this.#workingPatch(meta).catch(() => null);
     if (patch) this.emit('notification', { method: 'turn/diff/updated', params: { threadId: meta.id, turnId: turn.id, diff: patch } });
     const items = [];
-    const text = failureText ?? turn.final ?? turn.text.join('\n');
+    const text = failureText ?? latestReport(turn);
     // Failure text is bounded where it is produced; any failed-turn text is redacted here too.
     if (text) items.push({ type: 'agentMessage', text: status === 'failed' ? redactString(text) : text });
     if (turn.descendantsUnconfirmed && status === 'interrupted') items.push({ type: 'agentMessage', text: 'The worker process tree could not be ended as a whole, so only the worker process itself was terminated; tools it launched may still be running.' });
