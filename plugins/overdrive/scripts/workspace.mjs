@@ -150,6 +150,7 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - Implement the lane spec as the smallest coherent change that fully meets it, following repository conventions. Keep lane names, ownership notes and notes to other agents out of product files.
 - Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
 - Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. Updating an existing assertion that your change necessarily alters is part of the change. For quick feedback, run the existing checks closest to your change, not the full suite: lanes share this machine, and QA runs the full suite and any check that needs a harness (races, load, end-to-end journeys) in the lab. For broader verification of your own work, such as a differential comparison or fuzzing, run QA's suite for your lane with lab_run (lab_get lists the suites) instead of building your own harness, and ask \`qa\` when none covers it yet. Report failures outside your change instead of chasing them.
+- Before running checks, read the lab's ENVIRONMENT.md (your context packet names it), and send \`qa\` any environment fact you had to discover, so no other agent has to.
 - Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
 - ${TURN_END}
@@ -169,9 +170,10 @@ function qaAgentInstructions(root, agent) {
 
 You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
 
-- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Where expected results would otherwise come only from the spec, add an independent oracle when one exists: an established tool or reference implementation to compare against, or real-world inputs. Wrap the repository's own checks (build, lint, existing tests and the CI jobs that gate merges) as suites too, because lanes run only the checks nearest their change. When a check's runner is missing, look for an equivalent this machine can run before leaving the check out, and name in your handoff any check you leave out and any acceptance criterion or must-keep behavior in the lane specs that no suite exercises. The lab README describes the suite format.
+- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Where expected results would otherwise come only from the spec, add an independent oracle when one exists: an established tool or reference implementation to compare against, or real-world inputs. Wrap the repository's own checks (build, lint, existing tests and the CI jobs that gate merges) as suites too, because lanes run only the checks nearest their change; a wrapped test suite writes tests.json and runs on base in the same batch, so its runs are judged by regressions against base. When a check's runner is missing, look for an equivalent this machine can run before leaving the check out, and name in your handoff any check you leave out and any acceptance criterion or must-keep behavior in the lane specs that no suite exercises. The lab README describes the suite format and ENVIRONMENT.md, which you keep current, including with facts lanes send you.
 - Use browser and computer control where rendering or interaction matters, and check first what lanes said they could not verify themselves, such as rendering (feature agents have no browser), so those findings reach the lanes early. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
 - Run suites with lab_run; only runs the runtime executed are evidence. Your calls run one at a time, so pass independent runs together in \`batch\` (a suite sweep on an integration, or a control on base beside the lane it checks); keep benchmarks and other timing-sensitive suites, and suites that need a fixed port or another machine-wide resource such as a shared database, in a call of their own. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes. When a suite covering a lane first works while that lane is still in progress, tell it the suite's name, so it can run the suite itself with lab_run.
+- Fix a failing suite only for a technical fault in the suite, and say what changed. The spec decides expected outcomes; ask \`coordinator\` when it is silent. Never skip, loosen, or add retries or sleeps to turn a repro green; close its finding as wontfix with a note instead.
 - Build and test integration combinations with integration_build. Your handoff reaches the coordinator, so message \`coordinator\` only when it must act before your turn ends. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
 - When every lane you are verifying is ready, test one commit that combines them (an integration build, or a lane that merged the others) instead of each lane. Test a lane head on its own when it is ready well before the others, or to localize a failure.
@@ -321,7 +323,7 @@ function openFindingRows(db, row) {
 const OPEN_FINDING_COUNT = "SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'";
 
 function recentRuns(db, row, limit) {
-  return db.prepare('SELECT id, suite, target, status, exit_code, revision, created_by, created_at FROM lab_runs WHERE ? OR target = ? ORDER BY created_at DESC LIMIT ?')
+  return db.prepare('SELECT id, suite, target, status, exit_code, revision, created_by, created_at FROM lab_runs WHERE (? OR target = ?) AND mutant IS NULL ORDER BY created_at DESC LIMIT ?')
     .all(row.kind === 'qa' ? 1 : 0, row.slug, limit);
 }
 
@@ -377,7 +379,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
     : '';
   const agentLine = `Agent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}`;
   const notes = `\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}`;
-  const facts = `- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Pending agent requests: ${pending.length}\n`;
+  const facts = `- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Environment facts: ${contained(labPath(ctx.root), 'ENVIRONMENT.md')}\n- Pending agent requests: ${pending.length}\n`;
   const packet = qa
     ? qaPacket(ctx.db, feature, { agentLine, notes, workLines, findings, messages, facts })
     : `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\n${agentLine}\n${notes}\n## Work graph\n\n${workLines}\n\n## Open findings\n\n${findingLines(findings, false)}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Recent lab runs\n\n${runLines(recentRuns(ctx.db, feature, 10))}\n\n${legacyEvidence}## Live facts\n\n${facts}\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
@@ -552,6 +554,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - suites/<name>/suite.json: one runnable suite per directory. Names use lowercase letters, digits, - and _.
 - harness/: shared drivers (browser, API, CLI) that suites call.
 - fixtures/: shared test data.
+- ENVIRONMENT.md: facts QA verified on this machine, kept under about 3 KB: the install, build and test commands that work, failures known at base, and quirks such as toolchain versions, line endings and caches. Every agent's context packet names it, so record a fact there once instead of each agent rediscovering it.
 
 ## suite.json
 
@@ -572,14 +575,19 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - OVERDRIVE_REVISION: the commit under test.
 - OVERDRIVE_LAB: a runtime-owned checkout of this repository at the run's lab snapshot; the suite runs from it, never from this working tree.
 - OVERDRIVE_SUITE: the suite name.
-- OVERDRIVE_ARTIFACTS: an empty directory for this run's screenshots, logs and traces.
+- OVERDRIVE_ARTIFACTS: an empty directory for this run's screenshots, logs, traces and tests.json.
 - OVERDRIVE_PORT: a free TCP port on 127.0.0.1.
+
+## tests.json
+
+A suite that runs many tests, such as one wrapping the repository's own tests, writes its per-test results to $OVERDRIVE_ARTIFACTS/tests.json as {"<test id>": "passed|failed|error|skipped"}, converted from the runner's JUnit or TRX report by one converter the lab shares. A lane or integration run of such a suite is compared test by test with the latest base run of the same suite at the same lab snapshot, such as one in the same lab_run batch: vsBase lists regressions (tests that passed on base but not here, missing ones included) and fixed tests, or says why it is incomplete. The exit code stays the verdict; judge a suite that already fails on base by its regressions.
 
 ## Rules
 
 - Only lab_run produces evidence: the runtime runs the suite itself at an exact target revision and lab snapshot, and records the verdict, output and artifacts. A passing run resolves the open findings it is the repro suite for.
 - A lab_run call snapshots this working tree (tracked and unignored files, committed or not) when it starts, and its suites, harness and fixtures come from that snapshot, so edits made here during a run reach only later calls. Reach lab files through OVERDRIVE_LAB or paths relative to the suite, never through this directory's absolute path.
 - Keep suites deterministic: the same revision gives the same verdict. A suite whose verdict depends on timing or scheduling (concurrency, load, expiry) repeats its scenario within the run and reports how many repetitions passed.
+- Never let a runner retry a failing test until it passes, because a pass on retry exits 0: set retries to 0 (for Playwright, retries: 0 or --fail-on-flaky-tests). Rerun a failure that is not obviously deterministic once at the same revision before recording a finding; lab_get lists suites whose runs at one revision and lab snapshot both passed and failed as inconsistentVerdicts.
 - Set up dependencies in the target idempotently, for example install only when the lockfile hash changed, and prefer toolchains and browser builds already on this machine (for Playwright, a version whose browser is already in its cache) to new downloads. Ignored directories such as node_modules survive between runs in the same target checkout and in the same OVERDRIVE_LAB checkout. Ignored files in this working tree, such as a node_modules installed here, are not in the snapshot and runs never see them, so a suite that needs lab dependencies installs them into OVERDRIVE_LAB the same idempotent way; that install happens on the first run in each OVERDRIVE_LAB checkout (one per target and slot) and is kept after that.
 - Start every service a suite needs within the run, and stop it by its PID or process tree, never by image name, before the run ends.
 - Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host or leave those tests out and say so. For Node, a --require preload can rewrite every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1, but it must still bind synchronously, as Node's Server#_listen2 does: passing a host makes listen() resolve it asynchronously, and callers such as supertest read address() right after listen(0). Use OVERDRIVE_PORT.
@@ -587,7 +595,8 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Suites can run at the same time in separate checkouts (a batch, or other agents' runs), so at run time a suite writes only to OVERDRIVE_ARTIFACTS, its target checkout and ignored dependency directories in OVERDRIVE_LAB. The next run's sync discards anything else it leaves in OVERDRIVE_LAB.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
-- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Against a base that cannot pass at all, such as a new project's stub, a failure proves little and a slow suite wastes minutes there; break the property the suite checks with a mutant instead. Keep one-time checks of a suite itself, such as mutation runs, in a suite of their own, so reruns on lanes and integration stay fast.
+- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Against a base that cannot pass at all, such as a new project's stub, a failure proves little and a slow suite wastes minutes there; use mutants instead. Keep other one-time checks of a suite itself, such as a tool's negative control, in a suite of their own, so reruns on lanes and integration stay fast.
+- A mutant is a patch committed to the lab (made with git diff in a clone of the target) that breaks one property a suite checks. Pass its lab-relative path as mutant in lab_run: the runtime applies it to the target checkout, records the run as a mutant control and never as evidence about the target, and lab_get lists each mutant as killed (the suite failed) or survived. Write 2-5 intent-aware mutants per lane on changed lines the suite executes, and judge from the output whether a failure is a real kill or only a build error.
 - Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
 `;
 
@@ -600,6 +609,7 @@ export async function ensureLab(root) {
     if (await exists(lab)) throw new OverdriveError(`${lab} exists but is not a Git repository. Move it aside so OVERDRIVE can create the lab there.`, 'LAB_PATH_OCCUPIED');
     await fs.mkdir(lab);
     await atomicWrite(root, contained(lab, 'README.md'), LAB_README);
+    await atomicWrite(root, contained(lab, 'ENVIRONMENT.md'), '# Environment facts\n\n## Verified commands\n\n## Failures known at base\n\n## Machine quirks\n');
     await atomicWrite(root, contained(lab, '.gitignore'), 'node_modules/\n');
     await initializeRepository(root, lab, 'main', 'Initialize the OVERDRIVE lab');
     await ensureCommitIdentity(lab);
@@ -845,7 +855,7 @@ export async function listFeatures({ workspace_path, include_archived = false, r
   return await withContext(workspace_path, async ctx => {
     const features = [];
     const openFindings = ctx.db.prepare(OPEN_FINDING_COUNT);
-    const latestRun = ctx.db.prepare('SELECT id, suite, status, revision, created_at FROM lab_runs WHERE target = ? ORDER BY created_at DESC LIMIT 1');
+    const latestRun = ctx.db.prepare('SELECT id, suite, status, revision, created_at FROM lab_runs WHERE target = ? AND mutant IS NULL ORDER BY created_at DESC LIMIT 1');
     for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived) })) {
       const result = {
         ...summarizeFeature(ctx, recoverAgentState(ctx, feature)),

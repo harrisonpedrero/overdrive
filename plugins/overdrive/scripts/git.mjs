@@ -112,6 +112,8 @@ export async function resetIntegration(root, base, baseSource, builtHead, origin
   // rerere replays conflict resolutions an agent committed here, so a rebuild does not redo them.
   await git(clone, 'config', 'rerere.enabled', 'true');
   await git(clone, 'config', 'rerere.autoupdate', 'true');
+  // Conflict markers show the merge base's version too, which a resolver needs to see what each side changed.
+  await git(clone, 'config', 'merge.conflictStyle', 'zdiff3');
   await fetchCommit(clone, baseSource, base);
   // A fresh --no-checkout clone has an empty index, which only a forced checkout populates.
   await run(['git', ...runtimeGitConfig(root), 'checkout', '--detach', ...(fresh ? ['-f'] : []), base], { cwd: clone });
@@ -136,6 +138,30 @@ export async function mergeIntoIntegration(root, clone, source, commit, message)
     return [];
   }
   throw new OverdriveError(`Merging ${commit} into the integration clone failed: ${(merged.stderr || merged.stdout).slice(-4_000)}`, 'INTEGRATION_FAILED');
+}
+
+// The paths merging commit into head would conflict on, merged in memory so the clone's index, working tree and any
+// merge in progress stay untouched. Resolutions rerere recorded are not replayed here.
+export async function mergeConflicts(clone, source, head, commit) {
+  try {
+    await fetchCommit(clone, source, commit);
+    const result = await run(['git', 'merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', head, commit], { cwd: clone, rawOutput: true, allowFailure: true, timeoutMs: 60_000 });
+    // Exit 1 means conflicts only when a tree was written; merge-tree also exits 1 for commits it cannot merge.
+    const [tree, ...files] = result.stdout.split('\0');
+    if (result.timedOut || result.exitCode > 1 || !/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(result.timedOut ? 'it timed out' : result.stderr.trim().slice(-500) || `git merge-tree exited ${result.exitCode}`);
+    return { files: files.filter(Boolean) };
+  } catch (error) {
+    return { unavailable: `Previewing ${commit.slice(0, 12)} failed: ${redactString(error.message)}` };
+  }
+}
+
+// Applies a patch the lab snapshot holds to a synced lab target; the target's next sync restores it.
+export async function applyMutant(checkout, lab, labRevision, patch) {
+  const invalid = reason => new OverdriveError(`Mutant ${patch} ${reason}.`, 'MUTANT_INVALID');
+  if ((await run(['git', 'cat-file', '-e', `${labRevision}:${patch}`], { cwd: lab, allowFailure: true })).exitCode !== 0) throw invalid('is not a file in the lab snapshot');
+  const applied = await run(['git', 'apply', contained(lab, patch)], { cwd: checkout, allowFailure: true });
+  if (applied.exitCode !== 0) throw invalid(`does not apply to the target: ${redactString(applied.stderr).slice(-1_000)}`);
+  if (!(await run(['git', 'status', '--porcelain'], { cwd: checkout })).stdout) throw invalid('leaves the target unchanged');
 }
 
 // Keeps each command line well under Windows' 32,767-character limit.

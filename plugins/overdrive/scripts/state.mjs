@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { checkoutPath, labPath } from './git.mjs';
 import { OverdriveError, contained, ensureManagedPath, now, readJson, STATE_DIR, CONFIG_FILE } from './util.mjs';
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
 
@@ -164,6 +164,7 @@ function schema(db) {
       revision TEXT,
       lab_revision TEXT,
       lanes_json TEXT,
+      mutant TEXT,
       argv_json TEXT,
       cwd TEXT,
       exit_code INTEGER,
@@ -253,7 +254,7 @@ function migrate(db, currentVersion) {
       },
       candidates: { spec_revision: 'INTEGER NOT NULL DEFAULT -1', contract_hash: "TEXT NOT NULL DEFAULT ''" },
       // Runs recorded before membership was kept stay NULL, which means unknown.
-      lab_runs: { lanes_json: 'TEXT' },
+      lab_runs: { lanes_json: 'TEXT', mutant: 'TEXT' },
     };
     for (const [table, columns] of Object.entries(additions)) {
       const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(column => column.name));

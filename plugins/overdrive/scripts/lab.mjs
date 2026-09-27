@@ -4,10 +4,12 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import {
+  applyMutant,
   changesSinceMergeBase,
   committedChanges,
   integrationPath,
   isGitAncestor,
+  mergeConflicts,
   mergeIntoIntegration,
   mirrorPath,
   refreshMirror,
@@ -48,6 +50,8 @@ function suiteName(value, name = 'suite') {
 }
 
 const targetName = value => (value === 'integration' || value === 'base' ? value : safeSlug(value, 'target'));
+// applyMutant accepts only a file the lab snapshot holds, which keeps the path inside the lab.
+const mutantPath = value => optionalText(value, 'mutant', { max: 300 })?.replaceAll('\\', '/') ?? null;
 const agentName = value => (value === undefined || value === 'coordinator' ? 'coordinator' : safeSlug(value, 'from'));
 const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
 const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
@@ -179,10 +183,10 @@ function runTestedLane(row, slug) {
 }
 
 function presentRun(root, row, outputLog) {
-  const { argv_json: argv, artifacts_json: artifacts, lanes_json: _lanes, output, ...rest } = row;
+  const { argv_json: argv, artifacts_json: artifacts, lanes_json: _lanes, output, mutant, ...rest } = row;
   const files = parseJson(artifacts, []);
   return {
-    ...rest, lanes: runLanes(row), argv: parseJson(argv, []), outputTail: (output ?? '').slice(-4_000), ...(outputLog ? { outputLog } : {}),
+    ...rest, ...(mutant ? { mutant } : {}), lanes: runLanes(row), argv: parseJson(argv, []), outputTail: (output ?? '').slice(-4_000), ...(outputLog ? { outputLog } : {}),
     artifacts: { directory: runDirectory(root, row.id), count: files.length, files: files.slice(0, 50) },
   };
 }
@@ -206,8 +210,8 @@ async function integrationRunLanes(ctx, clone, revision) {
 }
 
 // A stopped build's recorded conflict; builds before later-lane advisories stored its files unredacted and without laterLanes.
-function recordedConflict({ feature, files, laterLanes }) {
-  return { feature, files: (files ?? []).slice(0, CONFLICT_FILE_LIMIT).map(redactString), ...(laterLanes ? { laterLanes } : {}) };
+function recordedConflict({ feature, files, laterLanes, laterConflicts }) {
+  return { feature, files: (files ?? []).slice(0, CONFLICT_FILE_LIMIT).map(redactString), ...(laterLanes ? { laterLanes } : {}), ...(laterConflicts ? { laterConflicts } : {}) };
 }
 
 // The recorded conflict still describes the clone only while its lane is pending on a HEAD built from the recorded base.
@@ -295,12 +299,12 @@ async function attachedFailure(ctx, finding, cache) {
   return result(null, 'ancestry_unverified');
 }
 
-async function labSnapshotTree(lab, revision, cache) {
+async function suiteTree(lab, revision, suite, cache) {
   if (!revision) return null;
-  const key = JSON.stringify([lab, revision]);
+  const key = JSON.stringify([lab, revision, suite]);
   if (!cache.trees.has(key)) cache.trees.set(key, (async () => {
     try {
-      const result = await run(['git', 'rev-parse', '--verify', `${revision}^{tree}`], { cwd: lab, allowFailure: true });
+      const result = await run(['git', 'rev-parse', '--verify', `${revision}:suites/${suite}`], { cwd: lab, allowFailure: true });
       return result.exitCode === 0 ? result.stdout.trim() : null;
     } catch { return null; }
   })());
@@ -317,27 +321,33 @@ function passingReason(finding, passingRun, failure) {
   return omitsFailedLanes(failure, runLanes(passingRun)) ? 'failed_lanes_omitted' : null;
 }
 
+// suiteChanged compares only the repro suite's own directory, because harness and fixture edits are routine.
 async function resolutionEvidence(ctx, finding, passingRun, lab, cache) {
   const failure = await attachedFailure(ctx, finding, cache);
   const failedLabRevision = failure.run?.status === 'failed' ? failure.run.lab_revision ?? null : null;
   const passing = passingReason(finding, passingRun, failure);
   const passingLabRevision = passing ? null : passingRun.lab_revision ?? null;
-  let labSnapshotChanged = null;
-  let labSnapshotReason = null;
-  if (failure.noFailingRun !== false) labSnapshotReason = 'no_verified_failure';
-  else if (passing) labSnapshotReason = passing;
-  else if (!failedLabRevision || !passingLabRevision) labSnapshotReason = 'revision_unavailable';
+  let suiteChanged = null;
+  let suiteChangedReason = null;
+  if (failure.noFailingRun !== false) suiteChangedReason = 'no_verified_failure';
+  else if (passing) suiteChangedReason = passing;
+  else if (!failedLabRevision || !passingLabRevision) suiteChangedReason = 'revision_unavailable';
   else {
     const [failedTree, passingTree] = await Promise.all([
-      labSnapshotTree(lab, failedLabRevision, cache), labSnapshotTree(lab, passingLabRevision, cache),
+      suiteTree(lab, failedLabRevision, finding.repro_suite, cache), suiteTree(lab, passingLabRevision, finding.repro_suite, cache),
     ]);
-    if (failedTree && passingTree) labSnapshotChanged = failedTree !== passingTree;
-    else labSnapshotReason = 'snapshot_unavailable';
+    if (failedTree && passingTree) suiteChanged = failedTree !== passingTree;
+    else suiteChangedReason = 'snapshot_unavailable';
   }
   return {
     finding: finding.id, noFailingRun: failure.noFailingRun, failureReason: failure.failureReason, passingReason: passing,
-    labSnapshotChanged, labSnapshotReason, failedLabRevision, passingLabRevision,
+    suiteChanged, suiteChangedReason, failedLabRevision, passingLabRevision,
   };
+}
+
+async function recordedResolutionEvidence(ctx, finding, lab, cache) {
+  const passingRun = ctx.db.prepare('SELECT id, suite, target, revision, lab_revision, lanes_json, status FROM lab_runs WHERE id = ?').get(finding.resolved_run);
+  return await resolutionEvidence(ctx, finding, passingRun, lab, cache);
 }
 
 // What a run tests, and the lanes it tests (null when unknown), whose findings its pass can resolve; base belongs to no lane.
@@ -353,12 +363,67 @@ async function runSubject(ctx, target, lane, requested, creator) {
   return { source, revision, features: await integrationRunLanes(ctx, source, revision) };
 }
 
-// An identical run (target, suite, revision, lanes and lab snapshot) that ended after this call arrived ran while
+// An identical run (target, suite, revision, lanes, lab snapshot and mutant) that ended after this call arrived ran while
 // it waited for the target's lock, so it answers this call too; one that ended earlier never does.
-function identicalRunSince(db, { target, suite, revision, lab_revision, lanes_json }, arrived) {
-  const row = db.prepare("SELECT * FROM lab_runs WHERE target = ? AND suite = ? AND revision = ? AND lab_revision = ? AND lanes_json IS ? AND status IN ('passed', 'failed') ORDER BY created_at DESC LIMIT 1")
-    .get(target, suite, revision, lab_revision, lanes_json);
+function identicalRunSince(db, { target, suite, revision, lab_revision, lanes_json, mutant }, arrived) {
+  const row = db.prepare("SELECT * FROM lab_runs WHERE target = ? AND suite = ? AND revision = ? AND lab_revision = ? AND lanes_json IS ? AND mutant IS ? AND status IN ('passed', 'failed') ORDER BY created_at DESC LIMIT 1")
+    .get(target, suite, revision, lab_revision, lanes_json, mutant);
   return row && Date.parse(row.created_at) + row.duration_ms >= arrived ? row : null;
+}
+
+const TEST_STATUSES = new Set(['passed', 'failed', 'error', 'skipped']);
+const TEST_LIST_LIMIT = 50;
+
+// A run's per-test results from the tests.json it wrote, or why they cannot be compared; missing when it wrote none.
+async function testResults(root, row) {
+  if (row.status !== 'passed' && row.status !== 'failed') return { incomplete: `run ${row.status}` };
+  if ((await fs.readFile(runLog(root, row.id), 'utf8').catch(() => '')).startsWith('[timed out')) return { incomplete: 'run timed out' };
+  let text;
+  try { text = await fs.readFile(path.join(runDirectory(root, row.id), 'tests.json'), 'utf8'); } catch (error) {
+    return error?.code === 'ENOENT' ? { missing: true, incomplete: 'no tests.json' } : { incomplete: 'tests.json unreadable' };
+  }
+  let tests = null;
+  try { tests = JSON.parse(text.replace(/^﻿/, '')); } catch { /* reported below */ }
+  const valid = tests && typeof tests === 'object' && !Array.isArray(tests) && Object.values(tests).every(status => TEST_STATUSES.has(status));
+  return valid ? { tests } : { incomplete: 'tests.json is not {"<test id>": "passed|failed|error|skipped"}' };
+}
+
+// A lane or integration run compared test by test with the latest base run of its suite at the same lab snapshot,
+// such as one in the same batch. A test that passed on base and is missing here counts as a regression.
+async function compareWithBase(ctx, row) {
+  if (row.target === 'base' || row.mutant) return null;
+  const base = ctx.db.prepare("SELECT id, status FROM lab_runs WHERE target = 'base' AND suite = ? AND lab_revision = ? AND mutant IS NULL AND status <> 'running' ORDER BY created_at DESC, id DESC LIMIT 1")
+    .get(row.suite, row.lab_revision);
+  if (!base) return null;
+  const [here, there] = await Promise.all([testResults(ctx.root, row), testResults(ctx.root, base)]);
+  if (here.missing && there.missing) return null;
+  if (!here.tests || !there.tests) {
+    return { baseRun: base.id, incomplete: [here.tests ? '' : `this run: ${here.incomplete}`, there.tests ? '' : `base: ${there.incomplete}`].filter(Boolean).join('; ') };
+  }
+  const lists = {
+    regressions: Object.keys(there.tests).filter(id => there.tests[id] === 'passed' && here.tests[id] !== 'passed'),
+    fixed: Object.keys(here.tests).filter(id => here.tests[id] === 'passed' && (there.tests[id] === 'failed' || there.tests[id] === 'error')),
+  };
+  const omitted = Object.fromEntries(Object.entries(lists).filter(([, ids]) => ids.length > TEST_LIST_LIMIT).map(([name, ids]) => [name, ids.length - TEST_LIST_LIMIT]));
+  return {
+    baseRun: base.id, regressions: lists.regressions.slice(0, TEST_LIST_LIMIT).map(redactString), fixed: lists.fixed.slice(0, TEST_LIST_LIMIT).map(redactString),
+    ...(Object.keys(omitted).length ? { omitted } : {}),
+  };
+}
+
+// Suites whose runs at one revision and lab snapshot both passed and failed, so neither verdict there stands alone.
+function inconsistentVerdicts(db, { suite = null, target = null, revision = null }) {
+  return db.prepare(`SELECT suite, revision, lab_revision AS labRevision, SUM(status = 'passed') AS passed, SUM(status = 'failed') AS failed FROM lab_runs
+    WHERE mutant IS NULL AND status IN ('passed', 'failed') AND (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) AND (? IS NULL OR revision = ?)
+    GROUP BY suite, revision, lab_revision HAVING passed > 0 AND failed > 0 ORDER BY MAX(created_at) DESC LIMIT 20`).all(suite, suite, target, target, revision, revision);
+}
+
+// Recorded mutant controls, latest first: a failing run killed its mutant and a passing one let it survive.
+function mutantRuns(db, { suite = null, target = null, revision = null }) {
+  return db.prepare(`SELECT id, suite, mutant, target, revision, status FROM lab_runs WHERE mutant IS NOT NULL AND status IN ('passed', 'failed')
+    AND (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) AND (? IS NULL OR revision = ?) ORDER BY created_at DESC, id DESC LIMIT 50`)
+    .all(suite, suite, target, target, revision, revision)
+    .map(({ id, status, ...mutant }) => ({ run: id, ...mutant, result: status === 'failed' ? 'killed' : 'survived' }));
 }
 
 function runSummary(root, row) {
@@ -382,9 +447,9 @@ function batchResponse(root, requests, results) {
 }
 
 // The single form is a batch of one.
-function labRequests({ suite, target, revision, batch }) {
-  if (batch === undefined) return [{ suite, target, revision }];
-  if (suite !== undefined || target !== undefined || revision !== undefined) throw new OverdriveError('Pass either suite, target and revision, or batch, not both.', 'INVALID_INPUT');
+function labRequests({ suite, target, revision, mutant, batch }) {
+  if (batch === undefined) return [{ suite, target, revision, mutant }];
+  if (suite !== undefined || target !== undefined || revision !== undefined || mutant !== undefined) throw new OverdriveError('Pass either suite, target, revision and mutant, or batch, not both.', 'INVALID_INPUT');
   if (!Array.isArray(batch) || batch.length < 1 || batch.length > 8) throw new OverdriveError('batch must list 1-8 runs.', 'INVALID_INPUT');
   return batch;
 }
@@ -392,7 +457,7 @@ function labRequests({ suite, target, revision, batch }) {
 const settle = promise => promise.then(value => ({ value }), error => ({ error }));
 
 // One run on a synced checkout in the given slot: reuse an identical run, or execute and record it.
-async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call) {
+async function runOnSlot(ctx, { name, target, lane, spec, mutant }, subject, slot, call) {
   const { source, revision: commit, features, uncommittedFiles } = subject;
   // Processes of a run whose termination is uncertain may still use its target and lab directories. Slugs never
   // contain --, so slot directories never collide with a lane's.
@@ -403,10 +468,11 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
   const details = target === 'integration' ? { included: features } : {};
   const notes = uncommittedFiles ? [`${target} has uncommitted changes that this run of its HEAD left out.`] : [];
   const lanesJson = features === null ? null : JSON.stringify(features);
-  const reused = identicalRunSince(ctx.db, { target, suite: name, revision: commit, lab_revision: labRevision, lanes_json: lanesJson }, call.arrived);
+  const reused = identicalRunSince(ctx.db, { target, suite: name, revision: commit, lab_revision: labRevision, lanes_json: lanesJson, mutant }, call.arrived);
   if (reused) return { row: reused, details: { reused: true, resolvedFindings: [], resolutionEvidence: [], ...details }, notes: ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes] };
   // The suite runs from the lab snapshot recorded as lab_revision, never from the live lab QA may be editing.
   const lab = await syncLabCheckout(ctx.root, 'snapshots', directory, call.lab, labRevision);
+  if (mutant) await applyMutant(checkout, lab, labRevision, mutant);
   const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
   const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
   await fs.mkdir(artifacts, { recursive: true });
@@ -417,7 +483,7 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
     OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
   };
   const row = {
-    id, suite: name, target, revision: commit, lab_revision: labRevision, lanes_json: lanesJson, argv_json: JSON.stringify(spec.argv), cwd,
+    id, suite: name, target, revision: commit, lab_revision: labRevision, lanes_json: lanesJson, mutant, argv_json: JSON.stringify(spec.argv), cwd,
     status: 'running', created_by: call.creator, created_at: now(),
   };
   ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
@@ -429,7 +495,8 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
     exit_code: result.exitCode, status: result.status, output: log.slice(-24_000),
     duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)),
   });
-  const resolvable = row.status === 'passed' ? await resolvableFindings(ctx, source, name, features, commit) : [];
+  // A mutant run tests the suite, not the target, so it never resolves a finding.
+  const resolvable = row.status === 'passed' && !mutant ? await resolvableFindings(ctx, source, name, features, commit) : [];
   const stamp = now();
   // A finding another run of this call resolved first stays credited to that run.
   const resolved = transaction(ctx.db, () => {
@@ -441,7 +508,7 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
     for (const finding of changed) withdrawFindingMessage(ctx.db, finding);
     return changed;
   });
-  if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
+  if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name}${mutant ? ` with mutant ${mutant}` : ''} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code, ...(mutant ? { mutant } : {}) } });
   const evidence = [];
   const evidenceCache = { ancestry: new Map(), trees: new Map() };
   for (const finding of resolved) {
@@ -488,9 +555,9 @@ async function runOnTarget(ctx, requests, call) {
 
 export async function runLabSuite({ workspace_path, batch, from, ...single }) {
   const requests = labRequests({ ...single, batch }).map(entry => ({
-    name: suiteName(entry?.suite), target: targetName(entry?.target), requested: optionalText(entry?.revision, 'revision', { max: 200 }),
+    name: suiteName(entry?.suite), target: targetName(entry?.target), requested: optionalText(entry?.revision, 'revision', { max: 200 }), mutant: mutantPath(entry?.mutant),
   }));
-  const keys = requests.map(({ name, target, requested }) => `${target} ${name} ${requested ?? ''}`);
+  const keys = requests.map(({ name, target, requested, mutant }) => `${target} ${name} ${requested ?? ''} ${mutant ?? ''}`);
   if (new Set(keys).size !== keys.length) throw new OverdriveError('Each run can appear once in a batch; to repeat a scenario, repeat it inside its suite.', 'INVALID_INPUT');
   const call = { creator: agentName(from), arrived: Date.now() };
   return await withContext(workspace_path, async ctx => {
@@ -510,6 +577,11 @@ export async function runLabSuite({ workspace_path, batch, from, ...single }) {
       group.forEach((request, index) => results.set(request, settled.error ? settled : settled.value[index]));
     }));
     const ordered = requests.map(request => results.get(request));
+    // Compared once every run has finished, so a base run in the same batch pairs with the others.
+    for (const { value } of ordered) {
+      const vsBase = value && await compareWithBase(ctx, value.row);
+      if (vsBase) value.details.vsBase = vsBase;
+    }
     if (batch !== undefined) return batchResponse(ctx.root, requests, ordered);
     if (ordered[0].error) throw ordered[0].error;
     return runResponse(ctx.root, ordered[0].value);
@@ -527,11 +599,11 @@ function knownRun(db, id, columns = '*') {
 // Pages by (created_at, id) descending, so runs recorded between pages or sharing a timestamp are never repeated or skipped.
 function runPage(db, { suite, target, before }) {
   const { id = null, created_at: at = null } = before ?? {};
-  const rows = db.prepare(`SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs
+  const rows = db.prepare(`SELECT id, suite, target, revision, mutant, status, exit_code, duration_ms, created_by, created_at FROM lab_runs
     WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
     ORDER BY created_at DESC, id DESC LIMIT ?`)
     .all(suite, suite, target, target, id, at, at, id, RUN_PAGE_SIZE + 1);
-  const runs = rows.slice(0, RUN_PAGE_SIZE);
+  const runs = rows.slice(0, RUN_PAGE_SIZE).map(({ mutant, ...run }) => (mutant ? { ...run, mutant } : run));
   return { runs, nextBeforeRun: rows.length > RUN_PAGE_SIZE ? runs.at(-1).id : null };
 }
 
@@ -563,10 +635,15 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
     }
     const before = beforeKey ? knownRun(ctx.db, beforeKey, 'id, created_at') : null;
     const lab = await ensureLab(ctx.root);
+    const filters = { suite: suiteFilter, target: targetFilter };
+    const inconsistent = inconsistentVerdicts(ctx.db, filters);
+    const mutants = mutantRuns(ctx.db, filters);
     const result = {
       lab,
       suites: await listSuites(ctx.root, lab),
-      ...await reconciledRunPage(ctx, { suite: suiteFilter, target: targetFilter, before }),
+      ...await reconciledRunPage(ctx, { ...filters, before }),
+      ...(inconsistent.length ? { inconsistentVerdicts: inconsistent } : {}),
+      ...(mutants.length ? { mutants } : {}),
       integration: await integrationStatus(ctx),
     };
     if (findings) {
@@ -577,9 +654,7 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
         .all(findings, ...(lanes ?? []));
       const evidenceCache = { ancestry: new Map(), trees: new Map() };
       for (const finding of rows) {
-        const passingRun = finding.resolved_run ? ctx.db.prepare('SELECT id, suite, target, revision, lab_revision, lanes_json, status FROM lab_runs WHERE id = ?').get(finding.resolved_run) : null;
-        finding.resolutionEvidence = finding.status === 'resolved' && finding.resolved_run
-          ? await resolutionEvidence(ctx, finding, passingRun, lab, evidenceCache) : null;
+        finding.resolutionEvidence = finding.status === 'resolved' && finding.resolved_run ? await recordedResolutionEvidence(ctx, finding, lab, evidenceCache) : null;
       }
       result.findings = rows;
     }
@@ -627,7 +702,7 @@ function reissueFindingMessage(db, finding, message, stamp) {
 
 // The latest failure of the suite that tested the lane, on its own target or in an integration known to include it.
 function latestLaneFailure(db, slug, suite) {
-  return db.prepare(`SELECT id FROM lab_runs WHERE suite = ? AND status = 'failed' AND (target = ?
+  return db.prepare(`SELECT id FROM lab_runs WHERE suite = ? AND status = 'failed' AND mutant IS NULL AND (target = ?
     OR (target = 'integration' AND EXISTS (SELECT 1 FROM json_each(lab_runs.lanes_json) WHERE value = ?)))
     ORDER BY created_at DESC, id DESC LIMIT 1`).get(suite, slug, slug)?.id ?? null;
 }
@@ -774,6 +849,23 @@ function laterLaneNote({ lanes, unavailable, complete }) {
   return notes;
 }
 
+// Later lanes that conflict when each is merged alone onto the build so far: HEAD, which a conflicted merge leaves in place.
+async function conflictPreview(clone, later) {
+  const head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
+  const conflicts = [];
+  for (const lane of later) {
+    const preview = await mergeConflicts(clone, lane.checkout, head, lane.revision);
+    if (preview.unavailable) conflicts.push({ feature: lane.slug, unavailable: preview.unavailable });
+    else if (preview.files.length) conflicts.push({ feature: lane.slug, files: preview.files.slice(0, CONFLICT_FILE_LIMIT).map(redactString) });
+  }
+  return conflicts;
+}
+
+function laterConflictNote(conflicts = []) {
+  const lanes = conflicts.filter(conflict => conflict.files).map(conflict => conflict.feature);
+  return lanes.length ? [`Later lanes ${lanes.join(', ')} would also conflict merged onto the build so far (conflict.laterConflicts, before any recorded resolution replays), so reconcile them in the same round rather than one build at a time.`] : [];
+}
+
 export async function buildIntegration({ workspace_path, features, base, from }) {
   if (!Array.isArray(features) || features.length < 1 || features.length > 50) throw new OverdriveError('features must list 1-50 lanes.', 'INVALID_INPUT');
   const requested = features.map(laneReference);
@@ -795,8 +887,10 @@ export async function buildIntegration({ workspace_path, features, base, from })
     for (const [index, lane] of lanes.entries()) {
       const files = await mergeIntoIntegration(ctx.root, clone, lane.checkout, lane.revision, `Integrate ${lane.slug} ${lane.revision.slice(0, 12)}`);
       if (!files.length) continue;
-      const laterLanes = await laterLaneAdvisory(clone, start.revision, lanes.slice(index + 1), files);
-      composition.conflict = { feature: lane.slug, files: files.slice(0, CONFLICT_FILE_LIMIT).map(redactString), laterLanes };
+      const later = lanes.slice(index + 1);
+      const laterLanes = await laterLaneAdvisory(clone, start.revision, later, files);
+      const laterConflicts = await conflictPreview(clone, later);
+      composition.conflict = { feature: lane.slug, files: files.slice(0, CONFLICT_FILE_LIMIT).map(redactString), laterLanes, ...(laterConflicts.length ? { laterConflicts } : {}) };
       break;
     }
     if (!composition.conflict) composition.head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
@@ -816,7 +910,7 @@ export async function buildIntegration({ workspace_path, features, base, from })
     } else if (composition.conflict) {
       notes.push(`The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`);
     }
-    if (composition.conflict) notes.push(...laterLaneNote(composition.conflict.laterLanes));
+    if (composition.conflict) notes.push(...laterConflictNote(composition.conflict.laterConflicts), ...laterLaneNote(composition.conflict.laterLanes));
     const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
     if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
     // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
@@ -923,23 +1017,55 @@ function remainingWorkNote(remaining) {
 // Every suite's latest verdict at the commit, so integrate cites what was actually run there.
 function latestRunsBySuite(ctx, commit) {
   const latest = new Map();
-  for (const row of ctx.db.prepare('SELECT id, suite, target, status FROM lab_runs WHERE revision = ? ORDER BY created_at DESC').all(commit)) {
+  for (const row of ctx.db.prepare('SELECT id, suite, target, status FROM lab_runs WHERE revision = ? AND mutant IS NULL ORDER BY created_at DESC').all(commit)) {
     if (!latest.has(row.suite)) latest.set(row.suite, row);
   }
   return [...latest.values()];
 }
 
-function evidenceGapsNote(runs, suitesNotRun) {
+// The latest runs with their per-test comparison against base and the mutant controls run at the same commit.
+async function deliveredRuns(ctx, commit) {
+  const runs = [];
+  for (const run of latestRunsBySuite(ctx, commit)) {
+    const vsBase = await compareWithBase(ctx, knownRun(ctx.db, run.id, 'id, suite, target, status, lab_revision, mutant'));
+    const mutants = mutantRuns(ctx.db, { suite: run.suite, revision: commit }).map(({ suite: _suite, revision: _revision, ...control }) => control);
+    runs.push({ ...run, ...(vsBase ? { vsBase } : {}), ...(mutants.length ? { mutants } : {}) });
+  }
+  return runs;
+}
+
+// Exact labels on the evidence behind a delivery; none of them blocks it.
+async function evidenceFlags(ctx, commit, lanes) {
+  const resolved = lanes.length
+    ? ctx.db.prepare(`SELECT * FROM findings WHERE status = 'resolved' AND resolved_run IS NOT NULL AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
+    : [];
+  const lab = await ensureLab(ctx.root);
+  const cache = { ancestry: new Map(), trees: new Map() };
+  const evidence = [];
+  for (const finding of resolved) evidence.push(await recordedResolutionEvidence(ctx, finding, lab, cache));
+  return {
+    inconsistent: [...new Set(inconsistentVerdicts(ctx.db, { revision: commit }).map(row => row.suite))],
+    suiteChanged: evidence.filter(item => item.suiteChanged).map(item => item.finding),
+    noFailingRun: evidence.filter(item => item.noFailingRun === true).map(item => item.finding),
+  };
+}
+
+function evidenceGapsNote(runs, suitesNotRun, flags) {
   const unpassed = runs.filter(run => run.status !== 'passed').map(run => run.suite);
+  const regressed = runs.filter(run => run.vsBase?.regressions?.length).map(run => run.suite);
   return [
     unpassed.length ? `The latest runs of ${unpassed.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '',
     suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it.` : '',
+    regressed.length ? `${regressed.join(', ')} regressed tests that passed on base (runs[].vsBase.regressions); report them whatever the exit code.` : '',
+    flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed at this commit with one lab snapshot, so neither verdict stands alone.` : '',
+    flags.suiteChanged.length ? `Findings ${flags.suiteChanged.join(', ')} were resolved after their repro suite changed since it failed: before reporting them fixed, read the suite's diff between failedLabRevision and passingLabRevision (lab_get {"findings": "all"}), and reopen any whose check was weakened.` : '',
+    flags.noFailingRun.length ? `Findings ${flags.noFailingRun.join(', ')} were resolved with no recorded failing run, so no run showed the defect before its fix.` : '',
   ].filter(Boolean).join(' ');
 }
 
 // An adopted repository is never published to; a tested commit with no open blocking findings is
 // delivered, and the user publishes it with the returned push command or fetches it into their own clone.
-async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes) {
+async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes, gaps) {
   const delivered = Boolean(passing) && !blocking.length;
   // The integration clone holds its commit only as a detached HEAD, which the next rebuild moves.
   await git(source, 'update-ref', `refs/overdrive/delivered/${commit}`, commit);
@@ -948,7 +1074,6 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   const ref = `${commit}:refs/heads/${branch ?? '<branch>'}`;
   const push = `git -C "${source}" push "${ctx.config.repository}" ${ref}`;
   const fetch = `git fetch "${source}" ${ref}`;
-  const gaps = evidenceGapsNote(runs, suitesNotRun);
   const exact = `target ${target} and revision ${commit.slice(0, 12)}`;
   const missing = [
     passing ? '' : `a passing lab_run of the relevant suites with ${exact}`,
@@ -968,21 +1093,22 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
 
 // A suite that has only run on base and passed there, such as a harness self-test, checks the lab rather than the lanes.
 async function suitesNotRunAt(ctx, runs) {
-  const baseOnly = new Set(ctx.db.prepare("SELECT suite FROM lab_runs GROUP BY suite HAVING SUM(target <> 'base') = 0 AND SUM(status = 'passed') > 0").all().map(row => row.suite));
+  const baseOnly = new Set(ctx.db.prepare("SELECT suite FROM lab_runs WHERE mutant IS NULL GROUP BY suite HAVING SUM(target <> 'base') = 0 AND SUM(status = 'passed') > 0").all().map(row => row.suite));
   return (await listSuites(ctx.root, await ensureLab(ctx.root))).map(suite => suite.name)
     .filter(name => !baseOnly.has(name) && !runs.some(run => run.suite === name));
 }
 
 async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   const changes = await committedChanges(source, base, commit);
-  const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
-  const runs = latestRunsBySuite(ctx, commit);
+  const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
+  const runs = await deliveredRuns(ctx, commit);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
+  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, commit, lanes));
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
   const managed = ctx.config.managedProject;
-  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes);
+  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes, gaps);
   if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
   if (blocking.length) {
     throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
@@ -1004,7 +1130,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   });
   const head = alreadyIncluded ? before.head : commit;
   const remaining = await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, runs }, project, head);
-  const next = [remainingWorkNote(remaining), evidenceGapsNote(runs, suitesNotRun)].filter(Boolean).join(' ');
+  const next = [remainingWorkNote(remaining), gaps].filter(Boolean).join(' ');
   return {
     integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, lanesDone: !remaining.length, ...(remaining.length ? { remainingWork: remaining } : {}),
     runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
