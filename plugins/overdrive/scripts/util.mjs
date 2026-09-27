@@ -203,7 +203,7 @@ function commandDescription(argv) {
 // named as terminationUncertain in a timed-out result or in the COMMAND_FAILED message; with
 // confirmTermination it rejects with COMMAND_TERMINATION_UNCERTAIN instead. Only this child's PID
 // is ever targeted, and never after it has exited.
-export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, combinedTail = false, allowFailure = false, rawOutput = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
+export async function run(argv, { cwd, env = process.env, input, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, combinedTail = false, allowFailure = false, rawOutput = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new OverdriveError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
@@ -228,8 +228,10 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       windowsHide: true,
       shell: false,
       detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
+    // A child that exits without reading its input closes the pipe; its exit code reports the failure.
+    if (input !== undefined) child.stdin.on('error', () => {}).end(input);
     let stdout = '';
     let stderr = '';
     let overflow = false;

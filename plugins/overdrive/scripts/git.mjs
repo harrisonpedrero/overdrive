@@ -1,6 +1,8 @@
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import {
   OverdriveError,
   contained,
@@ -156,10 +158,16 @@ export async function mergeConflicts(clone, source, head, commit) {
 }
 
 // Applies a patch the lab snapshot holds to a synced lab target; the target's next sync restores it.
+const execFileAsync = promisify(execFile);
+const PATCH_MAX_BYTES = 10 * 1024 * 1024;
+
 export async function applyMutant(checkout, lab, labRevision, patch) {
   const invalid = reason => new OverdriveError(`Mutant ${patch} ${reason}.`, 'MUTANT_INVALID');
-  if ((await run(['git', 'cat-file', '-e', `${labRevision}:${patch}`], { cwd: lab, allowFailure: true })).exitCode !== 0) throw invalid('is not a file in the lab snapshot');
-  const applied = await run(['git', 'apply', contained(lab, patch)], { cwd: checkout, allowFailure: true });
+  // The committed blob, not the snapshot checkout's copy, which line-ending settings such as core.autocrlf may have converted.
+  const bytes = await execFileAsync('git', ['cat-file', 'blob', `${labRevision}:${patch}`], { cwd: lab, encoding: 'buffer', maxBuffer: PATCH_MAX_BYTES, windowsHide: true })
+    .then(({ stdout }) => stdout, () => null);
+  if (!bytes) throw invalid('is not a file in the lab snapshot');
+  const applied = await run(['git', 'apply', '-'], { cwd: checkout, input: bytes, allowFailure: true });
   if (applied.exitCode !== 0) throw invalid(`does not apply to the target: ${redactString(applied.stderr).slice(-1_000)}`);
   if (!(await run(['git', 'status', '--porcelain'], { cwd: checkout })).stdout) throw invalid('leaves the target unchanged');
 }
