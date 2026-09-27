@@ -32,7 +32,6 @@ A QA agent is a lane row with `kind = 'qa'` whose checkout is `lab/`, so it shar
     lab/runs/<id>/artifacts/
     lab/integration/        the integration clone
   features/<slug>/
-    AGENTS.md               the generated feature-agent contract
     repo/                   a full, independent clone on feature/<slug>
   lab/                      QA & integration lab: a local Git repository, never pushed
   project/                  managed canonical repository (project_create only)
@@ -48,6 +47,7 @@ The profile comes from the agent's recorded `kind`, never from a tool argument.
 | --- | --- | --- |
 | Working directory | `features/<slug>/repo` | `lab/` |
 | Additional roots | its context packet | every lane checkout, `.overdrive/lab`, its context packet |
+| File tool writes | its checkout | `lab/` and the integration clone |
 | OVERDRIVE worker tools | `message_send`, `lanes`, `lab_get`, `lab_run` (its own lane only) | the same on any target, plus `finding_record` and `integration_build` |
 | Browser and computer control | denied | allowed |
 | Publishing | denied | denied |
@@ -56,19 +56,21 @@ The profile comes from the agent's recorded `kind`, never from a tool argument.
 
 **Worker-mode server.** Each worker session gets its own copy of `server.mjs` with `OVERDRIVE_AGENT=<slug>` and `OVERDRIVE_WORKSPACE=<root>`. It lists only the tools that agent's kind may call and refuses others with `WORKER_TOOL_FORBIDDEN`. Workers also get `OVERDRIVE_WORKER=1`, which leaves any copy of the coordinator plugin they load with no tools, and the coordinator plugin is disabled in their host.
 
-**Permission policy.** `workerToolDecision` in `worker-policy.mjs` answers every tool call a worker's host would otherwise prompt for, in both harnesses:
+**Permission policy.** `workerToolDecision` in `worker-policy.mjs` is the one policy both harnesses apply, to every Claude tool call and every Codex escalation:
 
 1. Deny OVERDRIVE coordinator tools (plugin copies, or `overdrive` tools beyond the worker set).
 2. For the feature profile, deny MCP tools whose server name matches `chrome|browser|computer|playwright|puppeteer|cua_repl`.
 3. For every profile, deny shell commands whose text publishes: `git push` (with any options, including `subtree push`), `gh pr` and `gh issue` subcommands that write (such as `create`, `merge`, `edit`, `comment`, `review`, `close`; reads such as `view`, `list` and `diff` stay allowed), `gh release`, `gh repo create`, `gh api` with a writing method, `npm|pnpm|yarn|cargo publish`, `dotnet nuget push`, `twine upload`, `docker push`.
-4. For every profile, deny writes to Git configuration outside the repository: `git config` with `--global` or `--system` (reads such as `--get` and `--list` stay allowed) and edits of a `.gitconfig` file. A worker once renamed the user's global Git identity.
-5. Allow everything else.
+4. For every profile, deny `git config` with `--global` or `--system`; reads such as `--get` and `--list` stay allowed. A worker once renamed the user's global Git identity.
+5. Deny a file tool write (Claude's `Write`, `Edit`, `MultiEdit`, `NotebookEdit`; a Codex patch) to any path outside the agent's write roots and the OS temp directory, or inside a `.git` directory. A feature agent writes only in its checkout, so not in `lab/`, another lane or `~/.gitconfig`; a QA agent writes in `lab/` and the integration clone, not in lane checkouts. Shell commands are not path-checked.
+6. Deny any other call Claude Code flags as a safety check (a protected path or a destructive command).
+7. Allow everything else.
 
 Each denial is appended to the turn's handoff.
 
-**Claude harness.** Each turn is one `claude -p` stream-json process resumed by session ID, with the contract appended to the system prompt. It runs with `--permission-mode <claude.permissionMode> --permission-prompt-tool stdio`, so prompted calls arrive as `can_use_tool` control requests that the policy answers. `--mcp-config` injects the worker server. `--settings` disables the coordinator plugin and adds a `PreToolUse` hook that applies the same policy to every tool call, including calls a permission mode or allow rule approves. Feature agents get `--no-chrome` plus deny rules for the browser and computer-control servers; QA agents get `--chrome`. Every worker gets a deny rule for `ScheduleWakeup`, because the process exits when the turn ends. Auto-memory is off. On Windows the process tree runs inside a kill-on-close Job Object, so a turn's completion covers the tools it launched.
+**Claude harness.** Each turn is one `claude -p` stream-json process resumed by session ID, with the contract appended to the system prompt. It runs with `--permission-mode <claude.permissionMode> --permission-prompt-tool stdio`, so prompted calls arrive as `can_use_tool` control requests that the policy answers. `--mcp-config` injects the worker server. `--settings` disables the coordinator plugin, adds a `PreToolUse` hook that applies the same policy, with the agent's write roots, to every tool call, including calls a permission mode or allow rule approves, and sets `disableAllHooks: false`, which outranks a repository's own settings. A prompted call Claude Code types `safetyCheck` passes only as a file write the path rule vetted. Feature agents get `--no-chrome` plus deny rules for the browser and computer-control servers; QA agents get `--chrome`. Every worker gets a deny rule for `ScheduleWakeup`, because the process exits when the turn ends. Auto-memory is off. On Windows the process tree runs inside a kill-on-close Job Object, so a turn's completion covers the tools it launched.
 
-**Codex harness.** There is one app-server process per profile. The coordinator plugin and skill MCP dependency installs are disabled; for feature agents, the browser, computer-use and in-app browser features and the bundled browser and computer plugins are disabled too. Per thread, MCP servers the profile denies are replaced by disabled stand-ins, and the worker server is injected as `overdrive`. Threads run in the `workspace-write` sandbox with network access and approval policy `untrusted`. The runtime answers command, file-change and permission escalations with the policy; questions and MCP elicitations reach the coordinator as pending requests.
+**Codex harness.** There is one app-server process per profile. The coordinator plugin and skill MCP dependency installs are disabled; for feature agents, the browser, computer-use and in-app browser features and the bundled browser and computer plugins are disabled too. Per thread, MCP servers the profile denies are replaced by disabled stand-ins, and the worker server is injected as `overdrive`. Threads run in the `workspace-write` sandbox with network access and approval policy `untrusted`. The runtime answers command, file-change and permission escalations with the policy; under `untrusted` every patch asks first, and the policy checks the paths its `item/started` named. Questions and MCP elicitations reach the coordinator as pending requests.
 
 ## Message delivery
 
@@ -119,4 +121,4 @@ Nothing else is enforced: the work graph is checked only for valid keys and cycl
 - State writes use cross-process workspace locks and SQLite transactions, and agent-state writes are fenced by the owning controller's token.
 - Initialization never runs repository setup scripts. Runtime Git commands run with hooks disabled and commit signing off.
 - Reasoning notifications, thinking blocks and tool results are discarded; a running tool call is held in memory only, as its name and a short redacted label. Messages, handoffs, request payloads and run output are redacted before storage.
-- The permission policy is a capability boundary, not a sandbox. On Claude its hook sees every tool call, but Claude Code runs the call anyway if the hook process cannot start or times out, or if settings turn hooks off (`disableAllHooks`, managed `allowManagedHooksOnly`). On Codex it sees only escalations. It matches publication by command text, so publishing through another route (a script, an HTTP client) is not caught. Claude workers' shell and file tools are not filesystem- or network-contained. Codex workers start in the `workspace-write` sandbox, but the runtime approves every escalation the policy does not deny.
+- The permission policy is a capability boundary, not a sandbox. Workers run repository code and its Claude project configuration with the user's privileges, and the policy holds whatever those settings allow. On Claude its hook sees every tool call and a repository's `disableAllHooks` cannot turn it off, but Claude Code runs the call anyway if the hook process cannot start or times out, or if managed settings turn hooks off (`disableAllHooks`, `allowManagedHooksOnly`). On Codex it sees only escalations. It matches publication by command text, so publishing through another route (a script, an HTTP client) is not caught, and it checks only file tools' paths, so a shell command can still write anywhere the user can. Claude workers' shell tools are not filesystem- or network-contained. Codex workers start in the `workspace-write` sandbox, but the runtime approves every escalation the policy does not deny.

@@ -322,6 +322,7 @@ function sessionParams(runtime) {
     threadId: runtime.feature.thread_id,
     cwd: runtime.cwd,
     runtimeWorkspaceRoots: runtime.roots,
+    writeRoots: runtime.writeRoots,
     developerInstructions: runtime.developerInstructions,
     workerServer: workerServer(runtime.root, runtime.feature.slug),
   };
@@ -679,9 +680,9 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
 }
 
 // On a timeout an agent is reported by where it stands, never by its previous handoff.
-function progressRow({ feature: { slug, status, agent }, git: { head, changedFileCount, unavailable }, liveProgress, warning }) {
+function progressRow({ feature: { slug, status, agent, spend }, git: { head, changedFileCount, unavailable }, liveProgress, warning }) {
   return {
-    feature: { slug, status, agent: { status: agent.status, activeTurnId: agent.activeTurnId, usage: agent.usage } },
+    feature: { slug, status, agent: { status: agent.status, activeTurnId: agent.activeTurnId }, ...(spend ? { spend } : {}) },
     git: { head, changedFileCount, unavailable },
     liveProgress: { message: liveProgress.message && clipTail(liveProgress.message, 800), running: liveProgress.running },
     ...(warning ? { warning } : {}),
@@ -753,7 +754,9 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
     const handoffs = await Promise.all(selected.map(async feature => {
       const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true, committed_changes: signal });
       if (!signal) return progressRow(state);
-      return { feature: state.feature, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
+      // Wait rows carry the lane's compact spend; agent_inspect has the session's per-turn usage.
+      const { usage: _usage, ...agent } = state.feature.agent;
+      return { feature: { ...state.feature, agent }, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
     }));
     // A lane handed off at rest is done until its next turn; one started during this wait stays pending.
     // A timeout hands nothing off, so a turn that ends just after it is returned by the next wait.
