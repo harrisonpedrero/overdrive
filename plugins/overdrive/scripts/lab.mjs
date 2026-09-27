@@ -451,6 +451,8 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
         ...changes,
         updated_at: stamp,
       };
+      // Text inherited from an older row is redacted too, so an update never carries a stored secret forward.
+      for (const field of ['title', 'body', 'note']) if (finding[field] != null) finding[field] = redactString(finding[field]);
       const opened = finding.status === 'open' && existing?.status !== 'open';
       // A new or reopened finding is judged from the lane's current head and latest failure, and a coordinator's resolution records where it was judged.
       if (opened) Object.assign(finding, { found_revision: head, found_run: null, resolved_revision: null, resolved_run: null });
@@ -463,14 +465,14 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
       ctx.db.prepare(`INSERT OR REPLACE INTO findings(${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`).run(...columns.map(column => finding[column] ?? null));
       if (opened) {
         const foundRun = finding.found_run ? ctx.db.prepare('SELECT id, target, revision FROM lab_runs WHERE id = ?').get(finding.found_run) : null;
-        ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, findingMessage(finding, sender, foundRun, integrationPath(ctx.root)), stamp);
+        ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, redactString(findingMessage(finding, sender, foundRun, integrationPath(ctx.root))), stamp);
       } else if (existing?.status === 'open' && finding.status !== 'open') withdrawFindingMessage(ctx.db, finding);
       return { finding, existing, opened };
     });
     await addEvent(ctx, {
       featureId: lane.id,
       kind: existing ? 'finding.updated' : 'finding.recorded',
-      summary: `Finding ${finding.id} ${finding.status} (${finding.severity}): ${finding.title}`,
+      summary: redactString(`Finding ${finding.id} ${finding.status} (${finding.severity}): ${finding.title}`),
       details: { finding: finding.id, status: finding.status, severity: finding.severity, reproSuite: finding.repro_suite ?? null, from: sender, messaged: opened },
     });
     return { finding, messagedLane: opened };
