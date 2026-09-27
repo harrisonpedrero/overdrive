@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import {
+  changesSinceMergeBase,
   committedChanges,
   integrationPath,
   isGitAncestor,
@@ -686,6 +687,40 @@ async function laneRevision(checkout, ref) {
   return { revision: head, ...(clean ? {} : { uncommittedFiles: changedFileCount }) };
 }
 
+const CONFLICT_FILE_LIMIT = 200;
+const ADVISORY_PATH_LIMIT = 20;
+// Shared by every later lane's comparison, so the advisory cannot hold up the conflict it describes.
+const ADVISORY_TIME_LIMIT_MS = 60_000;
+
+// Later lanes whose captured commit changed a conflict path since its merge base with the build base: a fact about
+// trees, not a predicted conflict, and a lane's tree includes what it inherits. Paths are compared raw and redacted here.
+async function laterLaneAdvisory(clone, base, later, files) {
+  const compared = files.slice(0, CONFLICT_FILE_LIMIT);
+  const deadline = Date.now() + ADVISORY_TIME_LIMIT_MS;
+  const lanes = [];
+  const unavailable = [];
+  const omitted = {};
+  for (const lane of later) {
+    const result = await changesSinceMergeBase(clone, lane.checkout, base, lane.revision, compared, deadline);
+    if (result.unavailable) unavailable.push({ slug: lane.slug, revision: lane.revision, reason: result.unavailable });
+    else if (result.paths.length) {
+      lanes.push({ slug: lane.slug, revision: lane.revision, mergeBase: result.mergeBase, paths: result.paths.slice(0, ADVISORY_PATH_LIMIT).map(redactString) });
+      if (result.paths.length > ADVISORY_PATH_LIMIT) omitted.paths = (omitted.paths ?? 0) + result.paths.length - ADVISORY_PATH_LIMIT;
+    }
+  }
+  if (files.length > compared.length) omitted.conflictPaths = files.length - compared.length;
+  const capped = Object.keys(omitted).length > 0;
+  return { complete: !unavailable.length && !capped, lanes, unavailable, ...(capped ? { omitted } : {}) };
+}
+
+function laterLaneNote({ lanes, unavailable, complete }) {
+  const notes = [];
+  if (lanes.length) notes.push(`Later lanes ${lanes.map(lane => lane.slug).join(', ')} also changed conflicting files since their merge base with the build base (laterLanes.lanes), including changes a lane inherits, so they may need reconciling together.`);
+  if (unavailable.length) notes.push(`Later lanes ${unavailable.map(lane => lane.slug).join(', ')} could not be compared (laterLanes.unavailable).`);
+  if (!complete && !unavailable.length) notes.push('laterLanes is capped; omitted counts what it leaves out.');
+  return notes;
+}
+
 export async function buildIntegration({ workspace_path, features, base, from }) {
   if (!Array.isArray(features) || features.length < 1 || features.length > 50) throw new OverdriveError('features must list 1-50 lanes.', 'INVALID_INPUT');
   const requested = features.map(laneReference);
@@ -704,9 +739,12 @@ export async function buildIntegration({ workspace_path, features, base, from })
     // Recorded before merging, so a failed build never leaves an older composition describing this clone.
     const composition = { base: start.revision, features: lanes.map(({ checkout, ...lane }) => lane), head: null, built_at: now() };
     meta(ctx.db, 'integration', JSON.stringify(composition));
-    for (const lane of lanes) {
+    for (const [index, lane] of lanes.entries()) {
       const files = await mergeIntoIntegration(ctx.root, clone, lane.checkout, lane.revision, `Integrate ${lane.slug} ${lane.revision.slice(0, 12)}`);
-      if (files.length) { composition.conflict = { feature: lane.slug, files: files.slice(0, 200) }; break; }
+      if (!files.length) continue;
+      const laterLanes = await laterLaneAdvisory(clone, start.revision, lanes.slice(index + 1), files);
+      composition.conflict = { feature: lane.slug, files: files.slice(0, CONFLICT_FILE_LIMIT).map(redactString), laterLanes };
+      break;
     }
     if (!composition.conflict) composition.head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
     meta(ctx.db, 'integration', JSON.stringify(composition));
@@ -725,6 +763,7 @@ export async function buildIntegration({ workspace_path, features, base, from })
     } else if (composition.conflict) {
       notes.push(`The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`);
     }
+    if (composition.conflict) notes.push(...laterLaneNote(composition.conflict.laterLanes));
     const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
     if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
     // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
