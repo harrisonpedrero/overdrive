@@ -99,7 +99,7 @@ export class CodexAppServer extends EventEmitter {
     this.pending = new Map();
     this.serverRequests = new Map();
     this.denials = new Map();
-    this.writeRoots = new Map();
+    this.writeScopes = new Map();
     this.patchPaths = new Map();
   }
 
@@ -186,19 +186,24 @@ export class CodexAppServer extends EventEmitter {
         if (this.serverRequests.get(key)?.params.threadId === message.params?.threadId) this.serverRequests.delete(key);
       }
       if (message.method === 'item/started' && message.params?.item?.type === 'fileChange') this.patchPaths.set(message.params.item.id, patchTargets(message.params.item));
+      // With streamed patch events, item/started may name only the files known so far.
+      if (message.method === 'item/fileChange/patchUpdated') {
+        const { itemId } = message.params ?? {};
+        this.patchPaths.set(itemId, [...new Set([...(this.patchPaths.get(itemId) ?? []), ...patchTargets(message.params)])]);
+      }
       if (message.method === 'item/completed') this.patchPaths.delete(message.params?.item?.id);
       if (message.method === 'turn/completed') this.#attachDenials(message.params);
       if (message.method) this.emit('notification', { method: message.method, params: message.params ?? {} });
     }
   }
 
-  // A file-change approval request is checked against the files its earlier item/started named; a patch Codex
+  // A file-change approval request is checked against the files its earlier item/started and patch updates named; a patch Codex
   // applies without a request, such as under preapproved permissions or a cached approval, is not seen here.
   #answerByPolicy({ id, method, params = {} }) {
     const approval = POLICY_APPROVALS[method];
     if (!approval) return false;
     const input = method === 'item/fileChange/requestApproval' ? { file_paths: this.patchPaths.get(params.itemId) } : params;
-    const { allow } = workerToolDecision(this.profile, approval.tool, input, { writeRoots: this.writeRoots.get(params.threadId) ?? null });
+    const { allow } = workerToolDecision(this.profile, approval.tool, input, this.writeScopes.get(params.threadId));
     if (!allow) this.denials.set(params.turnId, [...(this.denials.get(params.turnId) ?? []), approval.tool]);
     if (this.child?.stdin?.writable) this.child.stdin.write(`${JSON.stringify({ id, result: approval.answer(allow, params) })}\n`);
     return true;
@@ -264,7 +269,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   // Thread config needs the denied-server inventory, which is taken when the app-server starts.
-  async startThread({ cwd, runtimeWorkspaceRoots, writeRoots, developerInstructions, workerServer, model = 'gpt-6-sol', effort = 'high' }) {
+  async startThread({ cwd, runtimeWorkspaceRoots, writeRoots, workspaceRoot, developerInstructions, workerServer, model = 'gpt-6-sol', effort = 'high' }) {
     await this.#ready();
     const response = await this.request('thread/start', {
       cwd,
@@ -277,13 +282,13 @@ export class CodexAppServer extends EventEmitter {
       personality: 'pragmatic',
       ephemeral: false,
     });
-    this.writeRoots.set(response.thread.id, writeRoots);
+    this.writeScopes.set(response.thread.id, { writeRoots, workspaceRoot });
     return { ...response, requestedEffort: effort };
   }
 
-  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, writeRoots, developerInstructions, workerServer, model = 'gpt-6-sol' }) {
+  async resumeThread({ threadId, cwd, runtimeWorkspaceRoots, writeRoots, workspaceRoot, developerInstructions, workerServer, model = 'gpt-6-sol' }) {
     await this.#ready();
-    this.writeRoots.set(threadId, writeRoots);
+    this.writeScopes.set(threadId, { writeRoots, workspaceRoot });
     return await this.request('thread/resume', {
       threadId,
       cwd,

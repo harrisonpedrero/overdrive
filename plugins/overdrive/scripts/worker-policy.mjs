@@ -1,8 +1,10 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER_SCRIPT = fileURLToPath(new URL('./server.mjs', import.meta.url));
+const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 // The agent kinds that may call each tool of the worker-mode server.
 export const WORKER_TOOLS = Object.freeze({
@@ -42,12 +44,19 @@ function inside(target, root) {
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-// A file tool may write only inside the agent's write roots or the OS temp directory, and never in a .git directory.
-function writesOutsideRoots(input, writeRoots) {
+// The OS temp directory by its given and its real path, which differ on macOS (/var is /private/var).
+function tempDirectories() {
+  try { return [os.tmpdir(), fs.realpathSync.native(os.tmpdir())]; } catch { return [os.tmpdir()]; }
+}
+
+// A file tool may write only inside the agent's write roots, or in the OS temp directory outside the workspace and this
+// plugin, either of which can lie inside it, and never in a .git directory.
+function writesOutsideRoots(input, writeRoots, workspaceRoot) {
   const targets = [input?.file_path, input?.notebook_path, ...(Array.isArray(input?.file_paths) ? input.file_paths : [])].filter(value => value !== undefined);
   if (!targets.length || targets.some(value => typeof value !== 'string' || !value)) return true;
-  const roots = [...writeRoots, os.tmpdir()].map(comparablePath);
-  return targets.map(comparablePath).some(target => target.split(path.sep).includes('.git') || !roots.some(root => inside(target, root)));
+  const within = (target, roots) => roots.some(root => inside(target, comparablePath(root)));
+  const allowed = target => within(target, writeRoots) || (within(target, tempDirectories()) && !within(target, [workspaceRoot, PLUGIN_ROOT].filter(Boolean)));
+  return targets.map(comparablePath).some(target => target.split(path.sep).includes('.git') || !allowed(target));
 }
 
 // Git configuration outside the repository is the user's (a worker once renamed the user's global identity); reads stay allowed.
@@ -67,9 +76,10 @@ export function workerServer(root, slug) {
 }
 
 // The one permission policy both worker harnesses apply to tool calls. writeRoots are the directories the
-// agent's file tools may write in; safetyCheck marks a call Claude Code flagged as touching a protected
-// path or running a destructive command, which only a file write the path rule vetted may pass.
-export function workerToolDecision(profile, toolName, input, { writeRoots = null, safetyCheck = false } = {}) {
+// agent's file tools may write in, and workspaceRoot the OVERDRIVE workspace; safetyCheck marks a call Claude
+// Code flagged as touching a protected path or running a destructive command, which only a file write the
+// path rule vetted may pass.
+export function workerToolDecision(profile, toolName, input, { writeRoots = null, workspaceRoot = null, safetyCheck = false } = {}) {
   const name = String(toolName ?? '');
   const server = /^mcp__(.+?)__/.exec(name)?.[1];
   if (server && (/^plugin_(?:overdrive|feature-theater)_/.test(server) || server === 'feature_theater' || (server === 'overdrive' && !Object.hasOwn(WORKER_TOOLS, name.slice('mcp__overdrive__'.length))))) {
@@ -79,7 +89,7 @@ export function workerToolDecision(profile, toolName, input, { writeRoots = null
   if (typeof input?.command === 'string' && PUBLISH_COMMAND.test(input.command)) return deny("Publishing needs the user's authority; ask the coordinator.");
   if (writesUserGitConfig(input)) return deny('Global and system Git configuration belongs to the user; use repository-local git config instead.');
   const vetsPaths = writeRoots && FILE_WRITES.has(name);
-  if (vetsPaths && writesOutsideRoots(input, writeRoots)) {
+  if (vetsPaths && writesOutsideRoots(input, writeRoots, workspaceRoot)) {
     return deny(`File tools may write only under ${writeRoots.join(', ')} or the temp directory, and never inside .git; ask the agent that owns the path with message_send.`);
   }
   if (safetyCheck && !vetsPaths) return deny('Claude Code flagged this call as touching a protected path or running a destructive command; ask the coordinator with message_send.');

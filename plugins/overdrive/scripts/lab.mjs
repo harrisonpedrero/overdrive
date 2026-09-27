@@ -393,15 +393,17 @@ async function testResults(root, row) {
   return valid ? { tests } : { incomplete: 'tests.json is not {"<test id>": "passed|failed|error|skipped"}' };
 }
 
-// A lane or integration run compared test by test with the latest base run of its suite at the same lab snapshot,
-// such as one in the same batch. A test that passed on base and is missing here counts as a regression.
-async function compareWithBase(ctx, row) {
-  if (row.target === 'base' || row.mutant) return null;
-  const base = ctx.db.prepare("SELECT id, status FROM lab_runs WHERE target = 'base' AND suite = ? AND lab_revision = ? AND mutant IS NULL AND status <> 'running' ORDER BY created_at DESC, id DESC LIMIT 1")
-    .get(row.suite, row.lab_revision);
+// A lane or integration run compared test by test with the latest base run of its suite at the same lab snapshot, such as
+// one in the same batch, and at baseRevision, where the lane or the build started. A test that passed on base and is
+// missing here counts as a regression.
+async function compareWithBase(ctx, row, baseRevision) {
+  if (row.target === 'base' || row.mutant || !baseRevision) return null;
+  const base = ctx.db.prepare("SELECT id, status, revision FROM lab_runs WHERE target = 'base' AND suite = ? AND lab_revision = ? AND mutant IS NULL AND status <> 'running' ORDER BY revision = ? DESC, created_at DESC, id DESC LIMIT 1")
+    .get(row.suite, row.lab_revision, baseRevision);
   if (!base) return null;
   const [here, there] = await Promise.all([testResults(ctx.root, row), testResults(ctx.root, base)]);
   if (here.missing && there.missing) return null;
+  if (base.revision !== baseRevision) return { baseRun: base.id, incomplete: `base ran at ${base.revision.slice(0, 12)}, not at ${baseRevision.slice(0, 12)} where this run's subject started` };
   if (!here.tests || !there.tests) {
     return { baseRun: base.id, incomplete: [here.tests ? '' : `this run: ${here.incomplete}`, there.tests ? '' : `base: ${there.incomplete}`].filter(Boolean).join('; ') };
   }
@@ -410,8 +412,10 @@ async function compareWithBase(ctx, row) {
     fixed: Object.keys(here.tests).filter(id => here.tests[id] === 'passed' && (there.tests[id] === 'failed' || there.tests[id] === 'error')),
   };
   const omitted = Object.fromEntries(Object.entries(lists).filter(([, ids]) => ids.length > TEST_LIST_LIMIT).map(([name, ids]) => [name, ids.length - TEST_LIST_LIMIT]));
+  // An empty regressions list is itself the fact a report cites; an empty fixed list says nothing.
   return {
-    baseRun: base.id, regressions: lists.regressions.slice(0, TEST_LIST_LIMIT).map(redactString), fixed: lists.fixed.slice(0, TEST_LIST_LIMIT).map(redactString),
+    baseRun: base.id, regressions: lists.regressions.slice(0, TEST_LIST_LIMIT).map(redactString),
+    ...(lists.fixed.length ? { fixed: lists.fixed.slice(0, TEST_LIST_LIMIT).map(redactString) } : {}),
     ...(Object.keys(omitted).length ? { omitted } : {}),
   };
 }
@@ -585,8 +589,9 @@ export async function runLabSuite({ workspace_path, batch, from, ...single }) {
     }));
     const ordered = requests.map(request => results.get(request));
     // Compared once every run has finished, so a base run in the same batch pairs with the others.
-    for (const { value } of ordered) {
-      const vsBase = value && await compareWithBase(ctx, value.row);
+    const buildBase = parseJson(meta(ctx.db, 'integration'), null)?.base ?? null;
+    for (const [index, { value }] of ordered.entries()) {
+      const vsBase = value && await compareWithBase(ctx, value.row, requests[index].lane?.base_revision ?? buildBase);
       if (vsBase) value.details.vsBase = vsBase;
     }
     if (batch !== undefined) return batchResponse(ctx.root, requests, ordered);
@@ -833,7 +838,7 @@ async function laneRevision(checkout, ref) {
 
 const CONFLICT_FILE_LIMIT = 200;
 const ADVISORY_PATH_LIMIT = 20;
-// Shared by every later lane's comparison, so the advisory cannot hold up the conflict it describes.
+// Shared by every later lane's comparison or preview, so neither can hold up the conflict it describes.
 const ADVISORY_TIME_LIMIT_MS = 60_000;
 
 // Later lanes whose captured commit changed a conflict path since its merge base with the build base: a fact about
@@ -857,9 +862,11 @@ async function laterLaneAdvisory(clone, base, later, files) {
   return { complete: !unavailable.length && !capped, lanes, unavailable, ...(capped ? { omitted } : {}) };
 }
 
-function laterLaneNote({ lanes, unavailable, complete }) {
+// Lanes the exact preview already names as conflicting are left out.
+function laterLaneNote({ lanes, unavailable, complete }, conflicts = []) {
   const notes = [];
-  if (lanes.length) notes.push(`Later lanes ${lanes.map(lane => lane.slug).join(', ')} also changed conflicting files since their merge base with the build base (laterLanes.lanes), including changes a lane inherits, so they may need reconciling together.`);
+  const others = lanes.filter(lane => !conflicts.some(conflict => conflict.files && conflict.feature === lane.slug));
+  if (others.length) notes.push(`Later lanes ${others.map(lane => lane.slug).join(', ')} also changed conflicting files since their merge base with the build base (laterLanes.lanes), including changes a lane inherits, so they may need reconciling together.`);
   if (unavailable.length) notes.push(`Later lanes ${unavailable.map(lane => lane.slug).join(', ')} could not be compared (laterLanes.unavailable).`);
   if (!complete && !unavailable.length) notes.push('laterLanes is capped; omitted counts what it leaves out.');
   return notes;
@@ -868,9 +875,11 @@ function laterLaneNote({ lanes, unavailable, complete }) {
 // Later lanes that conflict when each is merged alone onto the build so far: HEAD, which a conflicted merge leaves in place.
 async function conflictPreview(clone, later) {
   const head = (await git(clone, 'rev-parse', 'HEAD')).stdout;
+  const deadline = Date.now() + ADVISORY_TIME_LIMIT_MS;
   const conflicts = [];
   for (const lane of later) {
-    const preview = await mergeConflicts(clone, lane.checkout, head, lane.revision);
+    const remainingMs = deadline - Date.now();
+    const preview = remainingMs > 0 ? await mergeConflicts(clone, lane.checkout, head, lane.revision, remainingMs) : { unavailable: 'The preview ran out of its one-minute limit.' };
     if (preview.unavailable) conflicts.push({ feature: lane.slug, unavailable: preview.unavailable });
     else if (preview.files.length) conflicts.push({ feature: lane.slug, files: preview.files.slice(0, CONFLICT_FILE_LIMIT).map(redactString) });
   }
@@ -926,7 +935,7 @@ export async function buildIntegration({ workspace_path, features, base, from })
     } else if (composition.conflict) {
       notes.push(`The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`);
     }
-    if (composition.conflict) notes.push(...laterConflictNote(composition.conflict.laterConflicts), ...laterLaneNote(composition.conflict.laterLanes));
+    if (composition.conflict) notes.push(...laterConflictNote(composition.conflict.laterConflicts), ...laterLaneNote(composition.conflict.laterLanes, composition.conflict.laterConflicts));
     const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
     if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
     // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
@@ -1039,11 +1048,11 @@ function latestRunsBySuite(ctx, commit) {
   return [...latest.values()];
 }
 
-// The latest runs with their per-test comparison against base and the mutant controls run at the same commit.
-async function deliveredRuns(ctx, commit) {
+// The latest runs with their per-test comparison against the delivery's base and the mutant controls run at the same commit.
+async function deliveredRuns(ctx, commit, base) {
   const runs = [];
   for (const run of latestRunsBySuite(ctx, commit)) {
-    const vsBase = await compareWithBase(ctx, knownRun(ctx.db, run.id, 'id, suite, target, status, lab_revision, mutant'));
+    const vsBase = await compareWithBase(ctx, knownRun(ctx.db, run.id, 'id, suite, target, status, lab_revision, mutant'), base);
     const mutants = mutantRuns(ctx.db, { suite: run.suite, revision: commit }).map(({ suite: _suite, revision: _revision, ...control }) => control);
     runs.push({ ...run, ...(vsBase ? { vsBase } : {}), ...(mutants.length ? { mutants } : {}) });
   }
@@ -1119,7 +1128,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   // A base control belongs to no lane, even at a lane's commit, so it never qualifies a delivery; a legacy lane named base keeps that address, as in runLabSuite.
   const passing = ctx.db.prepare(`SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL
     AND (target <> 'base' OR EXISTS (SELECT 1 FROM features WHERE slug = 'base')) ORDER BY created_at DESC LIMIT 1`).get(commit) ?? null;
-  const runs = await deliveredRuns(ctx, commit);
+  const runs = await deliveredRuns(ctx, commit, base);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
   const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, lanes }));
   const blocking = lanes.length

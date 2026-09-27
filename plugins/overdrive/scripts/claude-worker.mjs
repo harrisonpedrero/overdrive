@@ -16,11 +16,13 @@ const POLICY_HOOK = fileURLToPath(new URL('./worker-policy-hook.mjs', import.met
 
 // The coordinator plugin never loads in a worker; the injected worker server replaces it. The
 // policy hook uses the exec form (args), so no shell parses its paths or the tool input. Flag
-// settings outrank project settings, so a repository's disableAllHooks cannot switch the hook off.
-const workerSettings = (profile, writeRoots) => JSON.stringify({
+// settings outrank project settings, so a repository's disableAllHooks cannot switch the hook off,
+// nor can its NODE_OPTIONS keep the hook's Node from starting, which Claude Code treats as no objection.
+const workerSettings = (profile, workspaceRoot, writeRoots) => JSON.stringify({
   disableAllHooks: false,
+  env: { NODE_OPTIONS: process.env.NODE_OPTIONS ?? '' },
   enabledPlugins: { 'overdrive@overdrive-local': false, 'feature-theater@feature-theater-local': false },
-  hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: process.execPath, args: [POLICY_HOOK, profile, ...writeRoots] }] }] },
+  hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: process.execPath, args: [POLICY_HOOK, profile, workspaceRoot ?? '', ...writeRoots] }] }] },
 });
 const NESTED_SESSION_ENV = /^(?:CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(?:CHILD_SESSION|SESSION_ID|HOST_SESSION_ID|MESSAGING_SOCKET|MESSAGING_TOKEN|ENTRYPOINT|SESSION_ATTENDED))$/;
 const EDITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell']);
@@ -83,7 +85,7 @@ export function workerLaunchArgs(meta, effort) {
   // The CLI exits when the turn ends, so a scheduled wakeup could never fire.
   const disallowed = [...options.disallowedTools, 'ScheduleWakeup', ...(feature ? COMPUTER_USE_SERVERS : [])];
   args.push('--disallowedTools', ...disallowed);
-  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', workerSettings(feature ? 'feature' : 'qa', meta.writeRoots ?? []));
+  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', workerSettings(feature ? 'feature' : 'qa', meta.workspaceRoot, meta.writeRoots ?? []));
   // Without Chrome integration set up, --chrome adds no tools rather than failing.
   args.push(feature ? '--no-chrome' : '--chrome');
   for (const dir of meta.addDirs) args.push('--add-dir', dir);
@@ -255,7 +257,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     return meta;
   }
 
-  #register({ threadId, cwd, runtimeWorkspaceRoots = [], writeRoots = [cwd], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, workerServer, persisted }) {
+  #register({ threadId, cwd, runtimeWorkspaceRoots = [], writeRoots = [cwd], workspaceRoot = null, developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, workerServer, persisted }) {
     const existing = this.threads.get(threadId);
     // An in-flight turn and any lingering process keep the same session record.
     const meta = Object.assign(existing ?? {}, {
@@ -263,6 +265,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
       cwd,
       addDirs: runtimeWorkspaceRoots.filter(root => root && path.resolve(root) !== path.resolve(cwd)),
       writeRoots,
+      workspaceRoot,
       developerInstructions,
       model: model || null,
       effort,
@@ -637,9 +640,11 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   // Every control request gets an answer so the CLI never waits on one; only tool permission is handled.
+  // A compound shell command reports a safety check nested in it only through classifier_approvable.
   #answerControl(meta, turn, { request_id, request }) {
+    const safetyCheck = request?.decision_reason_type === 'safetyCheck' || typeof request?.classifier_approvable === 'boolean';
     const decision = request?.subtype === 'can_use_tool'
-      ? workerToolDecision(this.profile, request.tool_name, request.input, { writeRoots: meta.writeRoots, safetyCheck: request.decision_reason_type === 'safetyCheck' })
+      ? workerToolDecision(this.profile, request.tool_name, request.input, { writeRoots: meta.writeRoots, workspaceRoot: meta.workspaceRoot, safetyCheck })
       : null;
     const response = !decision
       ? { subtype: 'error', request_id, error: `OVERDRIVE does not handle ${request?.subtype} control requests.` }
