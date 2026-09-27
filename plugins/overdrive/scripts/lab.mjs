@@ -221,7 +221,8 @@ async function integrationStatus(ctx) {
 }
 
 // A pass resolves a finding only at a revision that contains the one it was found at and is not part of the revision of
-// an attached failure of this suite on the finding's lane, such as the HEAD under a snapshot whose uncommitted change failed.
+// an attached failure of this suite on the finding's lane, such as the HEAD under a snapshot whose uncommitted change failed,
+// and only on lanes that include every lane of a verified multi-lane failure.
 // A failing integration commit exists only in the integration clone, so that check runs there.
 async function resolvableFindings(ctx, repository, suite, features, commit) {
   if (!features?.length) return [];
@@ -229,6 +230,7 @@ async function resolvableFindings(ctx, repository, suite, features, commit) {
     lab_runs.suite AS failed_suite, lab_runs.status AS failed_status FROM findings LEFT JOIN lab_runs ON lab_runs.id = findings.found_run
     WHERE findings.status = 'open' AND repro_suite = ? AND feature IN (${features.map(() => '?').join(', ')})`).all(suite, ...features);
   const integration = integrationPath(ctx.root);
+  const cache = { ancestry: new Map() };
   const resolved = [];
   for (const row of rows) {
     if (row.found_revision && !await isGitAncestor(repository, row.found_revision, commit)) continue;
@@ -236,12 +238,20 @@ async function resolvableFindings(ctx, repository, suite, features, commit) {
       && runTestedLane({ target: row.failed_target, lanes_json: row.failed_lanes_json }, row.feature) === true;
     const failedIn = row.failed_target === 'integration' && await exists(integration) ? integration : repository;
     if (verified && row.failed_revision && await isGitAncestor(failedIn, commit, row.failed_revision)) continue;
+    if (omitsFailedLanes(await attachedFailure(ctx, row, cache), features)) continue;
     resolved.push(row);
   }
   return resolved;
 }
 
-// This describes the attached run; it does not search for other failures or change resolution eligibility.
+// Whether passing lanes omit a lane of a verified attached failure that tested several; a single-lane failure omits none.
+function omitsFailedLanes(failure, passingLanes) {
+  if (failure.noFailingRun !== false) return false;
+  const failedLanes = runLanes(failure.run) ?? [];
+  return failedLanes.length > 1 && failedLanes.some(slug => !passingLanes?.includes(slug));
+}
+
+// Whether the attached run is a verified failure of the finding; it does not search for other failures.
 async function attachedFailure(ctx, finding, cache) {
   if (!finding.found_run) return { run: null, noFailingRun: true, failureReason: null };
   const failed = ctx.db.prepare('SELECT id, suite, target, revision, lab_revision, lanes_json, status FROM lab_runs WHERE id = ?').get(finding.found_run);
@@ -282,18 +292,20 @@ async function labSnapshotTree(lab, revision, cache) {
   return await cache.trees.get(key);
 }
 
-// Why the resolving run is not a pass of the repro suite that tested the lane at the resolved revision, or null.
-function passingReason(finding, passingRun) {
+// Why the resolving run is not a pass of the repro suite that retested the lane, with every lane of a verified
+// multi-lane failure, at the resolved revision, or null.
+function passingReason(finding, passingRun, failure) {
   if (!passingRun) return 'passing_run_unavailable';
   if (passingRun.status !== 'passed' || passingRun.suite !== finding.repro_suite || passingRun.revision !== finding.resolved_revision) return 'passing_run_mismatch';
   const tested = runTestedLane(passingRun, finding.feature);
-  return tested ? null : tested === null ? 'membership_unknown' : 'lane_not_tested';
+  if (!tested) return tested === null ? 'membership_unknown' : 'lane_not_tested';
+  return omitsFailedLanes(failure, runLanes(passingRun)) ? 'failed_lanes_omitted' : null;
 }
 
 async function resolutionEvidence(ctx, finding, passingRun, lab, cache) {
   const failure = await attachedFailure(ctx, finding, cache);
   const failedLabRevision = failure.run?.status === 'failed' ? failure.run.lab_revision ?? null : null;
-  const passing = passingReason(finding, passingRun);
+  const passing = passingReason(finding, passingRun, failure);
   const passingLabRevision = passing ? null : passingRun.lab_revision ?? null;
   let labSnapshotChanged = null;
   let labSnapshotReason = null;
@@ -563,10 +575,11 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
 function reproduction(finding, sender, foundRun, integration) {
   const suite = finding.repro_suite;
   if (!suite) return `There is no repro suite yet; your context packet names it once ${sender} adds it. Ask ${sender} only if the body above does not say how to reproduce it.`;
-  // Only a failure of this suite on an integration known to include the lane is described as one.
+  // Only a failure of this suite on an integration known to combine the lane with others is described as one.
   const integrated = foundRun?.target === 'integration' && foundRun.status === 'failed' && foundRun.suite === suite && runTestedLane(foundRun, finding.feature) === true;
-  if (!integrated) return `Reproduce it with lab_run {"suite": "${suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`;
-  return `Suite ${suite} failed on integration ${foundRun.revision.slice(0, 12)} (${foundRun.id}), which combines your lane with others, so a lab_run on your lane alone may not reproduce it; to reproduce it locally, fetch ${foundRun.revision} from ${integration} without merging it into your branch. A passing run of ${suite} on an integration build that includes your fix resolves this finding.`;
+  const others = integrated ? runLanes(foundRun).filter(slug => slug !== finding.feature) : [];
+  if (!others.length) return `Reproduce it with lab_run {"suite": "${suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`;
+  return `Suite ${suite} failed on integration ${foundRun.revision.slice(0, 12)} (${foundRun.id}), which combines your lane with others, so a lab_run on your lane alone may not reproduce it; to reproduce it locally, fetch ${foundRun.revision} from ${integration} without merging it into your branch. A passing run of ${suite} on an integration build that includes your fix and ${others.join(', ')} resolves this finding.`;
 }
 
 function findingMessage(finding, sender, foundRun, integration) {
