@@ -51,7 +51,12 @@ function suiteName(value, name = 'suite') {
 
 const targetName = value => (value === 'integration' || value === 'base' ? value : safeSlug(value, 'target'));
 // applyMutant accepts only a file the lab snapshot holds, which keeps the path inside the lab.
-const mutantPath = value => optionalText(value, 'mutant', { max: 300 })?.replaceAll('\\', '/') ?? null;
+// A credential-shaped path is refused, never redacted, because redaction would merge distinct patch identities.
+function mutantPath(value) {
+  const patch = optionalText(value, 'mutant', { max: 300 })?.replaceAll('\\', '/') ?? null;
+  if (patch && redactString(patch) !== patch) throw new OverdriveError('Mutant paths that look like credentials are not stored. Rename the patch file so its path holds no credential.', 'MUTANT_INVALID');
+  return patch;
+}
 const agentName = value => (value === undefined || value === 'coordinator' ? 'coordinator' : safeSlug(value, 'from'));
 const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
 const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
