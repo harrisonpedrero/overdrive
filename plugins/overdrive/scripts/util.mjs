@@ -202,8 +202,8 @@ function commandDescription(argv) {
 // deadline even if a surviving process keeps the output open. A tree not confirmed stopped is
 // named as terminationUncertain in a timed-out result or in the COMMAND_FAILED message; with
 // confirmTermination it rejects with COMMAND_TERMINATION_UNCERTAIN instead. Only this child's PID
-// is ever targeted, and never after it has exited. onOutput, which must not throw, receives each decoded chunk
-// and its stream name as it arrives, in addition to the buffered result.
+// is ever targeted, and never after it has exited. onOutput, which must not throw, receives each decoded chunk of
+// either stream in arrival order, in addition to the buffered result.
 export async function run(argv, { cwd, env = process.env, input, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, combinedTail = false, allowFailure = false, rawOutput = false, confirmTermination = false, terminationGraceMs = 10_000, onOutput } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new OverdriveError('Command arguments are invalid.', 'INVALID_COMMAND');
@@ -255,8 +255,8 @@ export async function run(argv, { cwd, env = process.env, input, timeoutMs = 20 
     // Decoding per stream keeps a multibyte character split across two chunks intact.
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => { stdout = (combinedTail ? keepTail : collect)(stdout, chunk); onOutput?.(chunk, 'stdout'); });
-    child.stderr.on('data', chunk => { if (combinedTail) stdout = keepTail(stdout, chunk); else stderr = collect(stderr, chunk); onOutput?.(chunk, 'stderr'); });
+    child.stdout.on('data', chunk => { stdout = (combinedTail ? keepTail : collect)(stdout, chunk); onOutput?.(chunk); });
+    child.stderr.on('data', chunk => { if (combinedTail) stdout = keepTail(stdout, chunk); else stderr = collect(stderr, chunk); onOutput?.(chunk); });
     let timedOut = false;
     let unconfirmed = null;
     let killing = false;

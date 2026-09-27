@@ -189,13 +189,14 @@ function skipCredentialContinuation(open, text) {
   return [open, text.slice(at)];
 }
 
-// Rewrites a running run's log with its latest complete lines, redacted, at most once per interval. Lines stay
-// whole per stream, so a credential split across chunks is redacted. Earlier output is dropped at a line boundary
-// and a line longer than the limit is omitted entirely, each with any lines continuing a credential it opened.
+// Rewrites a running run's log with its latest complete lines, redacted, at most once per interval. Lines join both
+// streams in arrival order, as the final log does, so a credential split across chunks or streams is redacted alike.
+// Earlier output is dropped at a line boundary and a line longer than the limit is omitted entirely, each with any
+// lines continuing a credential it opened.
 function liveOutput(root, file) {
-  // While a stream skips an omitted line, its pending text is only that line's credential tail.
-  const pending = { stdout: '', stderr: '' };
-  const skipping = { stdout: false, stderr: false };
+  // While an omitted line is skipped, pending holds only its credential tail.
+  let pending = '';
+  let skipping = false;
   let lines = '';
   let open = '';
   let dropped = false;
@@ -229,32 +230,32 @@ function liveOutput(root, file) {
     if (lines.length > 2 * OUTPUT_LIMIT) dropEarlier(OUTPUT_LIMIT);
     schedule();
   };
-  const hold = (stream, text) => {
-    pending[stream] += text;
-    if (skipping[stream]) pending[stream] = credentialTail(pending[stream]);
-    else if (pending[stream].length > OUTPUT_LIMIT) {
-      pending[stream] = credentialTail(pending[stream]);
-      skipping[stream] = true;
+  const hold = text => {
+    pending += text;
+    if (skipping) pending = credentialTail(pending);
+    else if (pending.length > OUTPUT_LIMIT) {
+      pending = credentialTail(pending);
+      skipping = true;
       add(`[an output line over ${OUTPUT_LIMIT} characters was omitted]\n`);
     }
   };
   return {
-    write(chunk, stream) {
+    write(chunk) {
       if (closed) return;
       const end = chunk.lastIndexOf('\n') + 1;
-      if (!end) return hold(stream, chunk);
-      let complete = pending[stream] + chunk.slice(0, end);
-      if (skipping[stream]) {
+      if (!end) return hold(chunk);
+      let complete = pending + chunk.slice(0, end);
+      if (skipping) {
         // The omitted line ends at the first newline and may open a credential that later lines continue.
         const omitted = complete.indexOf('\n') + 1;
         open = openCredential(`${open}\n${complete.slice(0, omitted)}`);
         complete = complete.slice(omitted);
-        skipping[stream] = false;
+        skipping = false;
       }
-      pending[stream] = '';
+      pending = '';
       [open, complete] = skipCredentialContinuation(open, complete);
       if (complete) add(complete);
-      hold(stream, chunk.slice(end));
+      hold(chunk.slice(end));
     },
     // Stops writing and waits for a write in progress, so the final log is never overwritten afterward.
     async close() {
