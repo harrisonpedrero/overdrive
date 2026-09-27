@@ -76,11 +76,11 @@ async function assertOwnClone(clone) {
   }
 }
 
-// A target clone is runtime-owned scratch: each sync discards tracked edits and untracked files but
-// keeps ignored dependency directories such as node_modules. Its origin is the repository, as in a
-// lane clone, because builds such as SourceLink read it; fetches name their source explicitly.
-export async function syncTarget(root, directory, source, commit, origin) {
-  const target = await ensureManagedPath(root, contained(root, STATE_DIR, 'lab', 'targets', directory));
+// A lab checkout (a product target or a lab snapshot) is runtime-owned scratch: each sync discards tracked
+// edits and untracked files but keeps ignored dependency directories such as node_modules. A target's origin
+// is the repository, as in a lane clone, because builds such as SourceLink read it; fetches name their source explicitly.
+export async function syncLabCheckout(root, area, directory, source, commit, origin = source) {
+  const target = await ensureManagedPath(root, contained(root, STATE_DIR, 'lab', area, directory));
   if (!await exists(target)) {
     await fs.mkdir(path.dirname(target), { recursive: true });
     await run(['git', 'clone', '--no-checkout', ...LONG_PATHS, '--', source, target], { cwd: root });

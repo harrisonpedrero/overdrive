@@ -14,7 +14,7 @@ import {
   resolveMirrorRevision,
   runtimeGitConfig,
   snapshotCommit,
-  syncTarget,
+  syncLabCheckout,
   verifyCheckoutRevision,
 } from './git.mjs';
 import { featureBySlug, listFeatureRows, loadWorkspace, meta, parseJson, transaction } from './state.mjs';
@@ -76,13 +76,27 @@ async function integrationClone(root) {
   return clone;
 }
 
+const suiteNotFound = name => new OverdriveError(`No suite ${name}: lab/suites/${name}/suite.json does not exist.`, 'SUITE_NOT_FOUND');
+
+// The live lab's suite, for listing and naming suites.
 async function readSuite(root, lab, name) {
   const directory = await ensureManagedPath(root, contained(lab, 'suites', name));
   let text;
   try { text = await fs.readFile(contained(directory, 'suite.json'), 'utf8'); } catch (error) {
-    if (error?.code === 'ENOENT') throw new OverdriveError(`No suite ${name}: lab/suites/${name}/suite.json does not exist.`, 'SUITE_NOT_FOUND');
+    if (error?.code === 'ENOENT') throw suiteNotFound(name);
     throw error;
   }
+  return parseSuite(name, text);
+}
+
+// The suite as recorded in a lab snapshot, which is what a run executes.
+async function snapshotSuite(lab, revision, name) {
+  const blob = await run(['git', 'cat-file', 'blob', `${revision}:suites/${name}/suite.json`], { cwd: lab, allowFailure: true });
+  if (blob.exitCode !== 0) throw suiteNotFound(name);
+  return parseSuite(name, blob.stdout);
+}
+
+function parseSuite(name, text) {
   const invalid = detail => new OverdriveError(`lab/suites/${name}/suite.json is invalid: ${detail}.`, 'INVALID_SUITE');
   let suite;
   try { suite = JSON.parse(text.replace(/^﻿/, '')); } catch { throw invalid('it is not JSON'); }
@@ -90,7 +104,7 @@ async function readSuite(root, lab, name) {
   if (!Array.isArray(argv) || argv.length < 1 || argv.length > 200 || argv.some(part => typeof part !== 'string' || !part || part.includes('\0'))) throw invalid('argv must hold 1-200 non-empty strings');
   if (cwd !== 'suite' && cwd !== 'target') throw invalid('cwd must be "suite" or "target"');
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) throw invalid('timeout_seconds must be an integer from 1 to 3600');
-  return { directory, argv, cwd, timeout, description: typeof description === 'string' ? description : '' };
+  return { argv, cwd, timeout, description: typeof description === 'string' ? description : '' };
 }
 
 async function listSuites(root, lab) {
@@ -254,23 +268,25 @@ const settle = promise => promise.then(value => ({ value }), error => ({ error }
 // One run on a synced checkout in the given slot: reuse an identical run, or execute and record it.
 async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call) {
   const { source, revision: commit, features, uncommittedFiles } = subject;
-  // Processes of a run whose termination is uncertain may still use its target directory. Slugs never
+  // Processes of a run whose termination is uncertain may still use its target and lab directories. Slugs never
   // contain --, so slot directories never collide with a lane's.
   const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(target).count);
   const directory = `${uncertain ? `${target}--${uncertain}` : target}${slot ? `--s${slot}` : ''}`;
-  const checkout = await syncTarget(ctx.root, directory, source, commit, ctx.config.repository);
-  const labRevision = await call.labRevision();
+  const checkout = await syncLabCheckout(ctx.root, 'targets', directory, source, commit, ctx.config.repository);
+  const { labRevision } = call;
   const details = target === 'integration' ? { included: features } : {};
   const notes = uncommittedFiles ? [`${target} has uncommitted changes that this run of its HEAD left out.`] : [];
   const reused = identicalRunSince(ctx.db, { target, suite: name, revision: commit, lab_revision: labRevision }, call.arrived);
   if (reused) return { row: reused, details: { reused: true, resolvedFindings: [], ...details }, notes: ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes] };
+  // The suite runs from the lab snapshot recorded as lab_revision, never from the live lab QA may be editing.
+  const lab = await syncLabCheckout(ctx.root, 'snapshots', directory, call.lab, labRevision);
   const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
   const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
   await fs.mkdir(artifacts, { recursive: true });
-  const cwd = spec.cwd === 'target' ? checkout : spec.directory;
+  const cwd = spec.cwd === 'target' ? checkout : await ensureManagedPath(ctx.root, contained(lab, 'suites', name));
   const env = {
     ...process.env,
-    OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: call.lab, OVERDRIVE_SUITE: name,
+    OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: lab, OVERDRIVE_SUITE: name,
     OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
   };
   const row = {
@@ -335,12 +351,11 @@ export async function runLabSuite({ workspace_path, batch, from, ...single }) {
   const call = { creator: agentName(from), arrived: Date.now() };
   return await withContext(workspace_path, async ctx => {
     call.lab = await ensureLab(ctx.root);
-    // Taken once, after the first target sync, which can be slow, so the recorded snapshot matches the lab files suites run.
-    let snapshot;
-    call.labRevision = () => (snapshot ??= snapshotCommit(call.lab));
+    // Every run of the call reads and executes its suite from this one snapshot.
+    call.labRevision = await snapshotCommit(call.lab);
     const byTarget = new Map();
     for (const request of requests) {
-      request.spec = await readSuite(ctx.root, call.lab, request.name);
+      request.spec = await snapshotSuite(call.lab, call.labRevision, request.name);
       // A lane named base from before the control target keeps its lab address.
       request.lane = request.target === 'integration' || (request.target === 'base' && !featureId(ctx.db, 'base')) ? null : laneRow(ctx, request.target);
       byTarget.set(request.target, [...byTarget.get(request.target) ?? [], request]);

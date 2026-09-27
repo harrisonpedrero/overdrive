@@ -570,7 +570,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 
 - OVERDRIVE_TARGET: the checkout under test, a clean clone at the exact revision.
 - OVERDRIVE_REVISION: the commit under test.
-- OVERDRIVE_LAB: this repository.
+- OVERDRIVE_LAB: a runtime-owned checkout of this repository at the run's lab snapshot; the suite runs from it, never from this working tree.
 - OVERDRIVE_SUITE: the suite name.
 - OVERDRIVE_ARTIFACTS: an empty directory for this run's screenshots, logs and traces.
 - OVERDRIVE_PORT: a free TCP port on 127.0.0.1.
@@ -578,12 +578,13 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 ## Rules
 
 - Only lab_run produces evidence: the runtime runs the suite itself at an exact target revision and lab snapshot, and records the verdict, output and artifacts. A passing run resolves the open findings it is the repro suite for.
+- A lab_run call snapshots this working tree (tracked and unignored files, committed or not) when it starts, and its suites, harness and fixtures come from that snapshot, so edits made here during a run reach only later calls. Reach lab files through OVERDRIVE_LAB or paths relative to the suite, never through this directory's absolute path.
 - Keep suites deterministic: the same revision gives the same verdict. A suite whose verdict depends on timing or scheduling (concurrency, load, expiry) repeats its scenario within the run and reports how many repetitions passed.
-- Set up dependencies in the target idempotently, for example install only when the lockfile hash changed, and prefer toolchains and browser builds already on this machine (for Playwright, a version whose browser is already in its cache) to new downloads. Ignored directories such as node_modules survive between runs against the same target.
+- Set up dependencies in the target idempotently, for example install only when the lockfile hash changed, and prefer toolchains and browser builds already on this machine (for Playwright, a version whose browser is already in its cache) to new downloads. Ignored directories such as node_modules survive between runs in the same target checkout and in the same OVERDRIVE_LAB checkout. Ignored files in this working tree, such as a node_modules installed here, are not in the snapshot and runs never see them, so a suite that needs lab dependencies installs them into OVERDRIVE_LAB the same idempotent way; that install happens on the first run in each OVERDRIVE_LAB checkout (one per target and slot) and is kept after that.
 - Start every service a suite needs within the run, and stop it by its PID or process tree, never by image name, before the run ends.
 - Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host or leave those tests out and say so. For Node, a --require preload can rewrite every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1, but it must still bind synchronously, as Node's Server#_listen2 does: passing a host makes listen() resolve it asynchronously, and callers such as supertest read address() right after listen(0). Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
-- Suites can run at the same time in separate checkouts (a batch, or other agents' runs), so at run time a suite writes only to OVERDRIVE_ARTIFACTS and its target checkout, never to shared lab files.
+- Suites can run at the same time in separate checkouts (a batch, or other agents' runs), so at run time a suite writes only to OVERDRIVE_ARTIFACTS, its target checkout and ignored dependency directories in OVERDRIVE_LAB. The next run's sync discards anything else it leaves in OVERDRIVE_LAB.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
 - Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Against a base that cannot pass at all, such as a new project's stub, a failure proves little and a slow suite wastes minutes there; break the property the suite checks with a mutant instead. Keep one-time checks of a suite itself, such as mutation runs, in a suite of their own, so reruns on lanes and integration stay fast.
