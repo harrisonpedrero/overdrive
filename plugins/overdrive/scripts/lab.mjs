@@ -49,6 +49,7 @@ const targetName = value => (value === 'integration' || value === 'base' ? value
 const agentName = value => (value === undefined || value === 'coordinator' ? 'coordinator' : safeSlug(value, 'from'));
 const featureId = (db, slug) => db.prepare('SELECT id FROM features WHERE slug = ?').get(slug)?.id ?? null;
 const runDirectory = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'artifacts');
+const runLog = (root, id) => contained(root, STATE_DIR, 'lab', 'runs', id, 'output.log');
 // A run holds its target's lock for its whole suite, so a queued run waits as long as it can still finish
 // within the hour its MCP clients allow a call (tool_timeout_sec), and never less than the usual two minutes.
 const LAB_CALL_BUDGET_MS = 3_600_000;
@@ -134,11 +135,11 @@ async function artifactManifest(directory) {
 
 async function execute(argv, options) {
   try {
-    const result = await run(argv, { ...options, maxOutput: 500_000, allowFailure: true, confirmTermination: true });
+    const result = await run(argv, { ...options, maxOutput: 500_000, combinedTail: true, allowFailure: true, confirmTermination: true });
     return {
       status: result.exitCode === 0 && !result.timedOut ? 'passed' : 'failed',
       exitCode: result.exitCode,
-      output: [result.timedOut ? `[timed out after ${options.timeoutMs / 1000}s]` : '', result.stdout, result.stderr],
+      output: [result.timedOut ? `[timed out after ${options.timeoutMs / 1000}s]` : '', result.overflow ? '[earlier output dropped]' : '', result.stdout],
     };
   } catch (error) {
     // A command that could not start failed; one whose processes may still be running is uncertain.
@@ -146,10 +147,13 @@ async function execute(argv, options) {
   }
 }
 
-function presentRun(root, row) {
-  const { argv_json: argv, artifacts_json: artifacts, ...rest } = row;
+function presentRun(root, row, outputLog) {
+  const { argv_json: argv, artifacts_json: artifacts, output, ...rest } = row;
   const files = parseJson(artifacts, []);
-  return { ...rest, argv: parseJson(argv, []), artifacts: { directory: runDirectory(root, row.id), count: files.length, files: files.slice(0, 50) } };
+  return {
+    ...rest, argv: parseJson(argv, []), outputTail: (output ?? '').slice(-4_000), ...(outputLog ? { outputLog } : {}),
+    artifacts: { directory: runDirectory(root, row.id), count: files.length, files: files.slice(0, 50) },
+  };
 }
 
 // The lanes an integration commit contains, judged by Git ancestry rather than by the recorded build.
@@ -221,7 +225,7 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
       // Processes of a run whose termination is uncertain may still use its target directory.
       const uncertain = Number(ctx.db.prepare("SELECT COUNT(*) AS count FROM lab_runs WHERE target = ? AND status = 'uncertain'").get(targetSlug).count);
       const checkout = await syncTarget(ctx.root, uncertain ? `${targetSlug}--${uncertain}` : targetSlug, source, commit, ctx.config.repository);
-      const id = `run-${randomUUID().slice(0, 13)}`;
+      const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
       const artifacts = await ensureManagedPath(ctx.root, runDirectory(ctx.root, id));
       await fs.mkdir(artifacts, { recursive: true });
       const cwd = spec.cwd === 'target' ? checkout : spec.directory;
@@ -237,8 +241,10 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
       ctx.db.prepare(`INSERT INTO lab_runs(${Object.keys(row).join(', ')}) VALUES (${Object.keys(row).map(() => '?').join(', ')})`).run(...Object.values(row));
       const started = Date.now();
       const result = await execute(spec.argv, { cwd, env, timeoutMs: spec.timeout * 1_000 });
+      const log = redactString(result.output.filter(Boolean).join('\n'));
+      await fs.writeFile(runLog(ctx.root, id), log, 'utf8');
       Object.assign(row, {
-        exit_code: result.exitCode, status: result.status, output: redactString(result.output.filter(Boolean).join('\n')).slice(-24_000),
+        exit_code: result.exitCode, status: result.status, output: log.slice(-24_000),
         duration_ms: Date.now() - started, artifacts_json: JSON.stringify(await artifactManifest(artifacts)),
       });
       const resolved = row.status === 'passed' ? await resolvableFindings(ctx, source, name, features, commit) : [];
@@ -256,12 +262,12 @@ export async function runLabSuite({ workspace_path, suite, target, revision, fro
       for (const finding of resolved) {
         await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
       }
-      const { argv: _argv, artifacts: { files: _files, ...artifactSummary }, output, ...summary } = presentRun(ctx.root, row);
+      const { argv: _argv, artifacts: { files: _files, ...artifactSummary }, ...summary } = presentRun(ctx.root, row, runLog(ctx.root, id));
       return {
-        run: { ...summary, outputTail: output.slice(-4_000), artifacts: artifactSummary },
+        run: { ...summary, artifacts: artifactSummary },
         resolvedFindings: resolved.map(finding => finding.id),
         ...(targetSlug === 'integration' ? { included: features } : {}),
-        next: `lab_get {"run": "${id}"} returns the full output and artifact list.`,
+        next: `Earlier output is in run.outputLog; lab_get {"run": "${id}"} lists its artifacts.`,
       };
     }, { timeoutMs: labRunLockWait(spec) });
   });
@@ -276,7 +282,8 @@ export async function getLab({ workspace_path, run: runId, suite, target, findin
     if (runKey) {
       const row = ctx.db.prepare('SELECT * FROM lab_runs WHERE id = ?').get(runKey);
       if (!row) throw new OverdriveError(`Unknown lab run: ${runKey}`, 'RUN_NOT_FOUND');
-      return { run: presentRun(ctx.root, row) };
+      const log = runLog(ctx.root, row.id);
+      return { run: presentRun(ctx.root, row, await exists(log) ? log : null) };
     }
     const lab = await ensureLab(ctx.root);
     const result = {
@@ -503,34 +510,41 @@ function latestRunsBySuite(ctx, commit) {
   return [...latest.values()];
 }
 
-function unpassedRunsNote(runs) {
-  const suites = runs.filter(run => run.status !== 'passed').map(run => run.suite);
-  return suites.length ? `The latest runs of ${suites.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '';
+function evidenceGapsNote(runs, suitesNotRun) {
+  const unpassed = runs.filter(run => run.status !== 'passed').map(run => run.suite);
+  return [
+    unpassed.length ? `The latest runs of ${unpassed.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '',
+    suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it.` : '',
+  ].filter(Boolean).join(' ');
 }
 
 // An adopted repository is never published to; a tested commit with no open blocking findings is
 // delivered, and the user publishes it with the returned push command or fetches it into their own clone.
-async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs) {
+async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun) {
   const delivered = Boolean(passing) && !blocking.length;
+  // The integration clone holds its commit only as a detached HEAD, which the next rebuild moves.
+  await git(source, 'update-ref', `refs/overdrive/delivered/${commit}`, commit);
   if (delivered) await markLanesDone(ctx, lanes, `Delivered in ${commit.slice(0, 12)}; not published.`, { target, commit, runs });
   const ref = `${commit}:refs/heads/${branch ?? '<branch>'}`;
   const push = `git -C "${source}" push "${ctx.config.repository}" ${ref}`;
   const fetch = `git fetch "${source}" ${ref}`;
-  const unpassed = unpassedRunsNote(runs);
+  const gaps = evidenceGapsNote(runs, suitesNotRun);
   return {
-    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, openBlockingFindings: blocking.map(finding => finding.id), push, fetch,
-    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${unpassed ? ` ${unpassed}` : ''}`,
+    published: false, target, commit, branch, path: source, lanes, lanesDone: delivered, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
+    openBlockingFindings: blocking.map(finding => finding.id), push, fetch,
+    next: `OVERDRIVE never publishes to an adopted repository. ${delivered ? 'The included lanes are marked done.' : 'The lanes stay open until this commit has a passing lab run and no open blocking findings.'} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.${branch ? '' : ' In either command, replace <branch> with a new branch name.'}${gaps ? ` ${gaps}` : ''}`,
   };
 }
 
 async function promote(ctx, { target, commit, source, branch, lanes }) {
   const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
   const runs = latestRunsBySuite(ctx, commit);
+  const suitesNotRun = (await listSuites(ctx.root, await ensureLab(ctx.root))).map(suite => suite.name).filter(name => !runs.some(run => run.suite === name));
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
   const managed = ctx.config.managedProject;
-  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs);
+  if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun);
   if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
   if (blocking.length) {
     throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
@@ -551,10 +565,11 @@ async function promote(ctx, { target, commit, source, branch, lanes }) {
     meta(ctx.db, 'default_branch', refreshed.defaultBranch);
   });
   await markLanesDone(ctx, lanes, `Integrated ${commit.slice(0, 12)} into project/ ${managed.defaultBranch}.`, { target, commit, runs });
-  const unpassed = unpassedRunsNote(runs);
+  const gaps = evidenceGapsNote(runs, suitesNotRun);
   return {
-    integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, runs, project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit },
-    ...(unpassed ? { next: unpassed } : {}),
+    integrated: !alreadyIncluded, alreadyIncluded, target, commit, lanes, runs, ...(suitesNotRun.length ? { suitesNotRun } : {}),
+    project: { path: project, branch: managed.defaultBranch, head: alreadyIncluded ? before.head : commit },
+    ...(gaps ? { next: gaps } : {}),
   };
 }
 

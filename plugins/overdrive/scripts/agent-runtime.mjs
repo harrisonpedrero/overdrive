@@ -938,7 +938,7 @@ const steerFeatureAgent = async args => {
     result = await withAgentControl(args, ownerToken, () => deliverOwned(args, message));
   } catch (error) {
     if (!QUEUED_WHEN.has(error.code)) throw error;
-    const queued = await sendAgentMessage({ workspace_path: args.workspace_path, from: 'coordinator', to: args.feature, body: message });
+    const queued = await sendAgentMessage({ workspace_path: args.workspace_path, from: 'coordinator', to: args.feature, message });
     return { feature: queued.to, mode: 'queued', messageId: queued.id, reason: error.message, next: 'The message waits in the agent\'s inbox. It is delivered once the agent can take it, and at the latest in the prompt of its next turn.' };
   }
   await recordAgentEvent({ workspace_path: args.workspace_path, feature: result.feature, kind: 'coordinator.steered', summary: `Coordinator ${result.mode === 'mid_turn' ? 'steered the active turn' : 'started a follow-up turn'}: ${redactString(clip(message, 2_000))}`, details: { mode: result.mode } });

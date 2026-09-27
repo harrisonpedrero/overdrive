@@ -203,7 +203,7 @@ function commandDescription(argv) {
 // named as terminationUncertain in a timed-out result or in the COMMAND_FAILED message; with
 // confirmTermination it rejects with COMMAND_TERMINATION_UNCERTAIN instead. Only this child's PID
 // is ever targeted, and never after it has exited.
-export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, allowFailure = false, rawOutput = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
+export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_000, maxOutput = 2_000_000, combinedTail = false, allowFailure = false, rawOutput = false, confirmTermination = false, terminationGraceMs = 10_000 } = {}) {
   if (!Array.isArray(argv) || argv.length === 0 || argv.some(part => typeof part !== 'string' || part.includes('\0'))) {
     throw new OverdriveError('Command arguments are invalid.', 'INVALID_COMMAND');
   }
@@ -242,8 +242,15 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       if (next.length > maxOutput) overflow = true;
       return next.slice(0, maxOutput);
     };
-    child.stdout.on('data', chunk => { stdout = collect(stdout, chunk); });
-    child.stderr.on('data', chunk => { stderr = collect(stderr, chunk); });
+    // With combinedTail both streams share one tail buffer in arrival order. Trimming only once it doubles
+    // keeps a chatty command's cost linear, and settle trims it to maxOutput.
+    const keepTail = (current, chunk) => {
+      const next = current + chunk.toString();
+      if (next.length > maxOutput) overflow = true;
+      return next.length > 2 * maxOutput ? next.slice(-maxOutput) : next;
+    };
+    child.stdout.on('data', chunk => { stdout = (combinedTail ? keepTail : collect)(stdout, chunk); });
+    child.stderr.on('data', chunk => { if (combinedTail) stdout = keepTail(stdout, chunk); else stderr = collect(stderr, chunk); });
     let timedOut = false;
     let unconfirmed = null;
     let killing = false;
@@ -294,6 +301,7 @@ export async function run(argv, { cwd, env = process.env, timeoutMs = 20 * 60_00
       settled = true;
       clearTimeout(closeDeadline);
       if (deadline) { child.stdout.destroy(); child.stderr.destroy(); }
+      if (combinedTail) stdout = stdout.slice(-maxOutput);
       const code = closed ? closed.code : child.exitCode;
       const durationMs = closed ? closed.durationMs : Date.now() - started;
       const uncertainty = deadline ?? (unconfirmed && `${unconfirmed}, so its process tree was not confirmed stopped`);

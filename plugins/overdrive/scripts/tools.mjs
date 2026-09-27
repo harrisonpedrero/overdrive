@@ -181,16 +181,16 @@ export const TOOLS = [
     timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
   }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output tail and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
+  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
     ...workspace,
     suite: suite('Suite to run.'),
     target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
     revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from.'),
   }, ['workspace_path', 'suite', 'target']), { destructiveHint: false }),
 
-  tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return only one run, in full with its output and artifacts.', object({
+  tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return one run with its output tail, the path of its output log and its artifacts.', object({
     ...workspace,
-    run: string('Run id to return in full.'),
+    run: string('Run id to return.'),
     suite: suite('Only list runs of this suite.'),
     target: { ...target, description: 'Only list runs and findings for this lane, integration (its runs, and findings on the lanes it includes) or base (control runs).' },
     findings: string('Include findings: open, or all.', { enum: ['open', 'all'] }),
@@ -226,8 +226,8 @@ const WORKER_ONLY_TOOLS = [
   tool('message_send', 'Message an agent', 'Send a message to a lane agent, a QA agent (such as qa) or the coordinator; the runtime delivers it.', object({
     ...workspace,
     to: string('Recipient: a lane slug, a QA agent name, or coordinator.', { pattern: '^[a-z][a-z0-9-]{0,62}$' }),
-    body: string('What changed, what to test or fix, or what you need; self-contained.', { minLength: 1, maxLength: 20000 }),
-  }, ['workspace_path', 'to', 'body']), { destructiveHint: false }),
+    message: string('What changed, what to test or fix, or what you need; self-contained.', { minLength: 1, maxLength: 20000 }),
+  }, ['workspace_path', 'to', 'message']), { destructiveHint: false }),
   tool('lanes', 'List lanes', 'Every lane and QA agent: kind, title, status, agent status, checkout path, spec path, head commit, whether the checkout is dirty, and open findings.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 ];
 
