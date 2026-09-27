@@ -128,7 +128,7 @@ export async function mergeIntoIntegration(root, clone, source, commit, message)
   const env = automationEnv({ GIT_AUTHOR_DATE: `${time} +0000`, GIT_COMMITTER_DATE: `${time} +0000` });
   const merged = await run(['git', ...runtimeGitConfig(root), 'merge', '--ff', '--no-edit', '-m', message, commit], { cwd: clone, env, allowFailure: true });
   if (merged.exitCode === 0) return [];
-  const conflicts = (await run(['git', 'diff', '--name-only', '-z', '--diff-filter=U'], { cwd: clone })).stdout.split('\0').filter(Boolean);
+  const conflicts = (await run(['git', 'diff', '--name-only', '-z', '--diff-filter=U'], { cwd: clone, rawOutput: true })).stdout.split('\0').filter(Boolean);
   if (conflicts.length) return conflicts;
   if (await exists(path.join(clone, '.git', 'MERGE_HEAD'))) {
     // rerere resolved every conflict from a recorded resolution; conclude the merge it describes.
@@ -136,6 +136,49 @@ export async function mergeIntoIntegration(root, clone, source, commit, message)
     return [];
   }
   throw new OverdriveError(`Merging ${commit} into the integration clone failed: ${(merged.stderr || merged.stdout).slice(-4_000)}`, 'INTEGRATION_FAILED');
+}
+
+// Keeps each command line well under Windows' 32,767-character limit.
+const PATHSPEC_CHUNK_CHARS = 16_000;
+
+function pathspecChunks(paths) {
+  const chunks = [];
+  let size = Infinity;
+  for (const file of paths) {
+    if (size + file.length > PATHSPEC_CHUNK_CHARS) { chunks.push([]); size = 0; }
+    chunks.at(-1).push(file);
+    size += file.length + 1;
+  }
+  return chunks;
+}
+
+// The paths at or under `paths` where commit's tree differs from its unique merge base with base, so a lane that
+// is only behind base shows nothing there. Fetches commit from source when the clone lacks it; every step stops at
+// deadline (epoch ms). Literal pathspecs and --no-renames keep every original path, including a renamed-away one.
+export async function changesSinceMergeBase(clone, source, base, commit, paths, deadline) {
+  const step = async (args, exitCodes = [0]) => {
+    const timeoutMs = deadline - Date.now();
+    if (timeoutMs <= 0) throw new Error('its time limit ran out');
+    const result = await run(['git', ...args], { cwd: clone, rawOutput: true, allowFailure: true, timeoutMs });
+    if (result.timedOut) throw new Error('its time limit ran out');
+    if (result.overflow || !exitCodes.includes(result.exitCode)) throw new Error(result.stderr.trim().slice(-500) || `git ${args[0]} failed`);
+    return result;
+  };
+  try {
+    if ((await step(['cat-file', '-e', `${commit}^{commit}`], [0, 1, 128])).exitCode !== 0) {
+      await step(['fetch', '--no-tags', '--no-write-fetch-head', source, commit]);
+    }
+    const found = (await step(['merge-base', '--all', base, commit], [0, 1])).stdout.split(/\s+/).filter(Boolean);
+    if (found.length !== 1) return { unavailable: found.length ? `${commit.slice(0, 12)} has ${found.length} merge bases with the build base (${found.map(id => id.slice(0, 12)).join(', ')}), so none was chosen.` : `${commit.slice(0, 12)} shares no history with the build base.` };
+    const changed = [];
+    for (const chunk of pathspecChunks(paths)) {
+      const result = await step(['--literal-pathspecs', 'diff-tree', '-r', '-z', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', found[0], commit, '--', ...chunk]);
+      changed.push(...result.stdout.split('\0').filter(Boolean));
+    }
+    return { mergeBase: found[0], paths: changed };
+  } catch (error) {
+    return { unavailable: `Comparing ${commit.slice(0, 12)} failed: ${redactString(error.message)}` };
+  }
 }
 
 async function assertFullRepository(repository) {

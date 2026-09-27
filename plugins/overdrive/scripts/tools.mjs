@@ -216,7 +216,7 @@ export const TOOLS = [
     note: string('Why the finding changed.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false }),
 
-  tool('integration_build', 'Build an integration', 'Reset the runtime-owned integration clone to base and merge the listed lanes in order. A lane contributes its committed HEAD (uncommitted files are left out and counted), or slug@ref an exact revision. Stops at the first conflict; a QA agent\'s conflicted merge stays in place for it to resolve, and the coordinator\'s is aborted.', object({
+  tool('integration_build', 'Build an integration', 'Reset the runtime-owned integration clone to base and merge the listed lanes in order. A lane contributes its committed HEAD (uncommitted files are left out and counted), or slug@ref an exact revision. Stops at the first conflict; a QA agent\'s conflicted merge stays in place for it to resolve, and the coordinator\'s is aborted. The conflict\'s laterLanes lists later lanes whose trees differ at the conflicting files from their merge base with the base.', object({
     ...workspace,
     features: { type: 'array', minItems: 1, maxItems: 50, items: string('Lane slug, or slug@ref.') },
     base: string('Optional project or repository ref; a lane\'s commit joins through features (slug@ref) instead. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
