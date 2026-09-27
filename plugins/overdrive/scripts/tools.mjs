@@ -181,7 +181,7 @@ export const TOOLS = [
     timeout_seconds: integer('Maximum wait. It returns as soon as an agent finishes a turn, needs input or messages you. Defaults to 300 seconds.', 1, 600),
   }, ['workspace_path']), { readOnlyHint: true, openWorldHint: true }),
 
-  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes.', object({
+  tool('lab_run', 'Run a lab suite', 'Run lab/suites/<suite> against an exact revision of a lane, of the integration build or of base, in a clean runtime-owned clone, and record its verdict, output and artifacts. Only these runs count as evidence. A lane defaults to a snapshot of its working tree, uncommitted changes included, taken without touching it; integration defaults to its HEAD; base defaults to the managed project HEAD, or the cached default revision. A pass resolves the open findings this suite reproduces on the tested lanes. Runs on one target wait for each other, because they share its checkout.', object({
     ...workspace,
     suite: suite('Suite to run.'),
     target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
@@ -208,7 +208,7 @@ export const TOOLS = [
     note: string('Why the finding changed.'),
   }, ['workspace_path', 'feature']), { destructiveHint: false }),
 
-  tool('integration_build', 'Build an integration', 'Reset the runtime-owned integration clone to base and merge the listed lanes in order. A lane contributes a snapshot of its working tree, or slug@ref an exact revision. Stops at the first conflict and leaves it in place for resolution.', object({
+  tool('integration_build', 'Build an integration', 'Reset the runtime-owned integration clone to base and merge the listed lanes in order. A lane contributes its committed HEAD (uncommitted files are left out and counted), or slug@ref an exact revision. Stops at the first conflict; a QA agent\'s conflicted merge stays in place for it to resolve, and the coordinator\'s is aborted.', object({
     ...workspace,
     features: { type: 'array', minItems: 1, maxItems: 50, items: string('Lane slug, or slug@ref.') },
     base: string('Optional base ref. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),

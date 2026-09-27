@@ -60,8 +60,7 @@ lab/suites/<name>/suite.json
   "description": "What this suite proves",
   "argv": ["node", "run.mjs"],
   "cwd": "suite",
-  "timeout_seconds": 600,
-  "features": ["search-redesign"]
+  "timeout_seconds": 600
 }
 ```
 
@@ -69,7 +68,6 @@ lab/suites/<name>/suite.json
 - `argv`: 1 to 200 strings, run without a shell.
 - `cwd`: `suite` (the suite directory, the default) or `target` (the checkout under test).
 - `timeout_seconds`: 1 to 3600, default 600.
-- `features`: optional, the lanes the suite covers.
 
 Every run receives this environment:
 
@@ -84,7 +82,7 @@ Every run receives this environment:
 
 A suite starts every service it needs and stops it before exiting. Target clones keep ignored directories such as `node_modules` between runs, so dependency setup should be idempotent, for example reinstalling only when the lockfile changed. Keep dependencies and outputs out of the lab's Git with `.gitignore`, because every run snapshots the lab's working tree.
 
-`lab_run {suite, target, revision?}` targets a lane slug, `integration`, or `base` for control runs. Without a revision a lane is tested at a snapshot of its working tree, uncommitted changes included, the integration build at its HEAD, and `base` at the managed project HEAD, or the cached default revision of an adopted repository. A `base` revision given as a commit ID that the base cannot resolve, such as a foundation lane's commit, is taken from the lane that holds it. A `base` run belongs to no lane and resolves no findings. A run is `passed` (exit 0 within the timeout), `failed`, or `uncertain` when its processes could not be confirmed stopped. Artifacts stay in `.overdrive/lab/runs/<id>/artifacts/`, with a manifest of path, size and sha256. The runtime keeps the last 500,000 characters of a run's combined output, in the order it was printed, in `.overdrive/lab/runs/<id>/output.log`. `lab_run` and `lab_get {run}` return a 4,000-character output tail and that log's path (`outputLog`), and `lab_get {run}` also lists the artifacts. `lab_get` without a run lists the suites, the latest runs, the integration build and, on request, findings; with target `integration`, the findings are those on the lanes the build includes.
+`lab_run {suite, target, revision?}` targets a lane slug, `integration`, or `base` for control runs. Without a revision a lane is tested at a snapshot of its working tree, uncommitted changes included, the integration build at its HEAD, and `base` at the managed project HEAD, or the cached default revision of an adopted repository. A `base` revision given as a commit ID that the base cannot resolve, such as a foundation lane's commit, is taken from the lane that holds it. A `base` run belongs to no lane and resolves no findings. Runs on one target wait for each other, because they share its checkout. A run is `passed` (exit 0 within the timeout), `failed`, or `uncertain` when its processes could not be confirmed stopped. Artifacts stay in `.overdrive/lab/runs/<id>/artifacts/`, with a manifest of path, size and sha256. The runtime keeps the last 500,000 characters of a run's combined output, in the order it was printed, in `.overdrive/lab/runs/<id>/output.log`. `lab_run` and `lab_get {run}` return a 4,000-character output tail and that log's path (`outputLog`), and `lab_get {run}` also lists the artifacts. `lab_get` without a run lists the suites, the latest runs, the integration build and, on request, findings; with target `integration`, the findings are those on the lanes the build includes.
 
 Feature agents may read the lab and run suites against their own lane only. QA agents may run any target, record findings and build integrations.
 
@@ -92,14 +90,14 @@ Feature agents may read the lab and run suites against their own lane only. QA a
 
 ## Integration and publishing
 
-`integration_build {features, base?}` merges lanes in order into `.overdrive/lab/integration`. Each entry is a lane slug, which contributes a snapshot of its working tree, or `slug@ref` for an exact revision. On a conflict, the build stops with the lane and the conflicting files, and leaves the merge in place. Resolve and commit it in the integration clone, or run `git merge --abort` there and have the lanes reconcile. Lanes after the conflict are not merged yet (`lab_get` lists them as `pending`), so rebuild to include them; rebuilds replay the recorded resolution. Then test the integration with `lab_run` on target `integration`.
+`integration_build {features, base?}` merges lanes in order into `.overdrive/lab/integration`. Each entry is a lane slug, which contributes its committed HEAD (uncommitted files are left out and counted as `uncommittedFiles`), or `slug@ref` for an exact revision. On a conflict, the build stops with the lane and the conflicting files. A QA agent's conflicted merge stays in place: resolve and commit it in the integration clone, or run `git merge --abort` there and have the lanes reconcile. The coordinator's is aborted, so it sends the conflicting files to the owning lanes. Lanes after the conflict are not merged yet (`lab_get` lists them as `pending`), so rebuild to include them; rebuilds replay the recorded resolution. Then test the integration with `lab_run` on target `integration`.
 
 `integrate {target, revision?}` takes a lane or `integration` and only committed work, so test the exact commit you mean to integrate:
 
 - **Managed project:** fast-forwards `project/` when it is clean and on its default branch, the commit contains its HEAD, a lab run passed at that commit, and no blocking finding is open on the included lanes. The lanes become `done` and new lanes start from the new HEAD. `PROMOTION_NOT_FAST_FORWARD` means the commit does not contain the project HEAD; rebuild the integration on the current HEAD, which `integration_build` does by default.
 - **Adopted repository:** publishes nothing. It returns the commit, the checkout that holds it (`path`), any open blocking findings, and two commands for a branch, `feature/<slug>` for a lane or a name you fill in for the integration: `push` pushes the commit from that checkout to the repository URL, and `fetch`, run in the user's own clone, creates the branch at the commit. When the commit has a passing run and no open blocking findings, the included lanes become `done`. With the user's authority, the coordinator runs the push, to the user's fork when they cannot push to the repository; otherwise the user runs the fetch.
 
-Both results list the latest run of each suite at the commit and, in `suitesNotRun`, the lab suites that never ran there; these do not block integration, but a report must not claim them as passing.
+Both results list the latest run of each suite at the commit and, in `suitesNotRun`, the lab suites that never ran there, leaving out suites that have only run, and passed, on base, such as a harness self-test; these do not block integration, but a report must not claim them as passing.
 
 ## Recovery
 

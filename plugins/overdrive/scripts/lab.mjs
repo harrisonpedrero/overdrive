@@ -418,22 +418,30 @@ async function baseTarget(ctx, ref) {
   }
 }
 
-export async function buildIntegration({ workspace_path, features, base }) {
+// integrate accepts only committed lane work, so an unpinned lane contributes its HEAD and counts what it leaves out.
+async function laneRevision(checkout, ref) {
+  if (ref) return { revision: await verifyCheckoutRevision(checkout, ref) };
+  const { head, clean, changedFileCount } = await repositorySnapshot(checkout);
+  return { revision: head, ...(clean ? {} : { uncommittedFiles: changedFileCount }) };
+}
+
+export async function buildIntegration({ workspace_path, features, base, from }) {
   if (!Array.isArray(features) || features.length < 1 || features.length > 50) throw new OverdriveError('features must list 1-50 lanes.', 'INVALID_INPUT');
   const requested = features.map(laneReference);
   if (new Set(requested.map(entry => entry.slug)).size !== requested.length) throw new OverdriveError('Each lane can appear once in an integration.', 'INVALID_INPUT');
   const baseRef = optionalText(base, 'base', { max: 200 });
+  const caller = agentName(from);
   return await withContext(workspace_path, ctx => withWorkspaceLock(ctx.root, labLock('integration'), async () => {
     const built = parseJson(meta(ctx.db, 'integration'), null)?.head ?? null;
     const lanes = [];
     for (const { slug, ref } of requested) {
-      const lane = laneRow(ctx, slug);
-      lanes.push({ slug, checkout: lane.checkout_path, revision: ref ? await verifyCheckoutRevision(lane.checkout_path, ref) : await snapshotCommit(lane.checkout_path) });
+      const checkout = laneRow(ctx, slug).checkout_path;
+      lanes.push({ slug, checkout, ...await laneRevision(checkout, ref) });
     }
     const start = await integrationBase(ctx, baseRef);
     const clone = await resetIntegration(ctx.root, start.revision, start.source, built, ctx.config.repository);
     // Recorded before merging, so a failed build never leaves an older composition describing this clone.
-    const composition = { base: start.revision, features: lanes.map(({ slug, revision }) => ({ slug, revision })), head: null, built_at: now() };
+    const composition = { base: start.revision, features: lanes.map(({ checkout, ...lane }) => lane), head: null, built_at: now() };
     meta(ctx.db, 'integration', JSON.stringify(composition));
     for (const lane of lanes) {
       const files = await mergeIntoIntegration(ctx.root, clone, lane.checkout, lane.revision, `Integrate ${lane.slug} ${lane.revision.slice(0, 12)}`);
@@ -448,12 +456,17 @@ export async function buildIntegration({ workspace_path, features, base }) {
         : `Built integration ${composition.head.slice(0, 12)} of ${lanes.map(lane => lane.slug).join(', ')}.`,
       details: composition,
     });
-    if (!composition.conflict) return { integration: composition, path: clone };
-    return {
-      integration: composition,
-      path: clone,
-      next: `The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`,
-    };
+    const notes = [];
+    // Only QA resolves conflicts in the clone, and a merge left in place would block its next build.
+    if (composition.conflict && caller === 'coordinator') {
+      await git(clone, 'merge', '--abort');
+      notes.push(`Merging ${composition.conflict.feature} conflicted, so the merge was aborted. Send the conflicting files to the owning lanes, or have qa rebuild and resolve a trivial conflict in the integration clone.`);
+    } else if (composition.conflict) {
+      notes.push(`The conflicted merge is left in ${clone}. Resolve and commit it there to test it with lab_run target integration, or run git merge --abort there and have the lanes reconcile before rebuilding.`);
+    }
+    const leftOut = lanes.filter(lane => lane.uncommittedFiles).map(lane => lane.slug);
+    if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
+    return { integration: composition, path: clone, ...(notes.length ? { next: notes.join(' ') } : {}) };
   }));
 }
 
@@ -536,10 +549,17 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
   };
 }
 
+// A suite that has only run on base and passed there, such as a harness self-test, checks the lab rather than the lanes.
+async function suitesNotRunAt(ctx, runs) {
+  const baseOnly = new Set(ctx.db.prepare("SELECT suite FROM lab_runs GROUP BY suite HAVING SUM(target <> 'base') = 0 AND SUM(status = 'passed') > 0").all().map(row => row.suite));
+  return (await listSuites(ctx.root, await ensureLab(ctx.root))).map(suite => suite.name)
+    .filter(name => !baseOnly.has(name) && !runs.some(run => run.suite === name));
+}
+
 async function promote(ctx, { target, commit, source, branch, lanes }) {
   const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
   const runs = latestRunsBySuite(ctx, commit);
-  const suitesNotRun = (await listSuites(ctx.root, await ensureLab(ctx.root))).map(suite => suite.name).filter(name => !runs.some(run => run.suite === name));
+  const suitesNotRun = await suitesNotRunAt(ctx, runs);
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];

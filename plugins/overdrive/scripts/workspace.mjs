@@ -130,7 +130,7 @@ async function ensureWorkspaceFiles(root, config) {
   }
 }
 
-const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so. Stop every server you started before your turn ends, by its PID or process tree (on Windows, `taskkill /PID <pid> /T /F`; in Git Bash `$!` is not a Windows PID, so use `taskkill //PID $(cat /proc/$!/winpid) //T //F`), never by image name such as dotnet.exe or node.exe: other agents\' lab runs and the user\'s own programs share this machine.';
+const LOCAL_SERVERS = 'Bind any server you start to 127.0.0.1 only, including servers the project\'s own tests and tools start (binding all interfaces triggers firewall prompts on the user\'s machine). When one would listen on all interfaces, override its host or leave it out and say so. Give each server you start a port the OS picks (port 0) or a random high port, never a fixed or memorable number: parallel agents choose the same numbers, and on Windows a server that sets SO_REUSEADDR binds a port already in use and answers another agent\'s requests. Stop every server you started before your turn ends, by its PID or process tree (on Windows, `taskkill /PID <pid> /T /F`; in Git Bash `$!` is not a Windows PID, so use `taskkill //PID $(cat /proc/$!/winpid) //T //F`), never by image name such as dotnet.exe or node.exe: other agents\' lab runs and the user\'s own programs share this machine.';
 const TURN_END = 'Background commands, subagents and scheduled wakeups you leave running when your turn ends are stopped or never report back, so wait for work whose result you need before your handoff.';
 const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
 const SPEC_GAPS = 'When the spec contradicts its own goal, or a result meets the spec but would look wrong to the person using it, send `coordinator` the concrete example instead of following or encoding it silently, and keep working on the rest while it decides.';
@@ -166,7 +166,7 @@ function qaAgentInstructions(root, agent) {
 You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
 
 - Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Where expected results would otherwise come only from the spec, add an independent oracle when one exists: an established tool or reference implementation to compare against, or real-world inputs. Wrap the repository's own checks (build, lint, existing tests and the CI jobs that gate merges) as suites too, because lanes run only the checks nearest their change. When a check's runner is missing, look for an equivalent this machine can run before leaving the check out, and name any check you leave out in your handoff. The lab README describes the suite format.
-- Use browser and computer control where rendering or interaction matters. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
+- Use browser and computer control where rendering or interaction matters, and check first what lanes said they could not verify themselves, such as rendering (feature agents have no browser), so those findings reach the lanes early. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
 - Run suites with lab_run; only runs the runtime executed are evidence. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes.
 - Build and test integration combinations with integration_build. Your handoff reaches the coordinator, so message \`coordinator\` only when it must act before your turn ends. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
@@ -556,14 +556,12 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
       "description": "What this suite proves",
       "argv": ["node", "run.mjs"],
       "cwd": "suite",
-      "timeout_seconds": 600,
-      "features": ["lane-slug"]
+      "timeout_seconds": 600
     }
 
 - argv: the command as 1-200 argument strings, run without a shell.
 - cwd: "suite" (this suite's directory, the default) or "target" (the checkout under test).
 - timeout_seconds: 1-3600, default 600.
-- features: optional lane slugs the suite covers.
 
 ## Environment
 
@@ -584,7 +582,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
-- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Keep one-time checks of a suite itself, such as mutation runs, in a suite of their own, so reruns on lanes and integration stay fast.
+- Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Against a base that cannot pass at all, such as a new project's stub, a failure proves little and a slow suite wastes minutes there; break the property the suite checks with a mutant instead. Keep one-time checks of a suite itself, such as mutation runs, in a suite of their own, so reruns on lanes and integration stay fast.
 - Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
 `;
 
@@ -1156,7 +1154,8 @@ async function applyFeatureUpdate(root, slug, { status, spec, rationale, summary
     const current = featureBySlug(ctx.db, slug);
     await writeFeatureContext(ctx, current);
     await writeIndex(ctx);
-    return { feature: summarizeFeature(ctx, current), ...(specResult ? { spec: specResult } : {}) };
+    const agent = { status: current.agent_status, activeTurnId: current.active_turn_id ?? null };
+    return { feature: { slug, status: current.status, specRevision: current.spec_revision, agent }, ...(specResult ? { spec: specResult } : {}) };
   } finally { ctx.db.close(); }
 }
 
