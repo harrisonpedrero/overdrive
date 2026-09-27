@@ -809,12 +809,12 @@ export class ClaudeWorkerBridge extends EventEmitter {
 
   async #workingPatch(meta) {
     const options = { cwd: meta.cwd, allowFailure: true, timeoutMs: 60_000, maxOutput: 2_000_000 };
-    const tracked = await run(['git', 'diff', 'HEAD', '--no-color', '--no-ext-diff', '--'], options);
+    const tracked = await run(['git', 'diff', 'HEAD', '--no-color', '--no-ext-diff', '--no-textconv', '--'], options);
     if (tracked.exitCode !== 0) return null;
     const untracked = await run(['git', 'ls-files', '--others', '--exclude-standard'], options);
     let patch = tracked.stdout;
     for (const file of untracked.stdout.split(/\r?\n/).filter(Boolean).slice(0, 50)) {
-      const piece = await run(['git', 'diff', '--no-index', '--no-color', '--', '/dev/null', file], { ...options, maxOutput: 200_000 });
+      const piece = await run(['git', 'diff', '--no-index', '--no-color', '--no-ext-diff', '--no-textconv', '--', '/dev/null', file], { ...options, maxOutput: 200_000 });
       if (piece.stdout) patch += `\n${piece.stdout}`;
     }
     return patch.trim() ? patch : null;
