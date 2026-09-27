@@ -435,8 +435,8 @@ export async function repositorySnapshot(repository, baseRevision = undefined) {
     branch,
     clean: lines.length === 0,
     changedFileCount: lines.length,
-    changedFiles: changedFiles.slice(0, 200),
-    status: lines.slice(0, 200),
+    changedFiles: changedFiles.slice(0, 200).map(redactString),
+    status: lines.slice(0, 200).map(line => line.slice(0, 3) + redactString(line.slice(3))),
     ahead,
     behind,
   };
