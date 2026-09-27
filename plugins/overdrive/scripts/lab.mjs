@@ -1116,7 +1116,8 @@ async function suitesNotRunAt(ctx, runs) {
 
 async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   const changes = await committedChanges(source, base, commit);
-  const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
+  // A base run is a control belonging to no lane, even at a lane's commit, so it never qualifies a delivery.
+  const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL AND target <> 'base' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
   const runs = await deliveredRuns(ctx, commit);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
   const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, lanes }));
@@ -1125,7 +1126,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
     : [];
   const managed = ctx.config.managedProject;
   if (!managed) return await deliverAdopted(ctx, { target, commit, source, branch, lanes }, passing, blocking, runs, suitesNotRun, changes, gaps);
-  if (!passing) throw new OverdriveError(`No passing lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
+  if (!passing) throw new OverdriveError(`No passing lane or integration lab run at ${commit.slice(0, 12)}; run lab_run against ${target} at that revision first.`, 'INTEGRATE_UNTESTED');
   if (blocking.length) {
     throw new OverdriveError(`Open blocking findings: ${blocking.map(finding => `${finding.id} (${finding.feature}: ${finding.title})`).join('; ')}.`, 'INTEGRATE_BLOCKED', { findings: blocking.map(finding => finding.id) });
   }

@@ -60,7 +60,7 @@ const target = string('A feature lane slug, or integration for the integration b
 const labRun = {
   suite: suite('Suite to run.'),
   target: { ...target, description: 'A feature lane slug, integration for the integration build, or base for a control run that belongs to no lane, such as showing a suite fails without the lanes\' changes.' },
-  revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from.'),
+  revision: string('Optional branch, tag or commit in the target checkout. For base, a commit ID may also be a lane\'s commit, such as the foundation commit other lanes start from; that control run still never qualifies the commit for integrate.'),
   mutant: string('Optional lab-relative path of a patch in the lab snapshot, applied to the target checkout before the suite runs. The run is a recorded mutant control with its raw passed or failed status; a failure shows detection only beside a passing unmutated run and a failure caused by the patch. It never counts as evidence about the target, resolves no finding and is left out of integrate.'),
 };
 export const TOOLS = [
@@ -225,7 +225,7 @@ export const TOOLS = [
     base: string('Optional project or repository ref; a lane\'s commit joins through features (slug@ref) instead. Defaults to the managed project HEAD, otherwise the refreshed default revision.'),
   }, ['workspace_path', 'features']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run and no open blocking findings on the lanes it contains. Never pushes. For an adopted repository it publishes nothing: it returns the commit, its checkout path, a push command to run with the user’s authority and a fetch command for the user’s own clone, and delivers the commit when it has a passing lab run and no open blocking findings. On delivery it marks done each included lane whose checkout is clean and whose HEAD is contained in the resulting project HEAD, or in the selected commit for an adopted repository; the rest keep their status and next action and are listed in remainingWork.', object({
+  tool('integrate', 'Integrate into the project', 'Fast-forward the managed project to a lane or integration commit that has a passing lab run on a lane or integration (a base control run never counts) and no open blocking findings on the lanes it contains. Never pushes. For an adopted repository it publishes nothing: it returns the commit, its checkout path, a push command to run with the user’s authority and a fetch command for the user’s own clone, and delivers the commit when it has a passing lab run and no open blocking findings. On delivery it marks done each included lane whose checkout is clean and whose HEAD is contained in the resulting project HEAD, or in the selected commit for an adopted repository; the rest keep their status and next action and are listed in remainingWork.', object({
     ...workspace,
     target: target,
     revision: string('Optional exact revision. Defaults to the HEAD of a clean lane, or of the integration clone.'),
