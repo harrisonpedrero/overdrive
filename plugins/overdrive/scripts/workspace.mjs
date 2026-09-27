@@ -158,7 +158,7 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - ${MESSAGES}
 - ${USER_CONFIG}
 - ${SPEC_GAPS}
-- No browser or computer use. When a change is ready to test, or you need a behavior verified, commit it and send \`qa\` a message saying what changed and what to test.
+- No browser or computer use. When a change is ready to test, or you need a behavior verified, commit it and send \`qa\` a message saying what changed and what to test. Before saying a change is ready, read your whole diff against the Base in your context packet, untracked files included, and remove what the spec did not need.
 - Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
 - Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
 - Your \`overdrive\` tools: message_send reaches \`qa\`, another lane or \`coordinator\`; lanes shows every lane and QA agent; lab_get and lab_run read and run lab suites against your own lane.
@@ -171,7 +171,7 @@ function qaAgentInstructions(root, agent) {
 
 You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab at ${labPath(root)}, a local Git repository that is never pushed and stays decoupled from the product repository. ${agentFiles(root, agent.slug)}
 
-- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Where expected results would otherwise come only from the spec, add an independent oracle when one exists: an established tool or reference implementation to compare against, or real-world inputs. Wrap the repository's own checks (build, lint, existing tests and the CI jobs that gate merges) as suites too, because lanes run only the checks nearest their change; a wrapped test suite writes tests.json and runs on base in the same batch, so its runs are judged by regressions against base. When a check's runner is missing, look for an equivalent this machine can run before leaving the check out, and name in your handoff any check you leave out and any acceptance criterion or must-keep behavior in the lane specs that no suite exercises. The lab README describes the suite format and ENVIRONMENT.md, which you keep current, including with facts lanes send you.
+- Build and extend reusable harnesses, fixtures and suites in the lab. Bias toward integration and end-to-end journeys through real interfaces. Derive expected results from the spec, and from an independent oracle when one exists (an established tool or reference implementation to compare against, or real-world inputs), before reading the lane's implementation. Wrap the repository's own checks (build, lint, existing tests and the CI jobs that gate merges) as suites too, because lanes run only the checks nearest their change, and add the lab README's quality-delta suite when several lanes change code; a wrapped test suite writes tests.json and also runs on base, at the revision the lanes or the build start from and with the same lab snapshot (in the same batch, or in the call just before when it needs a fixed port or another machine-wide resource), so its runs are judged by regressions against base. When a check's runner is missing, look for an equivalent this machine can run before leaving the check out, and name in your handoff any check you leave out and, by number (AC-n), any criterion in the lane specs that no suite checks. The lab README describes the suite format and ENVIRONMENT.md, which you keep current, including with facts lanes send you.
 - Use browser and computer control where rendering or interaction matters, and check first what lanes said they could not verify themselves, such as rendering (feature agents have no browser), so those findings reach the lanes early. Keep suites deterministic, fast and parametrized by OVERDRIVE_TARGET. Local services answer in milliseconds, so give browser actions and requests timeouts of a few seconds rather than framework defaults such as Playwright's 30 s; allow longer only for startup.
 - Run suites with lab_run; only runs the runtime executed are evidence. Your calls run one at a time, so pass independent runs together in \`batch\` (a suite sweep on an integration, or a control on base beside the lane it checks); keep benchmarks and other timing-sensitive suites, and suites that need a fixed port or another machine-wide resource such as a shared database, in a call of their own. Record a defect with finding_record as soon as you have diagnosed it; it notifies the owning lane, which can fix it while you finish the suite. Add the repro suite to the finding (finding_record with its id) once it exists. Retest fixes. When a suite covering a lane first works while that lane is still in progress, tell it the suite's name, so it can run the suite itself with lab_run.
 - Fix a failing suite only for a technical fault in the suite, and say what changed. The spec decides expected outcomes; ask \`coordinator\` when it is silent. Never skip, loosen, or add retries or sleeps to turn a repro green; close its finding as wontfix with a note instead.
@@ -574,7 +574,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 
 ## tests.json
 
-A suite that runs many tests, such as one wrapping the repository's own tests, writes its per-test results to $OVERDRIVE_ARTIFACTS/tests.json as {"<test id>": "passed|failed|error|skipped"}, converted from the runner's JUnit or TRX report by one converter the lab shares. A lane or integration run of such a suite is compared test by test with the latest base run of the same suite at the same lab snapshot, such as one in the same lab_run batch: vsBase lists regressions (tests that passed on base but not here, missing ones included) and fixed tests, or says why it is incomplete. The exit code stays the verdict; judge a suite that already fails on base by its regressions.
+A suite that runs many tests, such as one wrapping the repository's own tests, writes its per-test results to $OVERDRIVE_ARTIFACTS/tests.json as {"<test id>": "passed|failed|error|skipped"}, converted from the runner's JUnit or TRX report by one converter the lab shares. A lane or integration run of such a suite is compared test by test with the latest base run of the same suite at the lane's base revision (for integration, the build's base) and the same lab snapshot, such as one in the same lab_run batch: vsBase lists regressions (tests that passed on base but not here, missing ones included) and fixed tests, or says why it is incomplete. The exit code stays the verdict; judge a suite that already fails on base by its regressions.
 
 ## Rules
 
@@ -591,19 +591,31 @@ A suite that runs many tests, such as one wrapping the repository's own tests, w
 - Before a suite trusts a new tool's exit code, show that the tool fails when it should (a negative control). Some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows.
 - Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Against a base that cannot pass at all, such as a new project's stub, a failure proves little and a slow suite wastes minutes there; use mutants instead. Keep other one-time checks of a suite itself, such as a tool's negative control, in a suite of their own, so reruns on lanes and integration stay fast.
 - A mutant is a patch committed to the lab (made with git diff in a clone of the target) that breaks one property a suite checks. Pass its lab-relative path as mutant in lab_run: the runtime applies it to the target checkout, records the run as a mutant control and never as evidence about the target, and lab_get lists each mutant run with its raw status, passed or failed. Write 2-5 intent-aware mutants per lane on changed lines the suite executes. A failure counts as a kill only when the same suite passed without the mutant at that revision and lab snapshot and the output shows the injected defect caused it, not a build or setup error.
+- A quality-delta suite catches duplication and complexity the lanes add, including logic two lanes each wrote: on the files changed between base and the target revision, run the repository's linters, a clone detector (such as jscpd) and a complexity counter (such as lizard) at both revisions. Fail on new duplicate blocks that involve changed lines and on new functions above the repository's complexity threshold, and print the other deltas.
 - Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree.
 `;
+
+const ENVIRONMENT_TEMPLATE = '# Environment facts\n\n## Verified commands\n\n## Failures known at base\n\n## Machine quirks\n';
+
+// A lab created before ENVIRONMENT.md also has an older README, which is replaced unless it has uncommitted edits.
+async function upgradeLab(root, lab) {
+  if (await exists(contained(lab, 'ENVIRONMENT.md'))) return lab;
+  const readme = await run(['git', 'diff', '--quiet', '--no-ext-diff', '--no-textconv', 'HEAD', '--', 'README.md'], { cwd: lab, allowFailure: true });
+  if (readme.exitCode === 0) await atomicWrite(root, contained(lab, 'README.md'), LAB_README);
+  await atomicWrite(root, contained(lab, 'ENVIRONMENT.md'), ENVIRONMENT_TEMPLATE);
+  return lab;
+}
 
 // Workspaces initialized before the lab existed get it on first lab use.
 export async function ensureLab(root) {
   const lab = await ensureManagedPath(root, labPath(root));
-  if (await exists(contained(lab, '.git'))) return lab;
+  if (await exists(contained(lab, '.git'))) return await upgradeLab(root, lab);
   return await withWorkspaceLock(root, 'lab', async () => {
     if (await exists(contained(lab, '.git'))) return lab;
     if (await exists(lab)) throw new OverdriveError(`${lab} exists but is not a Git repository. Move it aside so OVERDRIVE can create the lab there.`, 'LAB_PATH_OCCUPIED');
     await fs.mkdir(lab);
     await atomicWrite(root, contained(lab, 'README.md'), LAB_README);
-    await atomicWrite(root, contained(lab, 'ENVIRONMENT.md'), '# Environment facts\n\n## Verified commands\n\n## Failures known at base\n\n## Machine quirks\n');
+    await atomicWrite(root, contained(lab, 'ENVIRONMENT.md'), ENVIRONMENT_TEMPLATE);
     await atomicWrite(root, contained(lab, '.gitignore'), 'node_modules/\n');
     await initializeRepository(root, lab, 'main', 'Initialize the OVERDRIVE lab');
     await ensureCommitIdentity(lab);
@@ -1220,6 +1232,8 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new OverdriveError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
     const packet = await writeFeatureContext(ctx, row);
+    // Older workspaces kept a copy of the contract above the checkout, where Claude Code would still load it.
+    await fs.rm(contained(ctx.root, 'features', row.slug, 'AGENTS.md'), { force: true });
     const contextPath = contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md');
     const profile = workerProfile(row);
     return {

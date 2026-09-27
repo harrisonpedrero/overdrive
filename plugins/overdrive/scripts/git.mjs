@@ -144,10 +144,10 @@ export async function mergeIntoIntegration(root, clone, source, commit, message)
 
 // The paths merging commit into head would conflict on, merged in memory so the clone's index, working tree and any
 // merge in progress stay untouched. Resolutions rerere recorded are not replayed here.
-export async function mergeConflicts(clone, source, head, commit) {
+export async function mergeConflicts(clone, source, head, commit, timeoutMs) {
   try {
     await fetchCommit(clone, source, commit);
-    const result = await run(['git', 'merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', head, commit], { cwd: clone, rawOutput: true, allowFailure: true, timeoutMs: 60_000 });
+    const result = await run(['git', 'merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', head, commit], { cwd: clone, rawOutput: true, allowFailure: true, timeoutMs });
     // Exit 1 means conflicts only when a tree was written; merge-tree also exits 1 for commits it cannot merge.
     const [tree, ...files] = result.stdout.split('\0');
     if (result.timedOut || result.exitCode > 1 || !/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(result.timedOut ? 'it timed out' : result.stderr.trim().slice(-500) || `git merge-tree exited ${result.exitCode}`);
@@ -543,6 +543,8 @@ export async function isGitAncestor(repository, ancestor, descendant) {
 const CHANGED_FILE_LIMIT = 100;
 const CHANGED_PATH_MAX = 300;
 const TREE_DIFF_OUTPUT_MAX = 16_000_000;
+// Product test files by common naming conventions: a test directory, test_*, *_test.*, *.spec.*, FooTest.*.
+const PRODUCT_TEST_PATH = /(?:^|\/)(?:[Tt]ests?|[Ss]pec|__tests__|testdata|[^/]+\.Tests?)\/|(?:^|\/)test_[^/]*$|[._-](?:tests?|spec)\.[^/]+$|(?:Tests?|Spec)\.[^/.]+$/;
 
 const clipPath = text => `${text.slice(0, CHANGED_PATH_MAX - 1).replace(/[\uD800-\uDBFF]$/, '')}…`;
 
@@ -615,6 +617,8 @@ export async function committedChanges(repository, from, to) {
   if (!files) return unavailable('Git returned a change list that could not be read exactly.');
   const total = key => files.reduce((sum, file) => sum + (file[key] ?? 0), 0);
   const listed = files.slice(0, CHANGED_FILE_LIMIT).map(reviewFile);
+  const productTests = files.filter(file => PRODUCT_TEST_PATH.test(file.path) || PRODUCT_TEST_PATH.test(file.previousPath ?? ''))
+    .slice(0, CHANGED_FILE_LIMIT).map(file => reviewFile(file).path);
   return {
     from, to,
     fileCount: files.length,
@@ -622,6 +626,7 @@ export async function committedChanges(repository, from, to) {
     deletions: total('deletions'),
     binaryFiles: files.filter(file => file.binary).length,
     files: listed,
+    ...(productTests.length ? { productTests } : {}),
     // Any lossy list is marked: files left out, or a listed path clipped.
     truncated: files.length > listed.length || listed.some(file => file.pathClipped),
   };

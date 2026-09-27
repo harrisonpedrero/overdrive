@@ -323,6 +323,7 @@ function sessionParams(runtime) {
     cwd: runtime.cwd,
     runtimeWorkspaceRoots: runtime.roots,
     writeRoots: runtime.writeRoots,
+    workspaceRoot: runtime.root,
     developerInstructions: runtime.developerInstructions,
     workerServer: workerServer(runtime.root, runtime.feature.slug),
   };

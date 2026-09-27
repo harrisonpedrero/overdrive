@@ -1,5 +1,5 @@
-// Worker PreToolUse hook (argv: profile, then the agent's write roots): an allowed call gets no decision, so
-// user permission rules still apply, and a denied or unvettable call exits 2, the only hook failure that blocks it.
+// Worker PreToolUse hook (argv: profile, workspace root, then the agent's write roots): an allowed call gets no decision,
+// so user permission rules still apply, and a denied or unvettable call exits 2, the only hook failure that blocks it.
 const BLOCKED = 2;
 
 function block(reason) {
@@ -21,7 +21,8 @@ try {
   const call = await readInput();
   if (typeof call?.tool_name !== 'string' || !call.tool_name.trim() || !isObject(call.tool_input)) block('OVERDRIVE worker policy received a malformed tool call, so it was blocked.');
   else {
-    const decision = workerToolDecision(process.argv[2] === 'qa' ? 'qa' : 'feature', call.tool_name, call.tool_input, { writeRoots: process.argv.length > 3 ? process.argv.slice(3) : null });
+    const [profile, workspaceRoot, ...writeRoots] = process.argv.slice(2);
+    const decision = workerToolDecision(profile === 'qa' ? 'qa' : 'feature', call.tool_name, call.tool_input, { writeRoots: writeRoots.length ? writeRoots : null, workspaceRoot: workspaceRoot || null });
     if (!decision.allow) block(decision.message);
   }
 } catch {
