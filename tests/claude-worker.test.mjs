@@ -65,10 +65,10 @@ test('claude worker launch follows its capability profile, resumes and is free o
   const resumed = workerLaunchArgs({ ...meta, persisted: true }, 'high');
   assert.ok(resumed.includes('--resume') && !resumed.includes('--session-id') && !resumed.includes('--name'));
   const env = workerEnvironment({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_PID: '1', PATH: 'p', ANTHROPIC_BASE_URL: 'u' });
-  assert.deepEqual(env, { ANTHROPIC_BASE_URL: 'u', PATH: 'p', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' });
+  assert.deepEqual(env, { ANTHROPIC_BASE_URL: 'u', PATH: 'p', CLAUDE_AUTO_BACKGROUND_TASKS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' });
   for (const inherited of [{ CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0' }, { claude_code_disable_auto_memory: '0' }]) {
     const forced = workerEnvironment({ ...inherited, CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h' });
-    assert.deepEqual(forced, { CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' });
+    assert.deepEqual(forced, { CLAUDE_CODE_OAUTH_TOKEN: 't', HOME: 'h', CLAUDE_AUTO_BACKGROUND_TASKS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', OVERDRIVE_WORKER: '1' });
   }
   assert.throws(() => normalizeWorkerOptions({ permissionMode: 'plan' }), error => error.code === 'INVALID_STATE');
   assert.throws(() => normalizeWorkerOptions({ allowedTools: 'Bash' }), error => error.code === 'INVALID_STATE');

@@ -76,8 +76,9 @@ const registrations = new Map();
 const turnMessages = new Map();
 const turnDiffs = new Map();
 const turnPlans = new Map();
-// Per turn, the tool calls started and not yet returned, in memory only.
+// Per turn, the tool calls started and not yet returned, and the background tasks still running, in memory only.
 const turnTools = new Map();
+const turnBackground = new Map();
 const completedTurns = new Set();
 // Sessions this controller created whose first turn has not started; their usage starts at zero.
 const freshThreads = new Set();
@@ -104,6 +105,7 @@ function register(threadId, workspacePath, feature, handoffPending = null) {
 }
 
 const runningTools = turnId => [...(turnTools.get(turnId)?.values() ?? [])].map(({ tool, startedAt }) => ({ tool, runningSeconds: Math.round((Date.now() - startedAt) / 1000) }));
+const backgroundTasks = turnId => (turnBackground.get(turnId) ?? []).map(({ task, type, since }) => ({ task, type, runningSeconds: Math.round((Date.now() - since) / 1000) }));
 
 function textInput(text) {
   return [{ type: 'text', text, text_elements: [] }];
@@ -215,6 +217,10 @@ async function onNotification({ method, params }) {
     else turnTools.get(params.turnId)?.delete(params.item.id);
     return;
   }
+  if (method === 'worker/backgroundTasks') {
+    turnBackground.set(params.turnId, params.tasks);
+    return;
+  }
   // Codex reports the thread's cumulative totals; a Claude worker reports allowlisted result totals.
   if (method === 'thread/tokenUsage/updated') {
     await recordAgentUsage({ ...base, thread_id: params.threadId, turn_id: params.turnId, totals: codexUsageSnapshot(params.tokenUsage) });
@@ -251,6 +257,7 @@ async function onNotification({ method, params }) {
     turnDiffs.delete(turnId);
     turnPlans.delete(turnId);
     turnTools.delete(turnId);
+    turnBackground.delete(turnId);
     if (!saved.ignored && turnId) {
       completedTurns.add(completionKey);
       if (completedTurns.size > 256) completedTurns.delete(completedTurns.values().next().value);
@@ -274,6 +281,7 @@ bridge.on('exit', (error, threadIds = null) => {
     const runtime = await featureRuntime({ ...base, allow_inactive: true }).catch(() => null);
     const feature = runtime?.feature;
     turnTools.delete(feature?.active_turn_id);
+    turnBackground.delete(feature?.active_turn_id);
     // A turn that may outlive its backend connection (a known active turn or a request that may
     // have been delivered) stays uncertain with its turn ID; the native session settles it later.
     const mayBeLive = Boolean(feature?.active_turn_id || ['starting', 'uncertain'].includes(feature?.agent_status));
@@ -288,6 +296,7 @@ bridge.on('exit', (error, threadIds = null) => {
     turnPlans.clear();
     turnDiffs.clear();
     turnTools.clear();
+    turnBackground.clear();
   }
   }).catch(() => {});
 });
@@ -679,15 +688,16 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
   }
   const context = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 30, committed_changes });
   const turnId = context.feature.agent.activeTurnId;
-  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clipTail(turnMessages.get(turnId), 3_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null, running: runningTools(turnId) }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
+  const background = backgroundTasks(turnId);
+  return { ...context, nativeTask: thread, liveProgress: { message: turnMessages.get(turnId) ? clipTail(turnMessages.get(turnId), 3_000) : null, plan: turnPlans.get(turnId) ?? null, diff: turnDiffs.get(turnId) ?? null, running: runningTools(turnId), ...(background.length ? { background } : {}) }, warning, safety: 'Reasoning items are intentionally filtered. Visible agent messages and plans are reports, not evidence.' };
 }
 
 // On a timeout an agent is reported by where it stands, never by its previous handoff.
-function progressRow({ feature: { slug, status, agent, spend }, git: { head, changedFileCount, unavailable }, liveProgress, warning }) {
+function progressRow({ feature: { slug, status, agent, spend }, git: { head, changedFileCount, unavailable }, liveProgress: { message, running, background }, warning }) {
   return {
     feature: { slug, status, agent: { status: agent.status, activeTurnId: agent.activeTurnId }, ...(spend ? { spend } : {}) },
     git: { head, changedFileCount, unavailable },
-    liveProgress: { message: liveProgress.message && clipTail(liveProgress.message, 800), running: liveProgress.running },
+    liveProgress: { message: message && clipTail(message, 800), running, ...(background ? { background } : {}) },
     ...(warning ? { warning } : {}),
   };
 }
