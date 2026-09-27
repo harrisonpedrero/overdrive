@@ -4,14 +4,21 @@ import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { TREE_MARK, defaultContainment } from './process-tree.mjs';
 import { OverdriveError, now, redactString, refusedRequest, run } from './util.mjs';
 import { GH_PR_WRITES, workerToolDecision } from './worker-policy.mjs';
 
 // Server-level rules; they remove these servers' tools from a feature worker entirely.
 const COMPUTER_USE_SERVERS = ['mcp__claude-in-chrome', 'mcp__computer-use', 'mcp__playwright', 'mcp__puppeteer', 'mcp__chrome-devtools', 'mcp__browser'];
-// The coordinator plugin never loads in a worker; the injected worker server replaces it.
-const WORKER_SETTINGS = JSON.stringify({ enabledPlugins: { 'overdrive@overdrive-local': false, 'feature-theater@feature-theater-local': false } });
+const POLICY_HOOK = fileURLToPath(new URL('./worker-policy-hook.mjs', import.meta.url));
+
+// The coordinator plugin never loads in a worker; the injected worker server replaces it. The
+// policy hook uses the exec form (args), so no shell parses its paths or the tool input.
+const workerSettings = profile => JSON.stringify({
+  enabledPlugins: { 'overdrive@overdrive-local': false, 'feature-theater@feature-theater-local': false },
+  hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: process.execPath, args: [POLICY_HOOK, profile] }] }] },
+});
 const NESTED_SESSION_ENV = /^(?:CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(?:CHILD_SESSION|SESSION_ID|HOST_SESSION_ID|MESSAGING_SOCKET|MESSAGING_TOKEN|ENTRYPOINT|SESSION_ATTENDED))$/;
 const EDITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell']);
 const EFFORTS = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'max' };
@@ -47,8 +54,9 @@ export function normalizeWorkerOptions(raw = {}) {
   };
 }
 
-// The user's MCP servers, connectors, plugins, skills and hooks load. Tool calls the permission
-// mode would prompt for arrive as control requests, which the worker permission policy answers.
+// The user's MCP servers, connectors, plugins, skills and hooks load. The policy hook vets every
+// tool call; calls the permission mode would prompt for also arrive as control requests, which the
+// same worker permission policy answers.
 export function workerLaunchArgs(meta, effort) {
   const options = meta.options;
   const feature = meta.profile !== 'qa';
@@ -62,7 +70,7 @@ export function workerLaunchArgs(meta, effort) {
   // The CLI exits when the turn ends, so a scheduled wakeup could never fire.
   const disallowed = [...options.disallowedTools, 'ScheduleWakeup', ...(feature ? COMPUTER_USE_SERVERS : [])];
   args.push('--disallowedTools', ...disallowed);
-  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', WORKER_SETTINGS);
+  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', workerSettings(feature ? 'feature' : 'qa'));
   // Without Chrome integration set up, --chrome adds no tools rather than failing.
   args.push(feature ? '--no-chrome' : '--chrome');
   for (const dir of meta.addDirs) args.push('--add-dir', dir);
