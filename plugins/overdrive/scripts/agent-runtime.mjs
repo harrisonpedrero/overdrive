@@ -527,10 +527,10 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
   };
 }
 
-// Steers the agent's live turn with its waiting messages and the direction, or starts a turn with
-// them the way agent_start does. Without a direction (a delivery sweep) it does nothing once no
-// message waits; featureRuntime refuses paused, done and archived agents either way.
-async function deliverOwned(args, direction) {
+// Steers the agent's live turn with its waiting messages, or starts a turn with them the way
+// agent_start does. It does nothing once no message waits; featureRuntime refuses paused, done
+// and archived agents.
+async function deliverOwned(args) {
   const runtime = await featureRuntime({ workspace_path: args.workspace_path, feature: args.feature });
   if (runtime.feature.thread_id) {
     await bridge.ensureStarted();
@@ -540,14 +540,14 @@ async function deliverOwned(args, direction) {
   const turnId = runtime.feature.active_turn_id;
   const inbox = { workspace_path: runtime.root, feature: runtime.feature.slug };
   const messages = await agentInbox(inbox);
-  if (!direction && !messages.length) return null;
-  if (!turnId) return { ...(await startOwned(args, direction, runtime)), mode: 'new_turn' };
+  if (!messages.length) return null;
+  if (!turnId) return { ...(await startOwned(args, undefined, runtime)), mode: 'new_turn' };
   const result = await bridge.request('turn/steer', {
     harness: runtime.harness,
     profile: runtime.profile,
     threadId: runtime.feature.thread_id,
     expectedTurnId: turnId,
-    input: textInput([messageBlock(messages), direction].filter(Boolean).join('\n\n')),
+    input: textInput(messageBlock(messages)),
   }).catch(error => {
     // A refused steer reached no turn, because the turn ended first.
     throw error.refused ? new OverdriveError(`Turn ${turnId} ended before the steer reached it.`, 'TURN_MISMATCH') : error;
@@ -591,7 +591,7 @@ async function deliverMessages(root, feature) {
   const args = { workspace_path: root, feature };
   const key = `${root}\n${feature}`;
   try {
-    await withAgentControl(args, ownerToken, () => deliverOwned(args, null), { yieldToLiveOwner: true });
+    await withAgentControl(args, ownerToken, () => deliverOwned(args), { yieldToLiveOwner: true });
     deliveryRetry.delete(key);
   } catch (error) {
     deliveryRetry.set(key, Date.now() + DELIVERY_RETRY_MS);
@@ -953,20 +953,32 @@ const startFeatureAgent = async args => {
   const direction = args.instruction === undefined || args.instruction === null ? undefined : requiredText(args.instruction, 'instruction', { max: 100_000 });
   return await withAgentControl(args, ownerToken, () => startOwned(args, direction));
 };
-// A steer is durable: a message the agent cannot take now waits in its inbox.
+// A steer is durable: it is stored once in the agent's inbox under the control lock and delivered
+// from there, so a message the agent cannot take now, or whose delivery is uncertain, stays pending.
 const steerFeatureAgent = async args => {
   assertEffort(args);
   const message = requiredText(args.message, 'message', { max: 20_000 });
+  const store = () => sendAgentMessage({ workspace_path: args.workspace_path, from: 'coordinator', to: args.feature, message });
+  let stored = null;
   let result;
   try {
-    result = await withAgentControl(args, ownerToken, () => deliverOwned(args, message));
+    result = await withAgentControl(args, ownerToken, async () => {
+      stored = await store();
+      return await deliverOwned(args);
+    });
   } catch (error) {
-    if (!QUEUED_WHEN.has(error.code)) throw error;
-    const queued = await sendAgentMessage({ workspace_path: args.workspace_path, from: 'coordinator', to: args.feature, message });
-    return { feature: queued.to, mode: 'queued', messageId: queued.id, reason: error.message, next: 'The message waits in the agent\'s inbox. It is delivered once the agent can take it, and at the latest in the prompt of its next turn.' };
+    if (QUEUED_WHEN.has(error.code)) {
+      stored ??= await store();
+      return { feature: stored.to, mode: 'queued', messageId: stored.id, reason: error.message, next: 'The message waits in the agent\'s inbox. It is delivered once the agent can take it, and at the latest in the prompt of its next turn.' };
+    }
+    if (stored) {
+      error.message = `${error.message} The message waits in the agent's inbox.`;
+      error.details = { ...error.details, messageId: stored.id };
+    }
+    throw error;
   }
-  await recordAgentEvent({ workspace_path: args.workspace_path, feature: result.feature, kind: 'coordinator.steered', summary: `Coordinator ${result.mode === 'mid_turn' ? 'steered the active turn' : 'started a follow-up turn'}: ${redactString(clip(message, 2_000))}`, details: { mode: result.mode } });
-  return result;
+  await recordAgentEvent({ workspace_path: args.workspace_path, feature: result.feature, kind: 'coordinator.steered', summary: `Coordinator ${result.mode === 'mid_turn' ? 'steered the active turn' : 'started a follow-up turn'}: ${clip(redactString(message), 2_000)}`, details: { mode: result.mode, messageId: stored.id } });
+  return { ...result, messageId: stored.id };
 };
 const interruptFeatureAgent = args => withAgentControl(args, ownerToken, () => interruptOwned(args));
 const resolveFeatureAgentRequest = args => withAgentControl(args, ownerToken, () => resolveRequestOwned(args));

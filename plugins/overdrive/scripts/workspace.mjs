@@ -325,19 +325,17 @@ function recentRuns(db, row, limit) {
 
 function recentMessages(db, slug, limit = 10) {
   return db.prepare('SELECT id, from_agent, to_agent, body, status, created_at, delivered_how FROM messages WHERE to_agent = ? OR from_agent = ? ORDER BY id DESC LIMIT ?')
-    .all(slug, slug, limit).reverse();
+    .all(slug, slug, limit).reverse().map(row => ({ ...row, body: redactString(row.body) }));
 }
 
-function oneLine(text, max = 300) {
-  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
-}
+// Bodies are shown in full, indented under their list item, so a recovering agent sees every word.
+const indentedBody = text => String(text ?? '').trim().replace(/\r?\n/g, '\n  ');
 
 const findingLines = (rows, withLane) => (rows.length
   ? rows.map(row => `- ${row.id}${withLane ? ` on ${row.feature}` : ''} (${row.severity}): ${row.title}${row.repro_suite ? ` · repro suite ${row.repro_suite}` : ''}`).join('\n')
   : '- None open.');
 const messageLines = rows => (rows.length
-  ? rows.map(row => `- ${row.created_at} ${row.from_agent} → ${row.to_agent} (${row.status}): ${oneLine(row.body)}`).join('\n')
+  ? rows.map(row => `- ${row.created_at} ${row.from_agent} → ${row.to_agent} (${row.status}): ${indentedBody(row.body)}`).join('\n')
   : '- None.');
 const runLines = rows => (rows.length
   ? rows.map(row => `- ${row.id} · ${row.suite} on ${row.target}: ${row.status} at ${row.revision?.slice(0, 12) ?? 'unknown'} (${row.created_at})`).join('\n')
@@ -962,7 +960,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       evidence: projection.evidence,
       findings: projection.findings,
       labRuns: recentRuns(ctx.db, row, 5),
-      messages: projection.messages.map(message => ({ ...message, body: oneLine(message.body) })),
+      messages: projection.messages,
       pendingAgentRequests: projection.pending,
       git: projection.snapshot,
       commitIdentity: projection.commitIdentity,
