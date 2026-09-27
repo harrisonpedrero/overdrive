@@ -48,7 +48,7 @@ Model and permission changes apply from the next turn; `harness` applies to new 
 
 The worker permission policy ([architecture](architecture.md#worker-capability-profiles)) runs as a `PreToolUse` hook on every tool call, so `allowedTools`, the permission mode and a repository's own settings, `disableAllHooks` included, cannot skip it; the mode and allow rules decide only what else prompts. Deny rules hold in every mode. On top of this list, every worker is denied `ScheduleWakeup`, because the CLI exits when the turn ends and a wakeup could never fire, and feature agents are denied the browser and computer-control servers.
 
-Codex workers have no permission settings: they run in the `workspace-write` sandbox with network access, and the policy answers their escalations, which include every patch. Questions and MCP elicitations from a worker reach the coordinator as pending requests, answered with `agent_request_resolve`.
+Codex workers have no permission settings: they run in the `workspace-write` sandbox with network access, and the policy answers their escalations, including the file-change approval requests Codex sends for patches under approval policy `untrusted`. Codex can apply a patch without such a request, for example under preapproved permissions or a cached approval, and the policy never sees that patch. Questions and MCP elicitations from a worker reach the coordinator as pending requests, answered with `agent_request_resolve`.
 
 ## The lab
 

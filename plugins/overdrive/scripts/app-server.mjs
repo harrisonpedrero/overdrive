@@ -192,7 +192,8 @@ export class CodexAppServer extends EventEmitter {
     }
   }
 
-  // Under approval policy untrusted every patch asks first, and its item/started names the files it writes.
+  // A file-change approval request is checked against the files its earlier item/started named; a patch Codex
+  // applies without a request, such as under preapproved permissions or a cached approval, is not seen here.
   #answerByPolicy({ id, method, params = {} }) {
     const approval = POLICY_APPROVALS[method];
     if (!approval) return false;
