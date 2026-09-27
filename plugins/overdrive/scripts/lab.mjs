@@ -425,12 +425,24 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
   return { row, details: { resolvedFindings: resolved.map(finding => finding.id), resolutionEvidence: evidence, ...details }, notes };
 }
 
+// Only under the target's lock: a run still marked running there belongs to a runtime that exited mid-run.
+function markAbandonedRuns(db, target) {
+  db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(target);
+}
+
+// A read reconciles a target only if it takes the target's lock at once, so it never waits behind or disturbs a live call.
+async function reconcileAbandonedRuns(ctx, targets) {
+  for (const target of new Set(targets)) {
+    try { await withWorkspaceLock(ctx.root, labLock(target), async () => markAbandonedRuns(ctx.db, target), { timeoutMs: 0 }); }
+    catch (error) { if (error?.code !== 'WORKSPACE_BUSY') throw error; }
+  }
+}
+
 // A call's runs on one target share its lock and run up to LAB_SLOTS at a time, each slot in its own checkout.
 async function runOnTarget(ctx, requests, call) {
   const { target } = requests[0];
   return await withWorkspaceLock(ctx.root, labLock(target), async () => {
-    // Under this target's lock a run still marked running belongs to a runtime that exited mid-run.
-    ctx.db.prepare("UPDATE lab_runs SET status = 'uncertain', output = 'OVERDRIVE stopped before this run finished; its processes may have outlived it.' WHERE target = ? AND status = 'running'").run(target);
+    markAbandonedRuns(ctx.db, target);
     // One at a time, so two snapshots of one checkout never race on its refs.
     const subjects = [];
     for (const request of requests) subjects.push(await settle(runSubject(ctx, target, request.lane, request.requested, call.creator)));
@@ -496,6 +508,15 @@ function runPage(db, { suite, target, before }) {
   return { runs, nextBeforeRun: rows.length > RUN_PAGE_SIZE ? runs.at(-1).id : null };
 }
 
+// A page showing running runs first reconciles their targets, then is read again.
+async function reconciledRunPage(ctx, query) {
+  const page = runPage(ctx.db, query);
+  const running = page.runs.filter(row => row.status === 'running').map(row => row.target);
+  if (!running.length) return page;
+  await reconcileAbandonedRuns(ctx, running);
+  return runPage(ctx.db, query);
+}
+
 export async function getLab({ workspace_path, run: runId, before_run: beforeRunId, suite, target, findings }) {
   if (findings !== undefined && findings !== 'open' && findings !== 'all') throw new OverdriveError('findings must be open or all.', 'INVALID_INPUT');
   const suiteFilter = suite === undefined ? null : suiteName(suite);
@@ -505,7 +526,11 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
   if (runKey && beforeKey) throw new OverdriveError('Pass run to return one run, or before_run to page the run list, not both.', 'INVALID_INPUT');
   return await withContext(workspace_path, async ctx => {
     if (runKey) {
-      const row = knownRun(ctx.db, runKey);
+      let row = knownRun(ctx.db, runKey);
+      if (row.status === 'running') {
+        await reconcileAbandonedRuns(ctx, [row.target]);
+        row = knownRun(ctx.db, runKey);
+      }
       const log = runLog(ctx.root, row.id);
       return { run: presentRun(ctx.root, row, await exists(log) ? log : null) };
     }
@@ -514,7 +539,7 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
     const result = {
       lab,
       suites: await listSuites(ctx.root, lab),
-      ...runPage(ctx.db, { suite: suiteFilter, target: targetFilter, before }),
+      ...await reconciledRunPage(ctx, { suite: suiteFilter, target: targetFilter, before }),
       integration: await integrationStatus(ctx),
     };
     if (findings) {
