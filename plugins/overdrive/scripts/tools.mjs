@@ -171,7 +171,7 @@ export const TOOLS = [
 
   tool('agent_interrupt', 'Interrupt agent', 'Interrupt an active turn while preserving the task and checkout.', object({ ...workspace, ...agent }, ['workspace_path', 'agent']), { destructiveHint: true, openWorldHint: true }),
 
-  tool('agent_request_resolve', 'Resolve agent request', 'Relay the user-approved answer to a pending command, permission, elicitation, or input request from an agent’s task.', object({
+  tool('agent_request_resolve', 'Resolve agent request', 'Answer a pending command, permission, elicitation, or input request from an agent’s task, within the user’s current or earlier authorization.', object({
     ...workspace,
     ...agent,
     request_id: string('Opaque pending request identifier returned by inspection.'),
