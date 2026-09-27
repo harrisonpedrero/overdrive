@@ -10,6 +10,7 @@ import {
   bindAgentSession,
   clearWorkerGuards,
   deliverableAgents,
+  endAgentTurnUsage,
   featureRuntime,
   featureUpdateInput,
   getFeatureContext,
@@ -20,6 +21,7 @@ import {
   readUnconfirmedDescendants,
   readWorkerGuards,
   recordAgentEvent,
+  recordAgentUsage,
   recordWorkerGuardJob,
   registerWorkerGuard,
   releaseAgentSession,
@@ -27,9 +29,11 @@ import {
   saveAgentSession,
   savePendingAgentRequest,
   sendAgentMessage,
+  startAgentTurnUsage,
   takeCoordinatorMessages,
   updateStoppedFeature,
 } from './workspace.mjs';
+import { codexUsageSnapshot } from './usage.mjs';
 
 // After a failed delivery an agent's messages wait this long before the next attempt.
 const DELIVERY_RETRY_MS = 60_000;
@@ -74,6 +78,8 @@ const turnPlans = new Map();
 // Per turn, the tool calls started and not yet returned, in memory only.
 const turnTools = new Map();
 const completedTurns = new Set();
+// Sessions this controller created whose first turn has not started; their usage starts at zero.
+const freshThreads = new Set();
 const deliveryRetry = new Map();
 let notificationQueue = Promise.resolve();
 let sweepTimer = null;
@@ -208,9 +214,19 @@ async function onNotification({ method, params }) {
     else turnTools.get(params.turnId)?.delete(params.item.id);
     return;
   }
+  // Codex reports the thread's cumulative totals; a Claude worker reports allowlisted result totals.
+  if (method === 'thread/tokenUsage/updated') {
+    await recordAgentUsage({ ...base, thread_id: params.threadId, turn_id: params.turnId, totals: codexUsageSnapshot(params.tokenUsage) });
+    return;
+  }
+  if (method === 'worker/usage') {
+    await recordAgentUsage({ ...base, thread_id: params.threadId, turn_id: params.turnId, totals: params.totals, main_loop: params.mainLoop, session_totals: params.sessionTotals });
+    return;
+  }
   if (method === 'turn/started') {
     registration.handoffPending = params.turn?.id ?? true;
     await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: params.turn?.id, status: 'running' });
+    if (params.turn?.id) await startAgentTurnUsage({ ...base, thread_id: params.threadId, turn_id: params.turn.id, fresh: freshThreads.delete(params.threadId) });
     return;
   }
   if (method === 'turn/completed') {
@@ -226,6 +242,9 @@ async function onNotification({ method, params }) {
     if (plan) await recordAgentEvent({ ...base, thread_id: params.threadId, kind: 'agent.plan', summary: 'Agent updated its visible plan.', details: plan });
     if (diff) await recordAgentEvent({ ...base, thread_id: params.threadId, kind: 'agent.diff', summary: `Working diff touched ${diff.fileCount} file(s), +${diff.additions}/-${diff.deletions}.`, details: diff });
     const status = ['failed', 'interrupted'].includes(turn.status) ? turn.status : 'idle';
+    // A completion read back from the native session came after the fact; reports may be missing.
+    const ended = !params.reconciled && ['completed', 'failed', 'interrupted'].includes(turn.status) ? turn.status : 'reconciled';
+    if (turnId) await endAgentTurnUsage({ ...base, thread_id: params.threadId, turn_id: turnId, ended, final: ended === 'completed' && turn.usageFinal === true });
     const saved = await saveAgentSession({ ...base, thread_id: params.threadId, turn_id: null, status, summary: visible });
     turnMessages.delete(turnId);
     turnDiffs.delete(turnId);
@@ -333,7 +352,7 @@ async function reconcileCompletedNativeTurn(runtime, thread) {
   await enqueueStateWork(async () => {
     const current = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1 });
     if (current.feature.agent.threadId !== thread.id || current.feature.agent.activeTurnId !== turn.id) return;
-    await onNotification({ method: 'turn/completed', params: { threadId: thread.id, turn } });
+    await onNotification({ method: 'turn/completed', params: { threadId: thread.id, turn, reconciled: true } });
   });
   const current = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1 });
   Object.assign(runtime.feature, { agent_status: current.feature.agent.status, active_turn_id: current.feature.agent.activeTurnId });
@@ -465,6 +484,7 @@ async function dispatchTurn(runtime, threadId, instruction, effort, created = fa
     await markDelivered({ ...inbox, messages, how: 'prompt' }).catch(reportDeliveryFailure);
     if (result.treeStoppedGuardId) await clearWorkerGuards({ ...base, guard_id: result.treeStoppedGuardId });
     await enqueueStateWork(() => saveAgentSession({ ...base, turn_id: result.turn.id, status: 'running', only_if_status: 'starting' }));
+    await enqueueStateWork(() => startAgentTurnUsage({ ...base, turn_id: result.turn.id, fresh: freshThreads.delete(threadId) }));
     return result;
   } catch (error) {
     const summary = `Unable to start turn: ${redactString(error.message)}`;
@@ -510,6 +530,7 @@ async function startOwned({ workspace_path, feature, effort = 'high', force_new_
     const started = await bridge.startThread({ ...session, effort });
     threadId = started.thread.id;
     created = true;
+    freshThreads.add(threadId);
     register(threadId, runtime.root, runtime.feature.slug);
     await bridge.request('thread/name/set', { harness: runtime.harness, profile: runtime.profile, threadId, name: `OVERDRIVE · ${runtime.feature.title}` }).catch(() => {});
   }
@@ -660,7 +681,7 @@ async function inspectFeatureAgent({ workspace_path, feature, include_thread = t
 // On a timeout an agent is reported by where it stands, never by its previous handoff.
 function progressRow({ feature: { slug, status, agent }, git: { head, changedFileCount, unavailable }, liveProgress, warning }) {
   return {
-    feature: { slug, status, agent: { status: agent.status, activeTurnId: agent.activeTurnId } },
+    feature: { slug, status, agent: { status: agent.status, activeTurnId: agent.activeTurnId, usage: agent.usage } },
     git: { head, changedFileCount, unavailable },
     liveProgress: { message: liveProgress.message && clipTail(liveProgress.message, 800), running: liveProgress.running },
     ...(warning ? { warning } : {}),
