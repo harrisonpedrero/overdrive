@@ -165,7 +165,10 @@ export async function applyMutant(checkout, lab, labRevision, patch) {
   const invalid = reason => new OverdriveError(`Mutant ${patch} ${reason}.`, 'MUTANT_INVALID');
   // The committed blob, not the snapshot checkout's copy, which line-ending settings such as core.autocrlf may have converted.
   const bytes = await execFileAsync('git', ['cat-file', 'blob', `${labRevision}:${patch}`], { cwd: lab, encoding: 'buffer', maxBuffer: PATCH_MAX_BYTES, windowsHide: true })
-    .then(({ stdout }) => stdout, () => null);
+    .then(({ stdout }) => stdout, error => {
+      if (error?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw invalid('is larger than the 10 MiB mutant patch limit');
+      return null;
+    });
   if (!bytes) throw invalid('is not a file in the lab snapshot');
   const applied = await run(['git', 'apply', '-'], { cwd: checkout, input: bytes, allowFailure: true });
   if (applied.exitCode !== 0) throw invalid(`does not apply to the target: ${redactString(applied.stderr).slice(-1_000)}`);
