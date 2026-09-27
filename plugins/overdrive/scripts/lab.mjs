@@ -555,15 +555,20 @@ function withdrawFindingMessage(db, finding) {
 }
 
 // An undelivered fix request that no longer describes its open finding is replaced, so delivered text stays on record.
+// Returns whether any replacement was queued.
 function reissueFindingMessage(db, finding, message, stamp) {
   const prefix = `Finding ${finding.id} (`;
   const pending = db.prepare("SELECT id, from_agent, body FROM messages WHERE to_agent = ? AND status = 'pending' AND substr(body, 1, ?) = ?").all(finding.feature, prefix.length, prefix);
   const withdraw = db.prepare("UPDATE messages SET status = 'withdrawn' WHERE id = ? AND status = 'pending'");
   const insert = db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)");
+  let reissued = false;
   for (const { id, from_agent: from, body } of pending) {
     const current = message(from);
-    if (current !== body && withdraw.run(id).changes) insert.run(from, finding.feature, current, stamp);
+    if (current === body || !withdraw.run(id).changes) continue;
+    insert.run(from, finding.feature, current, stamp);
+    reissued = true;
   }
+  return reissued;
 }
 
 // The latest failure of the suite that tested the lane, on its own target or in an integration known to include it.
@@ -593,7 +598,7 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
     if (changes.repro_suite) await readSuite(ctx.root, await ensureLab(ctx.root), changes.repro_suite);
     const head = (await git(lane.checkout_path, 'rev-parse', 'HEAD')).stdout;
     const stamp = now();
-    const { finding, existing, opened } = transaction(ctx.db, () => {
+    const { finding, existing, messaged } = transaction(ctx.db, () => {
       const existing = findingId === undefined ? null : ctx.db.prepare('SELECT * FROM findings WHERE id = ?').get(findingId);
       if (findingId !== undefined && !existing) throw new OverdriveError(`Unknown finding: ${findingId}`, 'FINDING_NOT_FOUND');
       if (existing && existing.feature !== slug) throw new OverdriveError(`Finding ${findingId} belongs to ${existing.feature}, not ${slug}.`, 'INVALID_INPUT');
@@ -616,19 +621,21 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
       ctx.db.prepare(`INSERT OR REPLACE INTO findings(${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`).run(...columns.map(column => finding[column] ?? null));
       const foundRun = finding.found_run ? ctx.db.prepare('SELECT id, suite, target, revision, lanes_json, status FROM lab_runs WHERE id = ?').get(finding.found_run) : null;
       const message = from => redactString(findingMessage(finding, from, foundRun, integrationPath(ctx.root)));
+      let messaged = false;
       if (opened) {
         ctx.db.prepare("INSERT INTO messages(from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, 'pending', ?)").run(sender, slug, message(sender), stamp);
-      } else if (finding.status === 'open') reissueFindingMessage(ctx.db, finding, message, stamp);
+        messaged = true;
+      } else if (finding.status === 'open') messaged = reissueFindingMessage(ctx.db, finding, message, stamp);
       else if (existing?.status === 'open') withdrawFindingMessage(ctx.db, finding);
-      return { finding, existing, opened };
+      return { finding, existing, messaged };
     });
     await addEvent(ctx, {
       featureId: lane.id,
       kind: existing ? 'finding.updated' : 'finding.recorded',
       summary: redactString(`Finding ${finding.id} ${finding.status} (${finding.severity}): ${finding.title}`),
-      details: { finding: finding.id, status: finding.status, severity: finding.severity, reproSuite: finding.repro_suite ?? null, from: sender, messaged: opened },
+      details: { finding: finding.id, status: finding.status, severity: finding.severity, reproSuite: finding.repro_suite ?? null, from: sender, messaged },
     });
-    return { finding, messagedLane: opened };
+    return { finding, messagedLane: messaged };
   });
 }
 
