@@ -54,6 +54,7 @@ import {
   transaction,
   workItems,
 } from './state.mjs';
+import { agentUsage, endTurnUsage, recordTurnUsage, startTurnUsage } from './usage.mjs';
 
 const FEATURE_STATUSES = new Set(['planned', 'active', 'paused', 'blocked', 'review', 'done', 'archived']);
 const WORK_STATUSES = new Set(['planned', 'ready', 'running', 'blocked', 'review', 'done', 'failed', 'cancelled']);
@@ -953,8 +954,9 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
     const projection = await writeFeatureContext(ctx, row);
     const spec = latestSpec(ctx.db, row.id);
     const timeline = timelineRows(ctx.db, row.id, timeline_limit);
+    const summary = summarizeFeature(ctx, row);
     return {
-      feature: summarizeFeature(ctx, row),
+      feature: { ...summary, agent: { ...summary.agent, usage: agentUsage(ctx.db, row) } },
       specification: spec ?? { revision: 0, content: await fs.readFile(contained(ctx.root, STATE_DIR, 'features', row.slug, 'spec.md'), 'utf8') },
       workItems: projection.work,
       evidence: projection.evidence,
@@ -1273,6 +1275,25 @@ export async function saveAgentSession({ workspace_path, feature, thread_id, tur
     } finally { ctx.db.close(); }
   });
 }
+
+// Usage is written like session state: only by the lane's owner, for the session it is bound to.
+async function withBoundSession({ workspace_path, feature, thread_id, owner_token }, write) {
+  const root = await resolveWorkspace(workspace_path);
+  const slug = safeSlug(feature);
+  return await withWorkspaceLock(root, 'agent-state', async () => {
+    const ctx = await loadWorkspace(root);
+    try {
+      const row = featureBySlug(ctx.db, slug);
+      if (!ownsAgent(ctx.db, row.id, owner_token) || row.thread_id !== thread_id || !HARNESSES.has(row.thread_harness)) return { ignored: true };
+      return transaction(ctx.db, () => write(ctx.db, { featureId: row.id, threadId: row.thread_id, harness: row.thread_harness, activeTurnId: row.active_turn_id ?? null })) ?? {};
+    } finally { ctx.db.close(); }
+  });
+}
+
+// fresh: the session was created for this turn.
+export const startAgentTurnUsage = ({ turn_id, fresh = false, ...args }) => withBoundSession(args, (db, lane) => startTurnUsage(db, { ...lane, turnId: turn_id, fresh }));
+export const recordAgentUsage = ({ turn_id, totals = null, main_loop = undefined, session_totals = null, ...args }) => withBoundSession(args, (db, lane) => recordTurnUsage(db, { ...lane, turnId: turn_id, totals, mainLoop: main_loop, sessionTotals: session_totals }));
+export const endAgentTurnUsage = ({ turn_id, ended, final = false, ...args }) => withBoundSession(args, (db, lane) => endTurnUsage(db, { ...lane, turnId: turn_id, ended, final }));
 
 export async function recordAgentEvent({ workspace_path, feature, kind, summary, details = {}, owner_token, thread_id = undefined }) {
   const root = await resolveWorkspace(workspace_path);

@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { checkoutPath, labPath } from './git.mjs';
 import { OverdriveError, contained, ensureManagedPath, now, readJson, STATE_DIR, CONFIG_FILE } from './util.mjs';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 // Every lane is bound to the root its database was opened from, never to a recorded absolute path.
 const databaseRoots = new WeakMap();
 
@@ -190,6 +190,24 @@ function schema(db) {
       created_by TEXT,
       created_at TEXT,
       updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_usage (
+      feature_id TEXT NOT NULL REFERENCES features(id) ON DELETE CASCADE,
+      thread_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      harness TEXT NOT NULL,
+      baseline TEXT NOT NULL CHECK (baseline IN ('zero','previous','unknown','unverified')),
+      baseline_json TEXT,
+      previous_turn_id TEXT,
+      totals_json TEXT,
+      main_loop_json TEXT,
+      observed_at TEXT,
+      rejected INTEGER NOT NULL DEFAULT 0,
+      ended TEXT,
+      final INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(feature_id, thread_id, turn_id)
     );
 
     CREATE INDEX IF NOT EXISTS events_feature_created ON events(feature_id, created_at DESC);

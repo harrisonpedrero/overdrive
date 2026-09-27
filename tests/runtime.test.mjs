@@ -89,7 +89,7 @@ test('an invalid start instruction creates no native task and leaves the lane st
   assert.equal(threadStarts, 0);
   assert.deepEqual(bridge.requests, []);
   const untouched = (await getFeatureContext(args)).feature;
-  assert.deepEqual(untouched.agent, { status: 'not_started', threadId: null, harness: null, activeTurnId: null });
+  assert.deepEqual(untouched.agent, { status: 'not_started', threadId: null, harness: null, activeTurnId: null, usage: null });
 
   bridge.quick = true;
   const started = await runtime.startFeatureAgent({ ...args, instruction: '  Build the fixture.  ' });
@@ -104,7 +104,9 @@ test('an invalid start instruction creates no native task and leaves the lane st
   }
   assert.equal(resumes, 0);
   assert.equal(bridge.requests.length, requests);
-  assert.deepEqual((await getFeatureContext(args)).feature.agent, { status: 'idle', threadId: 'fixture-thread', harness: 'codex', activeTurnId: null });
+  assert.deepEqual((await getFeatureContext(args)).feature.agent, { status: 'idle', threadId: 'fixture-thread', harness: 'codex', activeTurnId: null,
+    usage: { harness: 'codex', threadId: 'fixture-thread', note: 'Codex-reported thread token counts; inputTokens already include cachedInputTokens. Codex reports no cost and marks no final report, so a turn is at most partial.',
+      turn: { turnId: 'turn-1', state: 'completed', quality: 'unknown', reason: 'no_usage_reported', delta: null, observedAt: null }, cumulative: null } });
 
   const { nextAction } = (await getFeatureContext(args)).feature;
   await runtime.startFeatureAgent(args);

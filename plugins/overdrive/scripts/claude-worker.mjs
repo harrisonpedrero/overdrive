@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TREE_MARK, defaultContainment } from './process-tree.mjs';
 import { OverdriveError, now, redactString, refusedRequest, run } from './util.mjs';
+import { addCounters, claudeMainLoopUsage, claudeUsageSnapshot } from './usage.mjs';
 import { GH_PR_WRITES, workerToolDecision } from './worker-policy.mjs';
 
 // Server-level rules; they remove these servers' tools from a feature worker entirely.
@@ -34,6 +35,16 @@ const STDERR_TAIL_CHARS = 8_000;
 const DIAGNOSTIC_CHARS = 1_200;
 const DIAGNOSTIC_STDERR_LINES = 12;
 const CONTAINMENT_START_MS = 30_000;
+// From this Claude Code version on, a resumed session's cost and token totals continue from its transcript.
+const RESTORES_TOTALS = [2, 1, 277];
+
+function restoresTotals(version) {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? '')?.slice(1).map(Number);
+  if (!parts) return false;
+  const differs = parts.findIndex((part, index) => part !== RESTORES_TOTALS[index]);
+  return differs < 0 || parts[differs] > RESTORES_TOTALS[differs];
+}
+
 const uncontainedNote = reason => `This worker ran without process-tree containment (${reason}), so tools it launched cannot be confirmed stopped. The next turn and a pause wait until the coordinator verifies no process for this lane is running and records that with prior_turn_attestation.`;
 
 function toolList(value, name) {
@@ -411,7 +422,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
     if (settled?.orphaned) meta.unconfirmedDescendants = settled.orphaned;
     if (meta.active) throw new OverdriveError(`Turn ${meta.active.id} is still active for ${threadId}.`, 'TURN_ACTIVE');
     meta.lingering = null;
-    const turn = { id: `turn_${randomUUID()}`, guardId, status: 'inProgress', startedAt: now(), text: [], tail: [], denials: [], pendingResults: 1, answered: false, liveTasks: new Set(), backgroundTasks: new Set(), unreadNotifications: 0, notificationReplies: 0, inputClosed: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
+    const turn = { id: `turn_${randomUUID()}`, guardId, resumed: Boolean(meta.persisted), cliVersion: null, mainLoop: {}, seenResultIds: new Set(), status: 'inProgress', startedAt: now(), text: [], tail: [], denials: [], pendingResults: 1, answered: false, liveTasks: new Set(), backgroundTasks: new Set(), unreadNotifications: 0, notificationReplies: 0, inputClosed: false, interrupted: false, child: null, process: null, tree: null, uncontained: null, cliExited: false, treeState: 'running', termination: null, descendantsUnconfirmed: Boolean(meta.unconfirmedDescendants), diffTimer: null, graceTimer: null, stderrTail: '', final: null, items: [] };
     turn.settled = new Promise(resolve => { turn.resolveSettled = resolve; });
     await this.#launch(meta, turn, { command: this.launch.command, args: [...this.launch.args, ...workerLaunchArgs(meta, effort || meta.effort)] });
     meta.active = turn;
@@ -633,6 +644,14 @@ export class ClaudeWorkerBridge extends EventEmitter {
 
   #event(meta, turn, message) {
     if (message.type === 'control_request') return this.#answerControl(turn, message);
+    // Capture usage before a failed result ends the turn; a repeated ID has no new usage.
+    if (message.type === 'result') {
+      const duplicate = typeof message.uuid === 'string' && turn.seenResultIds.has(message.uuid);
+      if (!duplicate) {
+        if (typeof message.uuid === 'string') turn.seenResultIds.add(message.uuid);
+        this.#reportUsage(meta, turn, message);
+      } else turn.lastResultTotals = false;
+    }
     if (turn.status !== 'inProgress' || turn.interrupted || turn.failedResult) return;
     if (message.type === 'system') return this.#systemEvent(meta, turn, message);
     if (message.type === 'assistant') {
@@ -692,6 +711,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   #systemEvent(meta, turn, message) {
     if (message.subtype === 'init') {
       meta.persisted = true;
+      turn.cliVersion = typeof message.claude_code_version === 'string' ? message.claude_code_version : null;
       clearTimeout(turn.graceTimer);
     } else if (message.subtype === 'background_tasks_changed') {
       // Each report lists every live background task; ambient ones are the CLI's own housekeeping.
@@ -700,9 +720,23 @@ export class ClaudeWorkerBridge extends EventEmitter {
       for (const id of turn.liveTasks) turn.backgroundTasks.add(id);
     } else if (message.subtype === 'task_notification') {
       // A stopped task gets no reply from the model; foreground tasks never enter the live set.
+      if (turn.backgroundTasks.has(message.task_id) && !message.ambient && message.status === 'stopped') turn.lastResultTotals = false;
       if (turn.backgroundTasks.has(message.task_id) && !message.ambient && message.status !== 'stopped') turn.unreadNotifications += 1;
       this.#closeInputWhenSettled(turn);
     }
+  }
+
+  // Only allowlisted numbers leave the worker. Totals are cumulative for the bound session;
+  // main-loop counts require a unique result identity and the same verified session.
+  #reportUsage(meta, turn, message) {
+    const sameSession = typeof message.session_id === 'string' && message.session_id === meta.id;
+    const identified = typeof message.uuid === 'string' && message.uuid.length > 0;
+    const mainLoop = sameSession && identified ? claudeMainLoopUsage(message) : null;
+    turn.mainLoop = turn.mainLoop && mainLoop && addCounters(turn.mainLoop, mainLoop);
+    const sessionTotals = sameSession ? !turn.resumed ? 'new' : restoresTotals(turn.cliVersion) ? 'restored' : 'unverified' : null;
+    const totals = sameSession ? claudeUsageSnapshot(message) : null;
+    turn.lastResultTotals = Boolean(totals);
+    this.emit('notification', { method: 'worker/usage', params: { threadId: meta.id, turnId: turn.id, totals, mainLoop: turn.mainLoop, sessionTotals } });
   }
 
   // Before any output since the last result, a notification opens a response of its own, which
@@ -788,6 +822,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
 
   async #finish(meta, turn, status, failureText) {
     if (turn.status !== 'inProgress') return;
+    const usageFinal = status === 'completed' && turn.lastResultTotals === true;
     turn.status = status;
     turn.completedAt = now();
     clearTimeout(turn.diffTimer);
@@ -809,7 +844,8 @@ export class ClaudeWorkerBridge extends EventEmitter {
     turn.items = items;
     turn.text = [];
     turn.child = null;
-    this.emit('notification', { method: 'turn/completed', params: { threadId: meta.id, turn: { id: turn.id, status, items, denials: turn.denials, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) } } });
+    // A clean completion follows the result that answered the turn's last input.
+    this.emit('notification', { method: 'turn/completed', params: { threadId: meta.id, turn: { id: turn.id, status, items, denials: turn.denials, usageFinal, ...(turn.descendantsUnconfirmed ? { descendantsUnconfirmed: true } : {}) } } });
     this.#reportCleanExit(meta, turn);
   }
 }
