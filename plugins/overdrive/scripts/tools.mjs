@@ -195,9 +195,10 @@ export const TOOLS = [
     },
   }, ['workspace_path']), { destructiveHint: false }),
 
-  tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return one run with its output tail, the path of its output log and its artifacts.', object({
+  tool('lab_get', 'Inspect the lab', 'List the lab suites, the 10 most recent runs, the current integration build and, on request, findings; or return one run with its output tail, the path of its output log and its artifacts. When older runs match, nextBeforeRun holds the before_run value for the next page; otherwise it is null.', object({
     ...workspace,
     run: string('Run id to return.'),
+    before_run: string('Run id from nextBeforeRun: list the 10 runs recorded before it that match suite and target. Not combined with run.'),
     suite: suite('Only list runs of this suite.'),
     target: { ...target, description: 'Only list runs and findings for this lane, integration (its runs, and findings on the lanes it includes) or base (control runs).' },
     findings: string('Include findings: open, or all.', { enum: ['open', 'all'] }),

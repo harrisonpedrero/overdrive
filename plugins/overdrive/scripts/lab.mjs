@@ -442,24 +442,44 @@ export async function runLabSuite({ workspace_path, batch, from, ...single }) {
   });
 }
 
-export async function getLab({ workspace_path, run: runId, suite, target, findings }) {
+const RUN_PAGE_SIZE = 10;
+
+function knownRun(db, id, columns = '*') {
+  const row = db.prepare(`SELECT ${columns} FROM lab_runs WHERE id = ?`).get(id);
+  if (!row) throw new OverdriveError(`Unknown lab run: ${id}`, 'RUN_NOT_FOUND');
+  return row;
+}
+
+// Pages by (created_at, id) descending, so runs recorded between pages or sharing a timestamp are never repeated or skipped.
+function runPage(db, { suite, target, before }) {
+  const { id = null, created_at: at = null } = before ?? {};
+  const rows = db.prepare(`SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs
+    WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+    ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(suite, suite, target, target, id, at, at, id, RUN_PAGE_SIZE + 1);
+  const runs = rows.slice(0, RUN_PAGE_SIZE);
+  return { runs, nextBeforeRun: rows.length > RUN_PAGE_SIZE ? runs.at(-1).id : null };
+}
+
+export async function getLab({ workspace_path, run: runId, before_run: beforeRunId, suite, target, findings }) {
   if (findings !== undefined && findings !== 'open' && findings !== 'all') throw new OverdriveError('findings must be open or all.', 'INVALID_INPUT');
   const suiteFilter = suite === undefined ? null : suiteName(suite);
   const targetFilter = target === undefined ? null : targetName(target);
   const runKey = runId === undefined ? null : requiredText(runId, 'run', { max: 100 });
+  const beforeKey = beforeRunId === undefined ? null : requiredText(beforeRunId, 'before_run', { max: 100 });
+  if (runKey && beforeKey) throw new OverdriveError('Pass run to return one run, or before_run to page the run list, not both.', 'INVALID_INPUT');
   return await withContext(workspace_path, async ctx => {
     if (runKey) {
-      const row = ctx.db.prepare('SELECT * FROM lab_runs WHERE id = ?').get(runKey);
-      if (!row) throw new OverdriveError(`Unknown lab run: ${runKey}`, 'RUN_NOT_FOUND');
+      const row = knownRun(ctx.db, runKey);
       const log = runLog(ctx.root, row.id);
       return { run: presentRun(ctx.root, row, await exists(log) ? log : null) };
     }
+    const before = beforeKey ? knownRun(ctx.db, beforeKey, 'id, created_at') : null;
     const lab = await ensureLab(ctx.root);
     const result = {
       lab,
       suites: await listSuites(ctx.root, lab),
-      runs: ctx.db.prepare('SELECT id, suite, target, revision, status, exit_code, duration_ms, created_by, created_at FROM lab_runs WHERE (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) ORDER BY created_at DESC LIMIT 10')
-        .all(suiteFilter, suiteFilter, targetFilter, targetFilter),
+      ...runPage(ctx.db, { suite: suiteFilter, target: targetFilter, before }),
       integration: await integrationStatus(ctx),
     };
     if (findings) {
