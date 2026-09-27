@@ -931,7 +931,7 @@ export async function buildIntegration({ workspace_path, features, base, from })
     if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
     // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
     const runs = composition.head ? latestRunsBySuite(ctx, composition.head) : [];
-    if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); a suite that passed on a non-base target at this commit needs no rerun unless it changed since.`);
+    if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); a suite with a lane or integration pass at this commit (a base control never counts) needs no rerun unless it changed since.`);
     return { integration: composition, path: clone, ...(runs.length ? { runs } : {}), ...(notes.length ? { next: notes.join(' ') } : {}) };
   }));
 }
@@ -1116,8 +1116,9 @@ async function suitesNotRunAt(ctx, runs) {
 
 async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   const changes = await committedChanges(source, base, commit);
-  // A base run is a control belonging to no lane, even at a lane's commit, so it never qualifies a delivery.
-  const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL AND target <> 'base' ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
+  // A base control belongs to no lane, even at a lane's commit, so it never qualifies a delivery; a legacy lane named base keeps that address, as in runLabSuite.
+  const passing = ctx.db.prepare(`SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL
+    AND (target <> 'base' OR EXISTS (SELECT 1 FROM features WHERE slug = 'base')) ORDER BY created_at DESC LIMIT 1`).get(commit) ?? null;
   const runs = await deliveredRuns(ctx, commit);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
   const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, lanes }));
