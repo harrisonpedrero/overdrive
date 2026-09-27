@@ -201,7 +201,7 @@ async function integrationStatus(ctx) {
 // A failing integration commit exists only in the integration clone, so that check runs there.
 async function resolvableFindings(ctx, repository, suite, features, commit) {
   if (!features.length) return [];
-  const rows = ctx.db.prepare(`SELECT findings.id, feature, found_revision, lab_runs.revision AS failed_revision, lab_runs.target AS failed_target FROM findings LEFT JOIN lab_runs ON lab_runs.id = findings.found_run
+  const rows = ctx.db.prepare(`SELECT findings.*, lab_runs.revision AS failed_revision, lab_runs.target AS failed_target FROM findings LEFT JOIN lab_runs ON lab_runs.id = findings.found_run
     WHERE findings.status = 'open' AND repro_suite = ? AND feature IN (${features.map(() => '?').join(', ')})`).all(suite, ...features);
   const integration = integrationPath(ctx.root);
   const resolved = [];
@@ -212,6 +212,70 @@ async function resolvableFindings(ctx, repository, suite, features, commit) {
     resolved.push(row);
   }
   return resolved;
+}
+
+// This describes the attached run; it does not search for other failures or change resolution eligibility.
+async function attachedFailure(ctx, finding, cache) {
+  if (!finding.found_run) return { run: null, noFailingRun: true, failureReason: null };
+  const failed = ctx.db.prepare('SELECT id, suite, target, revision, lab_revision, status FROM lab_runs WHERE id = ?').get(finding.found_run);
+  if (!failed) return { run: null, noFailingRun: null, failureReason: 'run_unavailable' };
+  const result = (noFailingRun, failureReason) => ({ run: failed, noFailingRun, failureReason });
+  if (failed.status !== 'failed') return result(true, 'not_failed');
+  if (failed.suite !== finding.repro_suite) return result(true, 'wrong_suite');
+  if (failed.target !== finding.feature && failed.target !== 'integration') return result(true, 'wrong_target');
+  if (!finding.found_revision || !failed.revision) return result(null, 'revision_unavailable');
+  let repository;
+  try { repository = failed.target === 'integration' ? integrationPath(ctx.root) : featureBySlug(ctx.db, finding.feature).checkout_path; }
+  catch { return result(null, 'target_unavailable'); }
+  const key = JSON.stringify([repository, finding.found_revision, failed.revision]);
+  if (!cache.ancestry.has(key)) {
+    try {
+      const check = await run(['git', 'merge-base', '--is-ancestor', finding.found_revision, failed.revision], { cwd: repository, allowFailure: true });
+      cache.ancestry.set(key, check.exitCode);
+    } catch { cache.ancestry.set(key, null); }
+  }
+  const ancestry = cache.ancestry.get(key);
+  if (ancestry === 0) return result(false, null);
+  if (ancestry === 1) return result(true, 'revision_mismatch');
+  return result(null, 'ancestry_unverified');
+}
+
+async function labSnapshotTree(lab, revision, cache) {
+  if (!revision) return null;
+  const key = JSON.stringify([lab, revision]);
+  if (!cache.trees.has(key)) cache.trees.set(key, (async () => {
+    try {
+      const result = await run(['git', 'rev-parse', '--verify', `${revision}^{tree}`], { cwd: lab, allowFailure: true });
+      return result.exitCode === 0 ? result.stdout.trim() : null;
+    } catch { return null; }
+  })());
+  return await cache.trees.get(key);
+}
+
+async function resolutionEvidence(ctx, finding, passingRun, lab, cache) {
+  const failure = await attachedFailure(ctx, finding, cache);
+  const failedLabRevision = failure.run?.status === 'failed' ? failure.run.lab_revision ?? null : null;
+  const validPass = passingRun?.status === 'passed' && passingRun.suite === finding.repro_suite
+    && passingRun.revision === finding.resolved_revision
+    && (passingRun.target === finding.feature || passingRun.target === 'integration');
+  const passingLabRevision = validPass ? passingRun.lab_revision ?? null : null;
+  let labSnapshotChanged = null;
+  let labSnapshotReason = null;
+  if (failure.noFailingRun !== false) labSnapshotReason = 'no_verified_failure';
+  else if (!passingRun) labSnapshotReason = 'passing_run_unavailable';
+  else if (!validPass) labSnapshotReason = 'passing_run_mismatch';
+  else if (!failedLabRevision || !passingLabRevision) labSnapshotReason = 'revision_unavailable';
+  else {
+    const [failedTree, passingTree] = await Promise.all([
+      labSnapshotTree(lab, failedLabRevision, cache), labSnapshotTree(lab, passingLabRevision, cache),
+    ]);
+    if (failedTree && passingTree) labSnapshotChanged = failedTree !== passingTree;
+    else labSnapshotReason = 'snapshot_unavailable';
+  }
+  return {
+    finding: finding.id, noFailingRun: failure.noFailingRun, failureReason: failure.failureReason,
+    labSnapshotChanged, labSnapshotReason, failedLabRevision, passingLabRevision,
+  };
 }
 
 // What a run tests, and the lanes whose findings its pass can resolve; base belongs to no lane.
@@ -277,7 +341,7 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
   const details = target === 'integration' ? { included: features } : {};
   const notes = uncommittedFiles ? [`${target} has uncommitted changes that this run of its HEAD left out.`] : [];
   const reused = identicalRunSince(ctx.db, { target, suite: name, revision: commit, lab_revision: labRevision }, call.arrived);
-  if (reused) return { row: reused, details: { reused: true, resolvedFindings: [], ...details }, notes: ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes] };
+  if (reused) return { row: reused, details: { reused: true, resolvedFindings: [], resolutionEvidence: [], ...details }, notes: ['An identical run finished while this call waited for the target, so it was not repeated.', ...notes] };
   // The suite runs from the lab snapshot recorded as lab_revision, never from the live lab QA may be editing.
   const lab = await syncLabCheckout(ctx.root, 'snapshots', directory, call.lab, labRevision);
   const id = `run-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
@@ -314,10 +378,14 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
     return changed;
   });
   if (lane) await addEvent(ctx, { featureId: lane.id, kind: 'lab.run', summary: `Suite ${name} ${row.status} at ${commit.slice(0, 12)} (${id}).`, details: { run: id, suite: name, revision: commit, status: row.status, exitCode: row.exit_code } });
+  const evidence = [];
+  const evidenceCache = { ancestry: new Map(), trees: new Map() };
   for (const finding of resolved) {
-    await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit } });
+    const projection = await resolutionEvidence(ctx, finding, row, call.lab, evidenceCache);
+    evidence.push(projection);
+    await addEvent(ctx, { featureId: featureId(ctx.db, finding.feature), kind: 'finding.resolved', summary: `Finding ${finding.id} resolved: suite ${name} passed at ${commit.slice(0, 12)} (${id}).`, details: { finding: finding.id, run: id, revision: commit, resolutionEvidence: projection } });
   }
-  return { row, details: { resolvedFindings: resolved.map(finding => finding.id), ...details }, notes };
+  return { row, details: { resolvedFindings: resolved.map(finding => finding.id), resolutionEvidence: evidence, ...details }, notes };
 }
 
 // A call's runs on one target share its lock and run up to LAB_SLOTS at a time, each slot in its own checkout.
@@ -396,8 +464,15 @@ export async function getLab({ workspace_path, run: runId, suite, target, findin
       // Findings belong to lanes, so an integration shows those of the lanes it includes.
       const lanes = targetFilter === 'integration' ? result.integration?.included ?? [] : targetFilter ? [targetFilter] : null;
       const laneFilter = lanes ? `AND feature IN (${lanes.map(() => '?').join(', ')})` : '';
-      result.findings = ctx.db.prepare(`SELECT * FROM findings WHERE (? = 'all' OR status = 'open') ${laneFilter} ORDER BY created_at DESC LIMIT 200`)
+      const rows = ctx.db.prepare(`SELECT * FROM findings WHERE (? = 'all' OR status = 'open') ${laneFilter} ORDER BY created_at DESC LIMIT 200`)
         .all(findings, ...(lanes ?? []));
+      const evidenceCache = { ancestry: new Map(), trees: new Map() };
+      for (const finding of rows) {
+        const passingRun = finding.resolved_run ? ctx.db.prepare('SELECT id, suite, target, revision, lab_revision, status FROM lab_runs WHERE id = ?').get(finding.resolved_run) : null;
+        finding.resolutionEvidence = finding.status === 'resolved' && finding.resolved_run
+          ? await resolutionEvidence(ctx, finding, passingRun, lab, evidenceCache) : null;
+      }
+      result.findings = rows;
     }
     return result;
   });
