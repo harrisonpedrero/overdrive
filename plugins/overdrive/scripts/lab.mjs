@@ -862,7 +862,7 @@ const workRemains = work => work.uncommittedFiles !== 0 || work.headDelivered !=
 function remainingWorkSummary(work) {
   if (work.unavailable) return `This lane stays ${work.status} because its work could not be checked.`;
   const reasons = [
-    work.headDelivered ? '' : `its HEAD ${work.head.slice(0, 12)} is not in that commit`,
+    work.headDelivered ? '' : `its HEAD ${work.head.slice(0, 12)} is not delivered`,
     work.uncommittedFiles ? `it has ${work.uncommittedFiles} uncommitted files` : '',
   ].filter(Boolean);
   return `This lane stays ${work.status}: ${reasons.join(' and ')}.`;
@@ -895,7 +895,7 @@ async function markLanesDone(ctx, lanes, summary, details, repository, delivered
 
 function remainingWorkNote(remaining) {
   if (!remaining.length) return '';
-  return `Not all lane work is in the delivered commit, so the lanes in remainingWork (${remaining.map(work => work.lane).join(', ')}) keep their status, summary and next action. Continue each, making a done lane active again first, then test and integrate its new commit.`;
+  return `Delivery of all work in ${remaining.map(work => work.lane).join(', ')} could not be confirmed, so they keep their status, summary and next action; review each lane's entry in remainingWork and continue the work that should ship, making a done lane active again first.`;
 }
 
 // Every suite's latest verdict at the commit, so integrate cites what was actually run there.
@@ -933,7 +933,7 @@ async function deliverAdopted(ctx, { target, commit, source, branch, lanes }, pa
     blocking.length ? `resolution of open blocking findings ${blocking.map(finding => finding.id).join(', ')}` : '',
   ].filter(Boolean).join(' and ');
   // Unfinished work stays exportable for review, but the prose must not present it as delivered.
-  const closed = lanesDone ? 'The included lanes are marked done.' : `This commit is delivered. ${remainingWorkNote(remaining)}`;
+  const closed = lanesDone ? 'This commit delivers all included lane work.' :`This commit is delivered. ${remainingWorkNote(remaining)}`;
   const action = delivered
     ? `${closed} With the user's authority, run the push command, with their fork's URL instead when they cannot push to the repository, then merge the branch through the repository's normal review; otherwise give the user the fetch command, which creates that branch at this commit in their own clone.`
     : `This commit is not delivered, so its lanes stay open. It still needs ${missing}; then call integrate with ${exact} to deliver it. A repair that changes code makes a new commit, so test and integrate that revision instead. Until then, with the user's authority, the push command (with their fork's URL instead when they cannot push to the repository) or the fetch command still exports this commit for interim review; present it as unfinished work, not a delivery.`;
