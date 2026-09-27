@@ -15,10 +15,12 @@ const COMPUTER_USE_SERVERS = ['mcp__claude-in-chrome', 'mcp__computer-use', 'mcp
 const POLICY_HOOK = fileURLToPath(new URL('./worker-policy-hook.mjs', import.meta.url));
 
 // The coordinator plugin never loads in a worker; the injected worker server replaces it. The
-// policy hook uses the exec form (args), so no shell parses its paths or the tool input.
-const workerSettings = profile => JSON.stringify({
+// policy hook uses the exec form (args), so no shell parses its paths or the tool input. Flag
+// settings outrank project settings, so a repository's disableAllHooks cannot switch the hook off.
+const workerSettings = (profile, writeRoots) => JSON.stringify({
+  disableAllHooks: false,
   enabledPlugins: { 'overdrive@overdrive-local': false, 'feature-theater@feature-theater-local': false },
-  hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: process.execPath, args: [POLICY_HOOK, profile] }] }] },
+  hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: process.execPath, args: [POLICY_HOOK, profile, ...writeRoots] }] }] },
 });
 const NESTED_SESSION_ENV = /^(?:CLAUDECODE|CLAUDE_PID|CLAUDE_CODE_(?:CHILD_SESSION|SESSION_ID|HOST_SESSION_ID|MESSAGING_SOCKET|MESSAGING_TOKEN|ENTRYPOINT|SESSION_ATTENDED))$/;
 const EDITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell']);
@@ -81,7 +83,7 @@ export function workerLaunchArgs(meta, effort) {
   // The CLI exits when the turn ends, so a scheduled wakeup could never fire.
   const disallowed = [...options.disallowedTools, 'ScheduleWakeup', ...(feature ? COMPUTER_USE_SERVERS : [])];
   args.push('--disallowedTools', ...disallowed);
-  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', workerSettings(feature ? 'feature' : 'qa'));
+  args.push('--mcp-config', JSON.stringify({ mcpServers: { overdrive: meta.workerServer } }), '--settings', workerSettings(feature ? 'feature' : 'qa', meta.writeRoots ?? []));
   // Without Chrome integration set up, --chrome adds no tools rather than failing.
   args.push(feature ? '--no-chrome' : '--chrome');
   for (const dir of meta.addDirs) args.push('--add-dir', dir);
@@ -253,13 +255,14 @@ export class ClaudeWorkerBridge extends EventEmitter {
     return meta;
   }
 
-  #register({ threadId, cwd, runtimeWorkspaceRoots = [], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, workerServer, persisted }) {
+  #register({ threadId, cwd, runtimeWorkspaceRoots = [], writeRoots = [cwd], developerInstructions = '', model = null, effort = 'high', harnessOptions = {}, workerServer, persisted }) {
     const existing = this.threads.get(threadId);
     // An in-flight turn and any lingering process keep the same session record.
     const meta = Object.assign(existing ?? {}, {
       id: threadId,
       cwd,
       addDirs: runtimeWorkspaceRoots.filter(root => root && path.resolve(root) !== path.resolve(cwd)),
+      writeRoots,
       developerInstructions,
       model: model || null,
       effort,
@@ -634,8 +637,10 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   // Every control request gets an answer so the CLI never waits on one; only tool permission is handled.
-  #answerControl(turn, { request_id, request }) {
-    const decision = request?.subtype === 'can_use_tool' ? workerToolDecision(this.profile, request.tool_name, request.input) : null;
+  #answerControl(meta, turn, { request_id, request }) {
+    const decision = request?.subtype === 'can_use_tool'
+      ? workerToolDecision(this.profile, request.tool_name, request.input, { writeRoots: meta.writeRoots, safetyCheck: request.decision_reason_type === 'safetyCheck' })
+      : null;
     const response = !decision
       ? { subtype: 'error', request_id, error: `OVERDRIVE does not handle ${request?.subtype} control requests.` }
       : { subtype: 'success', request_id, response: decision.allow ? { behavior: 'allow', updatedInput: request.input ?? {} } : { behavior: 'deny', message: decision.message } };
@@ -643,7 +648,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
   }
 
   #event(meta, turn, message) {
-    if (message.type === 'control_request') return this.#answerControl(turn, message);
+    if (message.type === 'control_request') return this.#answerControl(meta, turn, message);
     // Capture usage before a failed result ends the turn; a repeated ID has no new usage.
     if (message.type === 'result') {
       const duplicate = typeof message.uuid === 'string' && turn.seenResultIds.has(message.uuid);
@@ -664,7 +669,7 @@ export class ClaudeWorkerBridge extends EventEmitter {
           turn.tail.push(block.text);
           this.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: meta.id, turnId: turn.id, delta: `${block.text}\n` } });
         } else if (block?.type === 'tool_use') {
-          this.emit('notification', { method: 'item/started', params: { threadId: meta.id, turnId: turn.id, startedAtMs: Date.now(), item: { id: block.id, type: 'toolCall', tool: block.name, summary: block.input?.description ?? block.input?.command } } });
+          this.emit('notification', { method: 'item/started', params: { threadId: meta.id, turnId: turn.id, startedAtMs: Date.now(), item: { id: block.id, type: 'toolCall', tool: block.name, summary: block.input?.command ?? block.input?.description } } });
           if (EDITING_TOOLS.has(block.name)) this.#scheduleDiff(meta, turn);
         }
       }

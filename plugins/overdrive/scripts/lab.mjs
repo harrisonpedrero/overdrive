@@ -577,6 +577,8 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
         .all(findings, ...(lanes ?? []));
       const evidenceCache = { ancestry: new Map(), trees: new Map() };
       for (const finding of rows) {
+        const reopens = findingReopens(ctx.db, finding.id);
+        if (reopens) finding.reopens = reopens;
         const passingRun = finding.resolved_run ? ctx.db.prepare('SELECT id, suite, target, revision, lab_revision, lanes_json, status FROM lab_runs WHERE id = ?').get(finding.resolved_run) : null;
         finding.resolutionEvidence = finding.status === 'resolved' && finding.resolved_run
           ? await resolutionEvidence(ctx, finding, passingRun, lab, evidenceCache) : null;
@@ -599,8 +601,12 @@ function reproduction(finding, sender, foundRun, integration) {
 
 function findingMessage(finding, sender, foundRun, integration) {
   const reproduce = reproduction(finding, sender, foundRun, integration);
-  return `Finding ${finding.id} (${finding.severity}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
+  const reopened = finding.reopens ? `, reopened ${finding.reopens === 1 ? 'once' : `${finding.reopens} times`}` : '';
+  return `Finding ${finding.id} (${finding.severity}${reopened}): ${finding.title}\n\n${finding.body}\n\n${reproduce} Fix it at the root cause, commit, and tell ${sender} what changed.`;
 }
+
+// How often a finding was set open again after it was closed; each reopen records its event.
+const findingReopens = (db, id) => Number(db.prepare("SELECT COUNT(*) AS count FROM events WHERE kind = 'finding.updated' AND json_extract(details_json, '$.finding') = ? AND json_extract(details_json, '$.reopened') = 1").get(id).count);
 
 // A closed finding's fix request that its lane has not received yet must never reach it.
 function withdrawFindingMessage(db, finding) {
@@ -652,7 +658,7 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
     if (changes.repro_suite) await readSuite(ctx.root, await ensureLab(ctx.root), changes.repro_suite);
     const head = (await git(lane.checkout_path, 'rev-parse', 'HEAD')).stdout;
     const stamp = now();
-    const { finding, existing, messaged } = transaction(ctx.db, () => {
+    const { finding, existing, messaged, reopened } = transaction(ctx.db, () => {
       const existing = findingId === undefined ? null : ctx.db.prepare('SELECT * FROM findings WHERE id = ?').get(findingId);
       if (findingId !== undefined && !existing) throw new OverdriveError(`Unknown finding: ${findingId}`, 'FINDING_NOT_FOUND');
       if (existing && existing.feature !== slug) throw new OverdriveError(`Finding ${findingId} belongs to ${existing.feature}, not ${slug}.`, 'INVALID_INPUT');
@@ -665,6 +671,9 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
       // Text inherited from an older row is redacted too, so an update never carries a stored secret forward.
       for (const field of ['title', 'body', 'note']) if (finding[field] != null) finding[field] = redactString(finding[field]);
       const opened = finding.status === 'open' && existing?.status !== 'open';
+      const reopened = opened && Boolean(existing);
+      const reopens = findingReopens(ctx.db, finding.id) + (reopened ? 1 : 0);
+      if (reopens) finding.reopens = reopens;
       // A new or reopened finding is judged from the lane's current head and latest failure, and a coordinator's resolution records where it was judged.
       if (opened) Object.assign(finding, { found_revision: head, found_run: null, resolved_revision: null, resolved_run: null });
       else if (finding.status !== existing?.status) Object.assign(finding, { resolved_revision: finding.status === 'resolved' ? head : null, resolved_run: null });
@@ -681,13 +690,13 @@ export async function recordFinding({ workspace_path, id, feature, title, body, 
         messaged = true;
       } else if (finding.status === 'open') messaged = reissueFindingMessage(ctx.db, finding, message, stamp);
       else if (existing?.status === 'open') withdrawFindingMessage(ctx.db, finding);
-      return { finding, existing, messaged };
+      return { finding, existing, messaged, reopened };
     });
     await addEvent(ctx, {
       featureId: lane.id,
       kind: existing ? 'finding.updated' : 'finding.recorded',
       summary: redactString(`Finding ${finding.id} ${finding.status} (${finding.severity}): ${finding.title}`),
-      details: { finding: finding.id, status: finding.status, severity: finding.severity, reproSuite: finding.repro_suite ?? null, from: sender, messaged },
+      details: { finding: finding.id, status: finding.status, severity: finding.severity, reproSuite: finding.repro_suite ?? null, from: sender, messaged, ...(reopened ? { reopened } : {}) },
     });
     return { finding, messagedLane: messaged };
   });

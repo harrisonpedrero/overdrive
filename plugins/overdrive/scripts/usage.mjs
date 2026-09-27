@@ -151,6 +151,21 @@ function turnView(row, rows, activeTurnId) {
   };
 }
 
+// A lane's worker spend, or without featureId the workspace's: the turns started, and the latest
+// cumulative totals of each session summed. Tokens are all the input, cache and output tokens a
+// provider reported; costUsd is Claude's client-side estimate. Either is left out until reported.
+export function workerSpend(db, featureId = null) {
+  const rows = db.prepare('SELECT feature_id, thread_id, totals_json FROM agent_usage WHERE ? IS NULL OR feature_id = ? ORDER BY rowid').all(featureId, featureId);
+  if (!rows.length) return null;
+  const sessions = new Map(rows.filter(row => row.totals_json).map(row => [`${row.feature_id}\n${row.thread_id}`, parseJson(row.totals_json, {})]));
+  const spend = { turns: rows.length };
+  for (const totals of sessions.values()) {
+    spend.tokens = (spend.tokens ?? 0) + (totals.totalTokens ?? CLAUDE_TOKENS.reduce((sum, field) => sum + (totals[field] ?? 0), 0));
+    if (typeof totals.costUsd === 'number') spend.costUsd = Math.round(((spend.costUsd ?? 0) + totals.costUsd) * 1e4) / 1e4;
+  }
+  return spend;
+}
+
 const cumulativeScope = row => (row.harness === 'codex' ? 'codex_thread' : row.baseline === 'unverified' ? 'claude_worker_process' : 'claude_session');
 
 // The usage of the lane's bound session: its active turn, else its latest, and the latest totals.
