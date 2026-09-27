@@ -294,12 +294,14 @@ test('a real Codex app-server refusal fails the turn while a lost response is re
   assert.deepEqual(await agent(), { threadId: first.threadId, status: 'failed', activeTurnId: null });
   assert.equal((await turns()).length, 1);
 
-  await assert.rejects(running.call('start', { ...args, instruction: 'FAKE_LOSE_RESPONSE' }), error => error.code === 'CODEX_TIMEOUT');
+  // The lost turn runs until the reconciling start has read it and inspect reads it again.
+  await assert.rejects(running.call('start', { ...args, instruction: 'FAKE_LOSE_RESPONSE FAKE_COMPLETE_ON_SECOND_READ' }), error => error.code === 'CODEX_TIMEOUT');
   assert.deepEqual(await agent(), { threadId: first.threadId, status: 'uncertain', activeTurnId: null });
   const lost = (await turns()).at(-1);
   await assert.rejects(running.call('start', { ...args, instruction: 'Continue.' }), error => error.code === 'TURN_ACTIVE');
   assert.deepEqual(await agent(), { threadId: first.threadId, status: 'running', activeTurnId: lost.id });
   assert.equal((await turns()).length, 2, 'the reconciled turn was not dispatched twice');
+  await running.call('inspect', args);
   await eventually(async () => (await agent()).status === 'idle', 'lost turn completion');
   await running.call('start', { ...args, instruction: 'Continue.' });
   await eventually(async () => (await agent()).status === 'idle', 'final turn');
@@ -345,7 +347,7 @@ test('an unconfirmed turn request survives a controller crash and is reconciled 
   await settled(claudeLane, 'idle');
 
   // Codex: the lost turn is still in progress in the native session when the controller dies.
-  await assert.rejects(current.call('start', { ...codexLane, instruction: 'FAKE_LOSE_RESPONSE' }), error => error.code === 'CODEX_TIMEOUT');
+  await assert.rejects(current.call('start', { ...codexLane, instruction: 'FAKE_LOSE_RESPONSE hang' }), error => error.code === 'CODEX_TIMEOUT');
   assert.deepEqual(await agent(codexLane), { status: 'uncertain', activeTurnId: null });
   await current.kill();
   current = await launch();
