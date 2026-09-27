@@ -416,11 +416,12 @@ async function compareWithBase(ctx, row) {
   };
 }
 
-// Suites whose runs at one revision and lab snapshot both passed and failed, so neither verdict there stands alone.
+// Suites whose runs on one target at one revision and lab snapshot both passed and failed, so neither verdict there
+// stands alone. Targets stay apart because a suite may legitimately read its target from the run environment.
 function inconsistentVerdicts(db, { suite = null, target = null, revision = null }) {
-  return db.prepare(`SELECT suite, revision, lab_revision AS labRevision, SUM(status = 'passed') AS passed, SUM(status = 'failed') AS failed FROM lab_runs
+  return db.prepare(`SELECT suite, target, revision, lab_revision AS labRevision, SUM(status = 'passed') AS passed, SUM(status = 'failed') AS failed FROM lab_runs
     WHERE mutant IS NULL AND status IN ('passed', 'failed') AND (? IS NULL OR suite = ?) AND (? IS NULL OR target = ?) AND (? IS NULL OR revision = ?)
-    GROUP BY suite, revision, lab_revision HAVING passed > 0 AND failed > 0 ORDER BY MAX(created_at) DESC LIMIT 20`).all(suite, suite, target, target, revision, revision);
+    GROUP BY suite, target, revision, lab_revision HAVING passed > 0 AND failed > 0 ORDER BY MAX(created_at) DESC LIMIT 20`).all(suite, suite, target, target, revision, revision);
 }
 
 // Recorded mutant controls, latest first, with their raw status: a failure alone does not show the suite detected
@@ -1050,7 +1051,7 @@ async function deliveredRuns(ctx, commit) {
 }
 
 // Exact labels on the evidence behind a delivery; none of them blocks it.
-async function evidenceFlags(ctx, commit, lanes) {
+async function evidenceFlags(ctx, { target, commit, lanes }) {
   const resolved = lanes.length
     ? ctx.db.prepare(`SELECT * FROM findings WHERE status = 'resolved' AND resolved_run IS NOT NULL AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
@@ -1059,7 +1060,7 @@ async function evidenceFlags(ctx, commit, lanes) {
   const evidence = [];
   for (const finding of resolved) evidence.push(await recordedResolutionEvidence(ctx, finding, lab, cache));
   return {
-    inconsistent: [...new Set(inconsistentVerdicts(ctx.db, { revision: commit }).map(row => row.suite))],
+    inconsistent: [...new Set(inconsistentVerdicts(ctx.db, { target, revision: commit }).map(row => row.suite))],
     labChangedOrUnknown: evidence.filter(item => item.noFailingRun === false && item.labSnapshotChanged !== false).map(item => item.finding),
     noFailingRun: evidence.filter(item => item.noFailingRun === true).map(item => item.finding),
   };
@@ -1072,7 +1073,7 @@ function evidenceGapsNote(runs, suitesNotRun, flags) {
     unpassed.length ? `The latest runs of ${unpassed.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '',
     suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it.` : '',
     regressed.length ? `${regressed.join(', ')} regressed tests that passed on base (runs[].vsBase.regressions); report them whatever the exit code.` : '',
-    flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed at this commit with one lab snapshot, so neither verdict stands alone.` : '',
+    flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed on this target at this commit with one lab snapshot, so neither verdict stands alone.` : '',
     flags.labChangedOrUnknown.length ? `Findings ${flags.labChangedOrUnknown.join(', ')} were resolved after the lab changed since their failure, or with no comparison (labSnapshotReason): before reporting them fixed, read the lab diff between failedLabRevision and passingLabRevision (lab_get {"findings": "all"}), suite, harness and fixtures alike, and reopen any whose check was weakened.` : '',
     flags.noFailingRun.length ? `Findings ${flags.noFailingRun.join(', ')} were resolved with no recorded failing run, so no run showed the defect before its fix.` : '',
   ].filter(Boolean).join(' ');
@@ -1118,7 +1119,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
   const passing = ctx.db.prepare("SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL ORDER BY created_at DESC LIMIT 1").get(commit) ?? null;
   const runs = await deliveredRuns(ctx, commit);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
-  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, commit, lanes));
+  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, lanes }));
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
