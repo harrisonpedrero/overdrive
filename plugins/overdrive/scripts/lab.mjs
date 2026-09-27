@@ -373,7 +373,8 @@ async function runOnSlot(ctx, { name, target, lane, spec }, subject, slot, call)
     ctx.db.prepare('UPDATE lab_runs SET exit_code = ?, status = ?, output = ?, duration_ms = ?, artifacts_json = ? WHERE id = ?')
       .run(row.exit_code, row.status, row.output, row.duration_ms, row.artifacts_json, id);
     const resolve = ctx.db.prepare("UPDATE findings SET status = 'resolved', resolved_revision = ?, resolved_run = ?, updated_at = ? WHERE id = ? AND status = 'open'");
-    const changed = resolvable.filter(finding => resolve.run(commit, id, stamp, finding.id).changes);
+    const read = ctx.db.prepare('SELECT * FROM findings WHERE id = ?');
+    const changed = resolvable.filter(finding => resolve.run(commit, id, stamp, finding.id).changes).map(finding => read.get(finding.id));
     for (const finding of changed) withdrawFindingMessage(ctx.db, finding);
     return changed;
   });
