@@ -754,7 +754,7 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
     const handoffs = await Promise.all(selected.map(async feature => {
       const state = await inspectFeatureAgent({ workspace_path, feature, include_thread: true, committed_changes: signal });
       if (!signal) return progressRow(state);
-      // Wait rows carry the lane's compact spend; agent_inspect has the session's per-turn usage.
+      // Wait rows carry the lane's compact spend with its measuredTurns coverage; agent_inspect has the session's per-turn usage.
       const { usage: _usage, ...agent } = state.feature.agent;
       return { feature: { ...state.feature, agent }, git: state.git, liveProgress: state.liveProgress, pendingAgentRequests: state.pendingAgentRequests, warning: state.warning };
     }));

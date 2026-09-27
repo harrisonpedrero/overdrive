@@ -151,18 +151,29 @@ function turnView(row, rows, activeTurnId) {
   };
 }
 
-// A lane's worker spend, or without featureId the workspace's: the turns started, and the latest
-// cumulative totals of each session summed. Tokens are all the input, cache and output tokens a
-// provider reported; costUsd is Claude's client-side estimate. Either is left out until reported.
+// Codex totalTokens already include cachedInputTokens; Claude's cache fields are separate from inputTokens.
+const deltaTokens = delta => delta.totalTokens ?? CLAUDE_TOKENS.reduce((sum, field) => sum + (delta[field] ?? 0), 0);
+
+// A lane's worker spend, or without featureId the workspace's: the turns started, how many of them
+// have a credible delta (measuredTurns), and those non-overlapping deltas summed. A turn with an
+// unknown, moved or reset baseline adds nothing, and each sum is left out until a turn is measured.
 export function workerSpend(db, featureId = null) {
-  const rows = db.prepare('SELECT feature_id, thread_id, totals_json FROM agent_usage WHERE ? IS NULL OR feature_id = ? ORDER BY rowid').all(featureId, featureId);
+  const rows = db.prepare('SELECT * FROM agent_usage WHERE ? IS NULL OR feature_id = ? ORDER BY rowid').all(featureId, featureId);
   if (!rows.length) return null;
-  const sessions = new Map(rows.filter(row => row.totals_json).map(row => [`${row.feature_id}\n${row.thread_id}`, parseJson(row.totals_json, {})]));
-  const spend = { turns: rows.length };
-  for (const totals of sessions.values()) {
-    spend.tokens = (spend.tokens ?? 0) + (totals.totalTokens ?? CLAUDE_TOKENS.reduce((sum, field) => sum + (totals[field] ?? 0), 0));
-    if (typeof totals.costUsd === 'number') spend.costUsd = Math.round(((spend.costUsd ?? 0) + totals.costUsd) * 1e4) / 1e4;
+  const spend = { turns: rows.length, measuredTurns: 0 };
+  let tokens = 0;
+  let costUsd = null;
+  for (const session of Map.groupBy(rows, row => `${row.feature_id}\n${row.thread_id}`).values()) {
+    for (const row of session) {
+      const { delta } = turnView(row, session, null);
+      if (!delta) continue;
+      spend.measuredTurns += 1;
+      tokens += deltaTokens(delta);
+      if (typeof delta.costUsd === 'number') costUsd = (costUsd ?? 0) + delta.costUsd;
+    }
   }
+  if (spend.measuredTurns) spend.tokensObserved = tokens;
+  if (costUsd !== null) spend.claudeCostEstimateUsdObserved = Math.round(costUsd * 1e4) / 1e4;
   return spend;
 }
 
