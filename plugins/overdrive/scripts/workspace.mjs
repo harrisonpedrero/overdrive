@@ -1019,6 +1019,14 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
   });
 }
 
+// The lane's recorded state and pending requests, without reading Git or rewriting its context packet.
+export async function featureState({ workspace_path, feature }) {
+  return await withContext(workspace_path, async ctx => {
+    const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
+    return { feature: summarizeFeature(ctx, row), pendingAgentRequests: pendingRows(ctx.db, row.id) };
+  });
+}
+
 function workKey(value, name = 'work item key') {
   const key = requiredText(value, name, { max: 63 });
   if (!/^[A-Za-z][A-Za-z0-9._-]{0,62}$/.test(key)) throw new OverdriveError(`${name} has an invalid format.`, 'INVALID_WORK_KEY');
@@ -1225,11 +1233,12 @@ async function qaRoots(ctx) {
   return [...lanes.map(lane => lane.checkout_path), labState];
 }
 
-export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false }) {
+// Without refresh_context the context packet, which reads Git, is left for a later writer such as getFeatureContext.
+export async function featureRuntime({ workspace_path, feature, allow_inactive = false, force_new_session = false, refresh_context = true }) {
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new OverdriveError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
-    const packet = await writeFeatureContext(ctx, row);
+    const packet = refresh_context ? await writeFeatureContext(ctx, row) : { work: workItems(ctx.db, row.id) };
     // Older workspaces kept a copy of the contract above the checkout, where Claude Code would still load it.
     await fs.rm(contained(ctx.root, 'features', row.slug, 'AGENTS.md'), { force: true });
     const contextPath = contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md');

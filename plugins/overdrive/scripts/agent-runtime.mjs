@@ -12,6 +12,7 @@ import {
   deliverableAgents,
   endAgentTurnUsage,
   featureRuntime,
+  featureState,
   featureUpdateInput,
   getFeatureContext,
   markDelivered,
@@ -352,11 +353,11 @@ async function reconcileCompletedNativeTurn(runtime, thread) {
   if (!turn || !['completed', 'interrupted', 'failed'].includes(turn.status) ||
       !registrations.has(runtime.feature.thread_id)) return;
   await enqueueStateWork(async () => {
-    const current = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1, committed_changes: false });
+    const current = await featureState({ workspace_path: runtime.root, feature: runtime.feature.slug });
     if (current.feature.agent.threadId !== thread.id || current.feature.agent.activeTurnId !== turn.id) return;
     await onNotification({ method: 'turn/completed', params: { threadId: thread.id, turn, reconciled: true } });
   });
-  const current = await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1, committed_changes: false });
+  const current = await featureState({ workspace_path: runtime.root, feature: runtime.feature.slug });
   Object.assign(runtime.feature, { agent_status: current.feature.agent.status, active_turn_id: current.feature.agent.activeTurnId });
 }
 
@@ -376,7 +377,7 @@ async function settleUncertain(runtime, thread, attestation = null) {
       ? { summary: `The coordinator attested that no worker from the unconfirmed turn request is running (native history unavailable): ${clip(attestation.evidence, 2_000)}`, details: { basis: 'coordinator_attestation', attestation } }
       : { summary: running ? `The unconfirmed turn request is running as turn ${running.id}.` : 'The unconfirmed turn request left no running turn; the lane is idle.', details: { basis: 'native_history' } }) });
   }
-  const { agent } = saved.ignored ? (await getFeatureContext({ workspace_path: runtime.root, feature: runtime.feature.slug, timeline_limit: 1, committed_changes: false })).feature : saved;
+  const { agent } = saved.ignored ? (await featureState({ workspace_path: runtime.root, feature: runtime.feature.slug })).feature : saved;
   Object.assign(runtime.feature, { agent_status: agent.status, active_turn_id: agent.activeTurnId });
 }
 
@@ -640,8 +641,9 @@ function safeThreadView(thread) {
   return { id: thread.id, name: thread.name, cwd: thread.cwd, status: thread.status, updatedAt: thread.updatedAt, history, ...(historyNote ? { historyNote } : {}), turns: history === 'unavailable' ? null : turns };
 }
 
+// The context packet is written once, with the Git read that follows the native refresh.
 async function inspectFeatureAgent({ workspace_path, feature, include_thread = true, committed_changes = true }) {
-  const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true });
+  const runtime = await featureRuntime({ workspace_path, feature, allow_inactive: true, refresh_context: false });
   let thread = null;
   let warning = null;
   if (include_thread && runtime.feature.thread_id && !runtime.harness) {
@@ -698,7 +700,7 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
   const root = await resolveWorkspace(workspace_path);
   const lanes = () => new Map([...registrations.values()].filter(registration => registration.workspacePath === root).map(registration => [registration.feature, registration]));
   const registered = lanes();
-  let runtimes = await Promise.all((features ?? [...registered.keys()]).map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true })));
+  let runtimes = await Promise.all((features ?? [...registered.keys()]).map(feature => featureRuntime({ workspace_path, feature, allow_inactive: true, refresh_context: false })));
   if (!features) runtimes = runtimes.filter(runtime => registered.get(runtime.feature.slug).handoffPending || agentBusy(runtime.feature));
   if (!runtimes.length) {
     const messages = await takeCoordinatorMessages({ workspace_path: root });
@@ -734,7 +736,7 @@ async function waitFeatureAgents({ workspace_path, features, timeout_seconds = 3
       }
     }
     await notificationQueue;
-    const initial = await Promise.all(runtimes.map(runtime => getFeatureContext({ workspace_path, feature: runtime.feature.slug, timeline_limit: 1, committed_changes: false })));
+    const initial = await Promise.all(runtimes.map(runtime => featureState({ workspace_path, feature: runtime.feature.slug })));
     // A listed agent at rest whose turn was already handed off has nothing new until its next turn;
     // one starting or uncertain is still reported, as without a list.
     const handedOff = ({ feature: { slug, agent } }) => Boolean(features) && registered.has(slug) && !registered.get(slug).handoffPending
