@@ -531,8 +531,9 @@ async function testResults(root, row) {
 }
 
 const LAB_DIFF_LIMIT = 20;
-// Lab files that do not change a suite's own tests: other suites, mutant patches and the lab's notes.
-const OUTSIDE_SUITE = /^(?:suites\/|mutants\/|README\.md$|ENVIRONMENT\.md$)/;
+// Lab files that do not change a suite's tests: mutant patches and the lab's notes. Other suites stay listed, since a
+// suite may run a sibling suite's files.
+const NOT_TEST_INPUT = /^(?:mutants\/|README\.md$|ENVIRONMENT\.md$)/;
 
 // Each lab snapshot's tree of the suite directory, read in one call; empty when Git cannot read them all.
 async function suiteTrees(lab, suite, snapshots) {
@@ -554,7 +555,7 @@ async function pairedBaseRun(ctx, row, baseRevision, lab) {
     if (!trees.has(row.lab_revision) || trees.get(base.lab_revision) !== trees.get(row.lab_revision)) continue;
     const diff = await run(['git', 'diff', '--name-only', '--no-renames', '-z', base.lab_revision, row.lab_revision], { cwd: lab, rawOutput: true, allowFailure: true }).catch(() => null);
     if (diff?.exitCode !== 0) return null;
-    return { base, labDiffers: diff.stdout.split('\0').filter(file => file && !OUTSIDE_SUITE.test(file)).slice(0, LAB_DIFF_LIMIT).map(redactString) };
+    return { base, labDiffers: diff.stdout.split('\0').filter(file => file && !NOT_TEST_INPUT.test(file)).slice(0, LAB_DIFF_LIMIT).map(redactString) };
   }
   return null;
 }
