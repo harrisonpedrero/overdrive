@@ -931,7 +931,7 @@ export async function buildIntegration({ workspace_path, features, base, from })
     if (leftOut.length) notes.push(`Uncommitted files in ${leftOut.join(', ')} are not in this build; to include them, have each lane commit, then rebuild.`);
     // A rebuild of the same lanes, or a fast-forward to a lane head QA already tested, can land on a commit with runs.
     const runs = composition.head ? latestRunsBySuite(ctx, composition.head) : [];
-    if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); integrate counts a pass at this commit on any non-base target, so a suite that passed here needs no rerun unless it changed since.`);
+    if (runs.length) notes.push(`${composition.head.slice(0, 12)} already has runs (${runs.map(run => `${run.suite} ${run.status}`).join(', ')}); a suite that passed on a non-base target at this commit needs no rerun unless it changed since.`);
     return { integration: composition, path: clone, ...(runs.length ? { runs } : {}), ...(notes.length ? { next: notes.join(' ') } : {}) };
   }));
 }
