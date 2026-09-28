@@ -7,8 +7,8 @@ One coordinator conversation drives a network of worker agents through the `over
 | Party | Owns | Never owns |
 | --- | --- | --- |
 | Coordinator (host model) | User intent, specs, priorities, oversight of the agent network, delivery decisions, relaying the user's authority | Application edits, canonical state |
-| Feature agent (one per lane) | Implementing its spec in its clone, commits on `feature/<slug>`, asking QA for verification | Other lanes, the lab, publication, browser or computer control |
-| QA agent (`qa`, `qa-ui`, ...) | Harnesses, fixtures and suites in `lab/`; lab runs; findings; integration builds and conflict resolution | Product code in lane clones, publication |
+| Feature agent (one per lane) | Implementing its spec in its clone, commits on `feature/<slug>`, iterating against QA's lab suites | Other lanes, the lab, publication, browser or computer control |
+| QA agent (`qa`, `qa-ui`, ...) | The suites its brief asks for in `lab/`; lab runs; findings; integration builds and conflict resolution | Product code in lane clones, publication |
 | Runtime (`plugins/overdrive/scripts`) | Clones, SQLite state, message delivery, suite execution and evidence, snapshot and integration Git mechanics, the worker capability boundary | Product judgment, test adequacy, private reasoning |
 | Git | Application and lab history | Lifecycle status or completion |
 

@@ -860,21 +860,25 @@ export async function getLab({ workspace_path, run: runId, before_run: beforeRun
 
 function reproduction(finding, sender, foundRun, integration) {
   const suite = finding.repro_suite;
-  if (!suite) return `There is no repro suite yet; your context packet names it once ${sender} adds it. Ask ${sender} only if the body above does not say how to reproduce it.`;
+  if (!suite) return { text: `There is no repro suite yet; your context packet names it once ${sender} adds it. Ask ${sender} only if the body above does not say how to reproduce it.`, laneResolves: false };
   // Only a failure of this suite on an integration known to combine the lane with others is described as one.
   const integrated = foundRun?.target === 'integration' && foundRun.status === 'failed' && foundRun.suite === suite && runTestedLane(foundRun, finding.feature) === true;
   const others = integrated ? runLanes(foundRun).filter(slug => slug !== finding.feature) : [];
-  if (!others.length) return `Reproduce it with lab_run {"suite": "${suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`;
-  return `Suite ${suite} failed on integration ${foundRun.revision.slice(0, 12)} (${foundRun.id}), which combines your lane with others, so a lab_run on your lane alone may not reproduce it; to reproduce it locally, fetch ${foundRun.revision} from ${integration} without merging it into your branch. A passing run of ${suite} on an integration build that includes your fix and ${others.join(', ')} resolves this finding.`;
+  if (!others.length) return { text: `Reproduce it with lab_run {"suite": "${suite}", "target": "${finding.feature}"}, which tests your current working tree; a passing run resolves this finding.`, laneResolves: true };
+  return { text: `Suite ${suite} failed on integration ${foundRun.revision.slice(0, 12)} (${foundRun.id}), which combines your lane with others, so a lab_run on your lane alone may not reproduce it; to reproduce it locally, fetch ${foundRun.revision} from ${integration} without merging it into your branch. A passing run of ${suite} on an integration build that includes your fix and ${others.join(', ')} resolves this finding.`, laneResolves: false };
 }
 
+// When the lane's own repro run can resolve the finding, the fix needs no message that would wake QA.
 function findingMessage(finding, sender, foundRun, integration, head) {
-  const reproduce = reproduction(finding, sender, foundRun, integration);
+  const { text: reproduce, laneResolves } = reproduction(finding, sender, foundRun, integration);
   const reopened = finding.reopens ? `, reopened ${finding.reopens === 1 ? 'once' : `${finding.reopens} times`}` : '';
   const newer = finding.found_revision && finding.found_revision !== head
-    ? ` It was found at ${finding.found_revision.slice(0, 12)}; your HEAD ${head.slice(0, 12)} is newer, so if a later commit already fixes it, run the repro and tell ${sender}.`
+    ? ` It was found at ${finding.found_revision.slice(0, 12)}; your HEAD ${head.slice(0, 12)} is newer, so if a later commit already fixes it, run the repro${laneResolves ? '' : ` and tell ${sender}`}.`
     : '';
-  return `Finding ${finding.id} (${finding.severity}${reopened}): ${finding.title}\n\n${finding.body}\n\n${reproduce}${newer} Fix it at the root cause, commit, and tell ${sender} what changed.`;
+  const close = laneResolves
+    ? `Fix it at the root cause, commit, and rerun the repro with that commit as revision; tell ${sender} what changed only if the fix needs testing that suite does not cover.`
+    : `Fix it at the root cause, commit, and tell ${sender} what changed.`;
+  return `Finding ${finding.id} (${finding.severity}${reopened}): ${finding.title}\n\n${finding.body}\n\n${reproduce}${newer} ${close}`;
 }
 
 // How often a finding was set open again after it was closed; each reopen records its event.
@@ -1299,7 +1303,7 @@ async function deliveredRuns(ctx, commit, base) {
 }
 
 // Exact labels on the evidence behind a delivery; none of them blocks it.
-async function evidenceFlags(ctx, { target, commit, lanes }) {
+async function evidenceFlags(ctx, { target, commit, source, lanes }, runs) {
   const resolved = lanes.length
     ? ctx.db.prepare(`SELECT * FROM findings WHERE status = 'resolved' AND resolved_run IS NOT NULL AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
@@ -1307,10 +1311,17 @@ async function evidenceFlags(ctx, { target, commit, lanes }) {
   const cache = { ancestry: new Map(), trees: new Map() };
   const evidence = [];
   for (const finding of resolved) evidence.push(await recordedResolutionEvidence(ctx, finding, lab, cache));
+  // A working-tree snapshot, or a commit the delivering clone lacks, is never an ancestor of the delivered commit.
+  const passedHere = new Set(runs.filter(run => run.status === 'passed').map(run => run.suite));
+  const resolvedOutside = [];
+  for (const finding of resolved) {
+    if (!passedHere.has(finding.repro_suite) && !await isGitAncestor(source, finding.resolved_revision, commit)) resolvedOutside.push(`${finding.id} (${finding.repro_suite})`);
+  }
   return {
     inconsistent: [...new Set(inconsistentVerdicts(ctx.db, { target, revision: commit }).map(row => row.suite))],
     labChangedOrUnknown: evidence.filter(item => item.noFailingRun === false && item.labSnapshotChanged !== false).map(item => item.finding),
     noFailingRun: evidence.filter(item => item.noFailingRun === true).map(item => item.finding),
+    resolvedOutside,
   };
 }
 
@@ -1326,11 +1337,12 @@ function evidenceGapsNote(runs, suitesNotRun, flags) {
     unpassed.length ? `The latest runs of ${unpassed.join(', ')} at this commit have not passed; check them with lab_get before reporting the delivery.` : '',
     onBaseToo.length ? `Of these, ${onBaseToo.join(', ')} also failed on base, and no test that passed there fails here (vsBase).` : '',
     labDiffers.length ? `The base runs that ${labDiffers.join(', ')} were compared with come from a lab snapshot that differs outside the suite (vsBase.labDiffers); rerun base with the current snapshot if those files could change the suite's tests.` : '',
-    suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it.` : '',
+    suitesNotRun.length ? `${suitesNotRun.join(', ')} never ran at this commit; do not report them as passing it, and rerun those that decide a criterion or reproduce a resolved finding.` : '',
     regressed.length ? `${regressed.join(', ')} regressed tests that passed on base (runs[].vsBase.regressions); report them whatever the exit code.` : '',
     flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed on this target at this commit with one lab snapshot, so neither verdict stands alone.` : '',
     flags.labChangedOrUnknown.length ? `Findings ${flags.labChangedOrUnknown.join(', ')} were resolved after the lab changed since their failure, or with no comparison (labSnapshotReason): before reporting them fixed, read the lab diff between failedLabRevision and passingLabRevision (lab_get {"findings": "all"}), suite, harness and fixtures alike, and reopen any whose check was weakened.` : '',
     flags.noFailingRun.length ? `Findings ${flags.noFailingRun.join(', ')} were resolved with no recorded failing run, so no run showed the defect before its fix.` : '',
+    flags.resolvedOutside.length ? `Findings ${flags.resolvedOutside.join(', ')} were resolved at a revision this commit does not contain, such as an uncommitted snapshot, and their repro suites have not passed here; rerun them at this commit before reporting the fixes delivered.` : '',
   ].filter(Boolean).join(' ');
 }
 
@@ -1377,7 +1389,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
     AND (target <> 'base' OR EXISTS (SELECT 1 FROM features WHERE slug = 'base')) ORDER BY created_at DESC LIMIT 1`).get(commit) ?? null;
   const runs = await deliveredRuns(ctx, commit, base);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
-  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, lanes }));
+  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, source, lanes }, runs));
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];

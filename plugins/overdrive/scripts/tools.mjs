@@ -91,10 +91,10 @@ export const TOOLS = [
     spec: string('Optional complete initial Markdown specification.'),
   }, ['workspace_path', 'feature', 'title', 'outcome']), { destructiveHint: false, openWorldHint: true }),
 
-  tool('qa_create', 'Create QA agent', 'Create a QA agent that works in the workspace lab (lab/): it builds reusable suites, tests lanes and integrations with lab_run, records findings and messages them to the lanes. The brief is its durable spec; revise it with feature_update. Start it with agent_start.', object({
+  tool('qa_create', 'Create QA agent', 'Create a QA agent that works in the workspace lab (lab/): it builds the suites its brief asks for, runs them on lanes and integrations with lab_run, records findings and messages them to the lanes. The brief is its durable spec; revise it with feature_update. Start it with agent_start.', object({
     ...workspace,
     name: string('Agent name; defaults to qa. Give a second QA agent another name, such as qa-ui.', { pattern: SLUG }),
-    brief: string('What to test: the user journeys, interfaces, environments and priorities this agent covers.'),
+    brief: string('The verification plan: the lanes and environments this agent covers, then for each acceptance criterion the evidence that decides it and its depth, and what to leave out.'),
   }, ['workspace_path', 'brief']), { destructiveHint: false }),
 
   tool('feature_list', 'List feature lanes', 'Return a compact progress view of every lane and QA agent without loading their specifications, plus the messages agents sent the coordinator since they were last returned (coordinatorMessages, each returned once). With coordinator_messages set to recent it returns messageHistory instead: the 10 newest messages to the coordinator from any sender, pending and delivered alike, with their status and when and how the runtime handed them over (delivered records that handoff, not that anyone read it), and delivers none of them. When older messages remain, nextBeforeMessage holds the before_message value for the next page; otherwise it is null.', object({
