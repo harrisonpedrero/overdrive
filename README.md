@@ -68,6 +68,8 @@ claude plugin install overdrive@overdrive-local
 
 Start a new task or session afterward so it loads the plugin. For a single Claude Code session without installing, run `claude --plugin-dir C:\path\to\overdrive\plugins\overdrive`.
 
+Claude Code loads a plugin from a local-directory marketplace, like the one above, in place: to pick up source changes, start a new session or run `/reload-plugins`. A marketplace added from a Git URL is installed as a cached copy versioned by commit, because the Claude manifest has no `version`. To update it, run `claude plugin marketplace update overdrive-local`, then `claude plugin update overdrive@overdrive-local`, then start a new session.
+
 Claude Code asks before every OVERDRIVE call. To be asked only where Codex asks (adopting a repository, integrating, and answering an agent's request), add this to your user or project settings:
 
 ```json

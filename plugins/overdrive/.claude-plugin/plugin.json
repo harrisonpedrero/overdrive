@@ -1,6 +1,5 @@
 {
   "name": "overdrive",
-  "version": "0.1.0",
   "description": "OVERDRIVE: run parallel feature lanes from Claude Code, with isolated clones and worker agents, QA agents in a decoupled test and integration lab, direct agent messaging, and worker boundaries the runtime enforces.",
   "author": {
     "name": "Harrison Pedrero"
