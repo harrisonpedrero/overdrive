@@ -97,5 +97,5 @@ export function workerToolDecision(profile, toolName, input, { writeRoots = null
 }
 
 export function denialNote(tools) {
-  return `Worker permission policy denied ${tools.length} tool call(s): ${[...new Set(tools)].join(', ')}. Send browser or testing needs to QA with message_send; publishing needs the user's authority through the coordinator; file tools write only in the agent's own checkout, or for QA the lab and the integration clone.`;
+  return `Permission checks denied ${tools.length} tool call(s): ${[...new Set(tools)].join(', ')}.`;
 }
