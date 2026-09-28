@@ -35,7 +35,7 @@ Workers are configured separately in the workspace's `overdrive.json`:
 
 ## The lab
 
-`lab/` in the workspace is a local Git repository that belongs to the QA agents: harnesses, fixtures and suites at `lab/suites/<name>/suite.json`. It is decoupled from the product repository and never pushed, so tests can span several lanes and their integration without landing in product commits. Feature agents do not add tests to the product repository unless you ask for them.
+`lab/` in the workspace is a local Git repository that belongs to the QA agents: harnesses, fixtures and suites at `lab/suites/<name>/suite.json`. It is decoupled from the product repository and never pushed, so tests can span several lanes and their integration without landing in product commits. Feature agents do not add tests to the product repository unless you ask for them. Work that should never ship, such as probes, generated data and plans, stays in each agent's `.overdrive-workbench/`, which OVERDRIVE keeps out of Git and delivery.
 
 Only runs the runtime executes count as evidence. `lab_run` runs a suite in a clean clone at an exact revision of a lane (by default its committed HEAD, or for the lane's own agent a snapshot of its working tree, uncommitted changes included) or of the integration build, with the lab itself pinned to a snapshot, and records the verdict, output and artifacts. An agent's report of a passing test is never recorded as a run. A passing run of a finding's repro suite resolves that finding, and integrating into a managed project requires a passing lane or integration run at that exact commit, never a base control run, with no open blocking findings.
 

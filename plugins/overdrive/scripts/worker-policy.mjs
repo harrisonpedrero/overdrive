@@ -90,7 +90,7 @@ export function workerToolDecision(profile, toolName, input, { writeRoots = null
   if (writesUserGitConfig(input)) return deny('Global and system Git configuration belongs to the user; use repository-local git config instead.');
   const vetsPaths = writeRoots && FILE_WRITES.has(name);
   if (vetsPaths && writesOutsideRoots(input, writeRoots, workspaceRoot)) {
-    return deny(`File tools may write only under ${writeRoots.join(', ')} or the temp directory, and never inside .git; ask the agent that owns the path with message_send.`);
+    return deny(`File tools may write only under ${writeRoots.join(', ')} or the temp directory, and never inside .git. Keep files you may need again in your workbench (your instructions name it); ask the agent that owns another path with message_send.`);
   }
   if (safetyCheck && !vetsPaths) return deny('Claude Code flagged this call as touching a protected path or running a destructive command; ask the coordinator with message_send.');
   return ALLOW;

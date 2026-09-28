@@ -1,5 +1,5 @@
 # Product development artifacts
-.scratch-*/
+.overdrive-workbench/
 node_modules/
 
 # Ready-workspace runtime state
