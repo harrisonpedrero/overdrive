@@ -374,7 +374,7 @@ async function parentLaneFacts(ctx, feature, laneHead) {
 function parentLaneLine(parent) {
   if (!parent) return '';
   if (parent.unavailable) return `- Parent lane ${parent.feature}: unavailable. ${parent.unavailable}\n`;
-  const relation = `${parent.selectedInParentHistory ? '' : 'no longer contains this lane\'s base and '}is ${parent.headInLane ? '' : 'not '}in this lane's committed history.`;
+  const relation = `${parent.selectedInParentHistory ? 'still contains' : 'no longer contains'} this lane's base and is ${parent.headInLane ? '' : 'not '}in this lane's committed history.`;
   const advice = parent.selectedInParentHistory && parent.headInLane ? '' : ' Review whether this lane\'s assumptions still hold.';
   return `- Parent lane ${parent.feature}: HEAD ${parent.head} ${relation}${advice}\n`;
 }
