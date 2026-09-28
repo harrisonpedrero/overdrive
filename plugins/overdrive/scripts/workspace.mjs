@@ -317,9 +317,12 @@ function openFindingRows(db, row) {
 
 const OPEN_FINDING_COUNT = "SELECT COUNT(*) AS count FROM findings WHERE feature = ? AND status = 'open'";
 
+// A lane's runs, binding its slug twice: its own target, or an integration whose recorded lanes name it (NULL lanes name none).
+export const LANE_RUN_SQL = "(target = ? OR (target = 'integration' AND EXISTS (SELECT 1 FROM json_each(lab_runs.lanes_json) WHERE value = ?)))";
+
 function recentRuns(db, row, limit) {
-  return db.prepare('SELECT id, suite, target, status, exit_code, revision, created_by, created_at FROM lab_runs WHERE (? OR target = ?) AND mutant IS NULL ORDER BY created_at DESC LIMIT ?')
-    .all(row.kind === 'qa' ? 1 : 0, row.slug, limit);
+  return db.prepare(`SELECT id, suite, target, status, exit_code, revision, created_by, created_at FROM lab_runs WHERE (? OR ${LANE_RUN_SQL}) AND mutant IS NULL ORDER BY created_at DESC LIMIT ?`)
+    .all(row.kind === 'qa' ? 1 : 0, row.slug, row.slug, limit);
 }
 
 function recentMessages(db, slug, limit = 10) {
@@ -921,12 +924,12 @@ export async function listFeatures({ workspace_path, include_archived = false, i
   return await withContext(workspace_path, async ctx => {
     const features = [];
     const openFindings = ctx.db.prepare(OPEN_FINDING_COUNT);
-    const latestRun = ctx.db.prepare('SELECT id, suite, status, revision, created_at FROM lab_runs WHERE target = ? AND mutant IS NULL ORDER BY created_at DESC LIMIT 1');
+    const latestRun = ctx.db.prepare(`SELECT id, suite, target, status, revision, created_at FROM lab_runs WHERE ${LANE_RUN_SQL} AND mutant IS NULL ORDER BY created_at DESC LIMIT 1`);
     for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived), includeDone: include_done })) {
       const result = {
         ...summarizeFeature(ctx, recoverAgentState(ctx, feature)),
         openFindings: Number(openFindings.get(feature.slug).count),
-        latestLabRun: latestRun.get(feature.slug) ?? null,
+        latestLabRun: latestRun.get(feature.slug, feature.slug) ?? null,
       };
       if (refresh_git) {
         try { result.git = await repositorySnapshot(assertBoundCheckout(feature).checkout_path, feature.base_revision); }

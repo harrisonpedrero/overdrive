@@ -39,7 +39,7 @@ import {
   safeSlug,
   withWorkspaceLock, STATE_DIR,
 } from './util.mjs';
-import { addEvent, ensureLab, withContext, writeFeatureContext, writeIndex } from './workspace.mjs';
+import { LANE_RUN_SQL, addEvent, ensureLab, withContext, writeFeatureContext, writeIndex } from './workspace.mjs';
 
 const SUITE_NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const SEVERITIES = new Set(['blocking', 'minor']);
@@ -905,8 +905,7 @@ function reissueFindingMessage(db, finding, message, stamp) {
 
 // The latest failure of the suite that tested the lane, on its own target or in an integration known to include it.
 function latestLaneFailure(db, slug, suite) {
-  return db.prepare(`SELECT id, target, revision, created_at FROM lab_runs WHERE suite = ? AND status = 'failed' AND mutant IS NULL AND (target = ?
-    OR (target = 'integration' AND EXISTS (SELECT 1 FROM json_each(lab_runs.lanes_json) WHERE value = ?)))
+  return db.prepare(`SELECT id, target, revision, created_at FROM lab_runs WHERE suite = ? AND status = 'failed' AND mutant IS NULL AND ${LANE_RUN_SQL}
     ORDER BY created_at DESC, id DESC LIMIT 1`).get(suite, slug, slug) ?? null;
 }
 
