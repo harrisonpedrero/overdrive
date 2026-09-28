@@ -445,10 +445,10 @@ function normalizeFeature(row, root = undefined) {
   return feature;
 }
 
-export function listFeatureRows(db, { includeArchived = false } = {}) {
-  const rows = includeArchived
-    ? db.prepare("SELECT * FROM features ORDER BY status = 'active' DESC, priority DESC, updated_at DESC").all()
-    : db.prepare("SELECT * FROM features WHERE status <> 'archived' ORDER BY status = 'active' DESC, priority DESC, updated_at DESC").all();
+export function listFeatureRows(db, { includeArchived = false, includeDone = true } = {}) {
+  const hidden = [...(includeArchived ? [] : ['archived']), ...(includeDone ? [] : ['done'])];
+  const rows = db.prepare("SELECT * FROM features WHERE status NOT IN (SELECT value FROM json_each(?)) ORDER BY status = 'active' DESC, priority DESC, updated_at DESC")
+    .all(JSON.stringify(hidden));
   const root = databaseRoots.get(db);
   return rows.map(row => normalizeFeature(row, root));
 }

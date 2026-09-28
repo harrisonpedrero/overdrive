@@ -915,13 +915,14 @@ function coordinatorMessageHistory(db, before) {
   return { messageHistory, nextBeforeMessage: rows.length > MESSAGE_PAGE_SIZE ? messageHistory.at(-1).id : null };
 }
 
-export async function listFeatures({ workspace_path, include_archived = false, refresh_git = false, coordinator_messages, before_message }) {
+export async function listFeatures({ workspace_path, include_archived = false, include_done = true, refresh_git = false, coordinator_messages, before_message }) {
   const messages = coordinatorMessageMode(coordinator_messages, before_message);
+  if (typeof include_done !== 'boolean') throw new OverdriveError('include_done must be true or false.', 'INVALID_INPUT');
   return await withContext(workspace_path, async ctx => {
     const features = [];
     const openFindings = ctx.db.prepare(OPEN_FINDING_COUNT);
     const latestRun = ctx.db.prepare('SELECT id, suite, status, revision, created_at FROM lab_runs WHERE target = ? AND mutant IS NULL ORDER BY created_at DESC LIMIT 1');
-    for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived) })) {
+    for (const feature of listFeatureRows(ctx.db, { includeArchived: Boolean(include_archived), includeDone: include_done })) {
       const result = {
         ...summarizeFeature(ctx, recoverAgentState(ctx, feature)),
         openFindings: Number(openFindings.get(feature.slug).count),
