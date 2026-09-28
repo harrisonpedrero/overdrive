@@ -540,6 +540,30 @@ export async function isGitAncestor(repository, ancestor, descendant) {
   }
 }
 
+// Exact committed ancestry in a repository whose descendant commit was read: an ancestor object
+// absent from it cannot be in that history, while any other Git failure stays unknown and throws.
+async function containsCommit(repository, ancestor, descendant) {
+  if (ancestor === descendant) return true;
+  const options = { cwd: repository, allowFailure: true, timeoutMs: 30_000 };
+  const compared = await run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], options);
+  if (!compared.timedOut && (compared.exitCode === 0 || compared.exitCode === 1)) return compared.exitCode === 0;
+  const present = await run(['git', 'rev-parse', '--quiet', '--verify', `${ancestor}^{commit}`], options);
+  if (!present.timedOut && present.exitCode === 1) return false;
+  throw new OverdriveError('Git could not compare the commits.', 'COMMAND_FAILED');
+}
+
+// Reads a parent lane's committed HEAD and checks the parent's and the child's histories, each in its
+// own repository; nothing is fetched or written.
+export async function parentLaneAncestry(parentRepository, selectedRevision, laneRepository, laneHead) {
+  await assertFullRepository(parentRepository);
+  const head = (await git(parentRepository, 'rev-parse', '--verify', 'HEAD^{commit}')).stdout;
+  return {
+    head,
+    selectedInParentHistory: await containsCommit(parentRepository, selectedRevision, head),
+    headInLane: await containsCommit(laneRepository, head, laneHead),
+  };
+}
+
 const CHANGED_FILE_LIMIT = 100;
 const CHANGED_PATH_MAX = 300;
 const TREE_DIFF_OUTPUT_MAX = 16_000_000;

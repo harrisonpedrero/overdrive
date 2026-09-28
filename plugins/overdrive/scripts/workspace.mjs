@@ -34,6 +34,7 @@ import {
   integrationPath,
   labPath,
   mirrorPath,
+  parentLaneAncestry,
   profileRepository,
   readCommitIdentity,
   refreshMirror,
@@ -343,6 +344,41 @@ function qaPacket(db, feature, { agentLine, notes, workLines, findings, messages
   return `# ${feature.title}\n\nQA agent: ${feature.slug}\nStatus: ${feature.status}\nBrief revision: ${feature.spec_revision}\n${agentLine}\nLab: ${feature.checkout_path}; its README.md holds the suite format, environment and rules.\n${notes}\n## Open findings\n\n${findingLines(findings, true)}\n\n## Recent lab runs\n\n${runLines(recentRuns(db, feature, 10))}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Work graph\n\n${workLines}\n\n## Live facts\n\n${facts}\nRead spec.md beside this file for your complete brief. Treat this packet as navigation, not a substitute for Git and executed runs.\n`;
 }
 
+// The parent named by the lane's own creation record, which must also carry the lane's full base
+// commit; any other record names no parent, so none is ever inferred from shared ancestry.
+function recordedParent(db, feature) {
+  const created = db.prepare("SELECT details_json FROM events WHERE feature_id = ? AND kind = 'feature.created' ORDER BY id LIMIT 1").get(feature.id);
+  const { baseFeature, baseRevision } = parseJson(created?.details_json, null) ?? {};
+  if (typeof baseFeature !== 'string' || baseRevision !== feature.base_revision || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(baseRevision)) return null;
+  try { return safeSlug(baseFeature) === baseFeature ? baseFeature : null; } catch { return null; }
+}
+
+async function parentLaneFacts(ctx, feature, laneHead) {
+  const slug = recordedParent(ctx.db, feature);
+  if (!slug) return null;
+  const facts = { feature: slug, selectedRevision: feature.base_revision };
+  const unavailable = reason => ({ ...facts, unavailable: reason });
+  let parent;
+  try { parent = readFeatureRow(ctx.db, slug); } catch { return unavailable('It is not registered in this workspace.'); }
+  if (parent.checkout_location?.bound === false) return unavailable('Its checkout is not bound to this workspace.');
+  if (!laneHead) return unavailable('This lane\'s HEAD could not be read.');
+  try {
+    return { ...facts, ...await parentLaneAncestry(parent.checkout_path, feature.base_revision, feature.checkout_path, laneHead) };
+  } catch (error) {
+    return unavailable(['INVALID_CHECKOUT', 'UNSAFE_CHECKOUT'].includes(error?.code)
+      ? 'Its checkout is missing or is not a full Git repository.'
+      : 'Git could not read or compare its commits.');
+  }
+}
+
+function parentLaneLine(parent) {
+  if (!parent) return '';
+  if (parent.unavailable) return `- Parent lane ${parent.feature}: unavailable. ${parent.unavailable}\n`;
+  const relation = `${parent.selectedInParentHistory ? '' : 'no longer contains this lane\'s base and '}is ${parent.headInLane ? '' : 'not '}in this lane's committed history.`;
+  const advice = parent.selectedInParentHistory && parent.headInLane ? '' : ' Review whether this lane\'s assumptions still hold.';
+  return `- Parent lane ${parent.feature}: HEAD ${parent.head} ${relation}${advice}\n`;
+}
+
 export async function writeFeatureContext(ctx, featureOrSlug) {
   const feature = typeof featureOrSlug === 'string' ? featureBySlug(ctx.db, safeSlug(featureOrSlug)) : featureOrSlug;
   const qa = workerProfile(feature) === 'qa';
@@ -363,6 +399,7 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
   const identityLine = identity
     ? `- Commit identity: ${identity.summary}${identity.automation || !identity.author || !identity.committer ? `. Lane-local override: run ${identity.override.map(command => `\`${command}\``).join(' then ')}` : ''}\n`
     : '';
+  const parentLane = qa ? null : await parentLaneFacts(ctx, feature, snapshot.head);
   const detailFiles = await writeWorkDetails(ctx, feature, work);
   const workLines = work.length
     ? work.map(item => `- [${item.status === 'done' ? 'x' : ' '}] ${item.item_key} · ${item.kind} · ${item.status}: ${item.title}${item.dependencies.length ? ` (after ${item.dependencies.join(', ')})` : ''}${item.blocker ? ` — ${item.blocker}` : ''}${detailFiles.has(item.item_key) ? `\n  - ${item.item_key} description and acceptance: ${detailFiles.get(item.item_key)}` : ''}`).join('\n')
@@ -373,12 +410,12 @@ export async function writeFeatureContext(ctx, featureOrSlug) {
     : '';
   const agentLine = `Agent: ${feature.agent_status}${feature.thread_id ? ` · thread ${feature.thread_id} (${feature.thread_harness ?? 'backend unknown'})` : ''}`;
   const notes = `\n## Summary\n\n${feature.summary || 'None yet.'}\n${feature.next_action ? `\nNext action: ${feature.next_action}\n` : ''}${feature.blocker ? `\nBlocker: ${feature.blocker}\n` : ''}`;
-  const facts = `- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${identityLine}- Environment facts: ${contained(labPath(ctx.root), 'ENVIRONMENT.md')}\n- Pending agent requests: ${pending.length}\n`;
+  const facts = `- Checkout: ${feature.checkout_path}\n- HEAD: ${snapshot.head ?? 'unavailable'}\n- Working tree: ${snapshot.clean === true ? 'clean' : snapshot.clean === false ? `${snapshot.changedFileCount} changed path(s)` : 'unavailable'}\n${parentLaneLine(parentLane)}${identityLine}- Environment facts: ${contained(labPath(ctx.root), 'ENVIRONMENT.md')}\n- Pending agent requests: ${pending.length}\n`;
   const packet = qa
     ? qaPacket(ctx.db, feature, { agentLine, notes, workLines, findings, messages, facts })
     : `# ${feature.title}\n\nFeature: ${feature.slug}\nStatus: ${feature.status}\nOutcome: ${feature.outcome}\nBase: ${feature.base_revision}\nBranch: ${feature.branch}\nSpec revision: ${feature.spec_revision}\n${agentLine}\n${notes}\n## Work graph\n\n${workLines}\n\n## Open findings\n\n${findingLines(findings, false)}\n\n## Recent messages\n\n${messageLines(messages)}\n\n## Recent lab runs\n\n${runLines(recentRuns(ctx.db, feature, 10))}\n\n${legacyEvidence}## Live facts\n\n${facts}\nRead spec.md beside this file for the complete current specification. Treat this packet as navigation, not a substitute for Git and executed checks.\n`;
   await atomicWrite(ctx.root, contained(ctx.root, STATE_DIR, 'features', feature.slug, 'context.md'), packet);
-  return { feature, work, evidence, pending, findings, messages, snapshot, commitIdentity: identity };
+  return { feature, work, evidence, pending, findings, messages, snapshot, commitIdentity: identity, parentLane };
 }
 
 async function existingInitialization(root, normalized) {
@@ -1012,6 +1049,7 @@ export async function getFeatureContext({ workspace_path, feature, timeline_limi
       messages: projection.messages,
       pendingAgentRequests: projection.pending,
       git,
+      ...(projection.parentLane ? { parentLane: projection.parentLane } : {}),
       commitIdentity: projection.commitIdentity,
       timeline,
       contextPath: contained(ctx.root, STATE_DIR, 'features', row.slug, 'context.md'),

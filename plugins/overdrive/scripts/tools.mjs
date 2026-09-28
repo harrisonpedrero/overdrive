@@ -105,7 +105,7 @@ export const TOOLS = [
     before_message: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: 'Message id from nextBeforeMessage: list the 10 messages before it. Only with coordinator_messages recent.' },
   }, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, safe timeline, Git facts, recorded evidence history, and pending agent requests.', object({
+  tool('feature_get', 'Inspect feature lane', 'Load one feature only: current spec, work DAG, safe timeline, Git facts, recorded evidence history, and pending agent requests. A lane created from another lane\'s commit adds parentLane: that lane\'s committed head, whether it still contains the selected base, and whether this lane\'s committed HEAD contains it.', object({
     ...workspace,
     ...feature,
     timeline_limit: integer('Number of recent safe events.', 1, 200),
