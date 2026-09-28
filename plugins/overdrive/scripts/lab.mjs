@@ -1302,8 +1302,17 @@ async function deliveredRuns(ctx, commit, base) {
   return runs;
 }
 
+// Whether any recorded pass of the finding's repro at the commit retested its lane, with every lane of a verified
+// multi-lane failure, whatever ran there since; base controls and mutants never do.
+async function retestedAt(ctx, finding, commit, cache) {
+  const passes = ctx.db.prepare("SELECT id, suite, target, revision, lanes_json, status FROM lab_runs WHERE suite = ? AND revision = ? AND status = 'passed' AND mutant IS NULL").all(finding.repro_suite, commit);
+  if (!passes.length) return false;
+  const failure = await attachedFailure(ctx, finding, cache);
+  return passes.some(run => passingReason({ ...finding, resolved_revision: commit }, run, failure) === null);
+}
+
 // Exact labels on the evidence behind a delivery; none of them blocks it.
-async function evidenceFlags(ctx, { target, commit, source, lanes }, runs) {
+async function evidenceFlags(ctx, { target, commit, source, lanes }) {
   const resolved = lanes.length
     ? ctx.db.prepare(`SELECT * FROM findings WHERE status = 'resolved' AND resolved_run IS NOT NULL AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
@@ -1312,10 +1321,9 @@ async function evidenceFlags(ctx, { target, commit, source, lanes }, runs) {
   const evidence = [];
   for (const finding of resolved) evidence.push(await recordedResolutionEvidence(ctx, finding, lab, cache));
   // A working-tree snapshot, or a commit the delivering clone lacks, is never an ancestor of the delivered commit.
-  const passedHere = new Set(runs.filter(run => run.status === 'passed').map(run => run.suite));
   const resolvedOutside = [];
   for (const finding of resolved) {
-    if (!passedHere.has(finding.repro_suite) && !await isGitAncestor(source, finding.resolved_revision, commit)) resolvedOutside.push(`${finding.id} (${finding.repro_suite})`);
+    if (!await isGitAncestor(source, finding.resolved_revision, commit) && !await retestedAt(ctx, finding, commit, cache)) resolvedOutside.push(`${finding.id} (${finding.repro_suite})`);
   }
   return {
     inconsistent: [...new Set(inconsistentVerdicts(ctx.db, { target, revision: commit }).map(row => row.suite))],
@@ -1342,7 +1350,7 @@ function evidenceGapsNote(runs, suitesNotRun, flags) {
     flags.inconsistent.length ? `${flags.inconsistent.join(', ')} both passed and failed on this target at this commit with one lab snapshot, so neither verdict stands alone.` : '',
     flags.labChangedOrUnknown.length ? `Findings ${flags.labChangedOrUnknown.join(', ')} were resolved after the lab changed since their failure, or with no comparison (labSnapshotReason): before reporting them fixed, read the lab diff between failedLabRevision and passingLabRevision (lab_get {"findings": "all"}), suite, harness and fixtures alike, and reopen any whose check was weakened.` : '',
     flags.noFailingRun.length ? `Findings ${flags.noFailingRun.join(', ')} were resolved with no recorded failing run, so no run showed the defect before its fix.` : '',
-    flags.resolvedOutside.length ? `Findings ${flags.resolvedOutside.join(', ')} were resolved at a revision this commit does not contain, such as an uncommitted snapshot, and their repro suites have not passed here; rerun them at this commit before reporting the fixes delivered.` : '',
+    flags.resolvedOutside.length ? `Findings ${flags.resolvedOutside.join(', ')} were resolved at a revision this commit does not contain, such as an uncommitted snapshot, and no pass of their repro suites here retested their lanes (a base control never does); rerun each at this commit on its lane, or on an integration of every lane its failure tested when that was several, before reporting the fixes delivered.` : '',
   ].filter(Boolean).join(' ');
 }
 
@@ -1389,7 +1397,7 @@ async function promote(ctx, { target, base, commit, source, branch, lanes }) {
     AND (target <> 'base' OR EXISTS (SELECT 1 FROM features WHERE slug = 'base')) ORDER BY created_at DESC LIMIT 1`).get(commit) ?? null;
   const runs = await deliveredRuns(ctx, commit, base);
   const suitesNotRun = await suitesNotRunAt(ctx, runs);
-  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, source, lanes }, runs));
+  const gaps = evidenceGapsNote(runs, suitesNotRun, await evidenceFlags(ctx, { target, commit, source, lanes }));
   const blocking = lanes.length
     ? ctx.db.prepare(`SELECT id, feature, title FROM findings WHERE status = 'open' AND severity = 'blocking' AND feature IN (${lanes.map(() => '?').join(', ')})`).all(...lanes)
     : [];
