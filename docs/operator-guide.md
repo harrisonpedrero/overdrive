@@ -52,7 +52,7 @@ Codex workers have no permission settings: they run in the `workspace-write` san
 
 ## The lab
 
-`lab/` is created at initialization, or on first use in older workspaces, with a README that QA agents follow (the suite format, rules, and recipes for `tests.json` and mutants) and an `ENVIRONMENT.md` in which QA keeps verified install, build and test commands, failures known at base and machine quirks; every agent's context packet names that file. A lab created before `ENVIRONMENT.md` existed gets it on first use; its existing README is left unchanged. QA agents own its contents and commit to it. Each suite is a directory:
+`lab/` is created at initialization, or on first use in older workspaces, with a README that QA agents follow (the suite format, rules, and recipes for `tests.json` and mutants) and an `ENVIRONMENT.md` in which QA keeps verified install, build and test commands, failures known at base and machine quirks; every agent's context packet names that file. A lab created before `ENVIRONMENT.md` existed gets it on first use; its existing README is left unchanged. QA agents own its contents and commit to it. Every agent keeps work that never ships in a workbench, `.overdrive-workbench/`: in its checkout for a feature agent, one directory per QA agent in the lab beside `data/` (the datasets suites reach as `OVERDRIVE_DATA`), and the workspace root for the coordinator. OVERDRIVE keeps workbenches out of Git, lab snapshots and delivery and never deletes them; `data/` can be deleted at any time, and its committed generators recreate it. Each suite is a directory:
 
 ```text
 lab/suites/<name>/suite.json
@@ -78,6 +78,7 @@ Every run receives this environment:
 | `OVERDRIVE_LAB` | A checkout of the run's lab snapshot, which the suite runs from |
 | `OVERDRIVE_SUITE` | Suite name |
 | `OVERDRIVE_ARTIFACTS` | Empty directory for this run's screenshots, logs, traces and `tests.json` |
+| `OVERDRIVE_DATA` | The live lab's `.overdrive-workbench/data`, shared by all runs and kept between them, for generated datasets too large to commit |
 | `OVERDRIVE_PORT` | A free TCP port on 127.0.0.1 |
 
 Each `lab_run` call snapshots the lab's working tree, uncommitted suites included, when it starts and records it as `lab_revision`; its suites, harness and fixtures run from a checkout of that snapshot, so lab edits made during a run reach only later calls. A suite starts every service it needs and stops it before exiting. Target clones and lab snapshot checkouts keep ignored directories such as `node_modules` between runs, so dependency setup should be idempotent, for example reinstalling only when the lockfile changed. Ignored files in the lab itself, such as a `node_modules` QA installed there, are not in the snapshot and runs never see them. A suite that needs lab dependencies installs them idempotently into `OVERDRIVE_LAB`; the install happens on the first run in each lab snapshot checkout (one per target and slot) and is kept after that. Keep dependencies and outputs out of the lab's Git with `.gitignore`, because every run snapshots the lab's working tree.

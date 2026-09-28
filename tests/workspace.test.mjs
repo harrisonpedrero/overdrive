@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { integrate } from '../plugins/overdrive/scripts/lab.mjs';
 import { git } from '../plugins/overdrive/scripts/util.mjs';
 import {
   createFeature,
@@ -205,6 +206,22 @@ test('starts a managed project from scratch and bases lanes on its head', async 
     spec: '# Foundation\n\napp.txt contains the working foundation.\n',
   });
   assert.equal(foundation.feature.baseRevision, (await git(project, 'rev-parse', 'HEAD')).stdout);
+});
+
+test('integrate refuses a lane whose history once committed a workbench file', async t => {
+  const { source, workspace } = await fixture(t);
+  await initializeWorkspace({ workspace_path: workspace, repository: source });
+  await createFeature({ workspace_path: workspace, feature: 'lane', outcome: 'Force-adds a workbench file.' });
+  const lane = path.join(workspace, 'features', 'lane', 'repo');
+  await git(lane, 'config', 'user.name', 'OVERDRIVE Test');
+  await git(lane, 'config', 'user.email', 'overdrive@example.invalid');
+  await fs.mkdir(path.join(lane, '.overdrive-workbench'));
+  await fs.writeFile(path.join(lane, '.overdrive-workbench', 'x'), 'probe\n');
+  await git(lane, 'add', '-f', '.overdrive-workbench/x');
+  await git(lane, 'commit', '-m', 'add a workbench file');
+  await git(lane, 'rm', '-q', '.overdrive-workbench/x');
+  await git(lane, 'commit', '-m', 'remove it');
+  await assert.rejects(integrate({ workspace_path: workspace, target: 'lane' }), error => error.code === 'WORKBENCH_COMMITTED');
 });
 
 test('versions specs and enforces the work DAG', async t => {

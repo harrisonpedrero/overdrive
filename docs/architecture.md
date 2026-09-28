@@ -31,13 +31,18 @@ A QA agent is a lane row with `kind = 'qa'` whose checkout is `lab/`, so it shar
     lab/snapshots/<target>/ runtime-owned checkouts of lab snapshots that suites run from
     lab/runs/<id>/artifacts/
     lab/integration/        the integration clone
+  .overdrive-workbench/     the coordinator's workbench: plans, drafts, reviews, scripts (in the workspace .gitignore)
   features/<slug>/
     repo/                   a full, independent clone on feature/<slug>
+      .overdrive-workbench/ the lane agent's workbench (in the clone's .git/info/exclude)
   lab/                      QA & integration lab: a local Git repository, never pushed, with README.md and ENVIRONMENT.md
+    .overdrive-workbench/   QA agents' workbenches (<slug>/) and data/, which runs see as OVERDRIVE_DATA (in the lab's .git/info/exclude)
   project/                  managed canonical repository (project_create only)
 ```
 
 SQLite is canonical; the Markdown files are projections that a fresh agent reads instead of a transcript. The legacy `evidence`, `candidates` and `checkpoints` tables receive no new writes; `feature_get` shows evidence rows as read-only history.
+
+**Workbenches.** A workbench is an `.overdrive-workbench/` directory for work that never ships: probes, harnesses, generated data, notes and plans. The runtime lists it in a lane clone's `.git/info/exclude` before every turn and in the lab's whenever the lab is used, and the workspace `.gitignore` lists the coordinator's, so no `add -A`, snapshot, lab revision or commit contains one and Git never walks them. `integrate` refuses a commit whose history since its base touches one (`WORKBENCH_COMMITTED`). The runtime never reads, moves or deletes workbench files, and they are never evidence.
 
 ## Worker capability profiles
 
@@ -93,7 +98,7 @@ Delivery holds the agent's control lock, so two controllers never deliver the sa
 1. Snapshot the lab working tree as `lab_revision`, once per call, and read each `suite.json` from that commit.
 2. Resolve the revision: the given ref, a lane snapshot when the lane's own agent runs the suite or else the lane HEAD, the integration HEAD, or for the `base` control target the managed `project/` HEAD or the cached default revision. A `base` commit ID that neither holds, such as a foundation lane's commit, is resolved in the first feature lane checkout that has it.
 3. Under a per-target lock, fetch it into `.overdrive/lab/targets/<target>`, a clone whose `origin` is the repository as in lane clones, `checkout --detach -f`, and `git clean -fd`, which keeps ignored dependency directories. A call runs up to three of its runs on one target at once, in `<target>`, `<target>--s1` and `<target>--s2`, after resolving their revisions one at a time.
-4. When a run of the same suite on this target at the same revision, lab revision and mutant ended after the call arrived, return it marked `reused`. Otherwise sync `lab_revision` the same way into `.overdrive/lab/snapshots/` under the slot's directory name, for a mutant run apply its patch blob as committed at `lab_revision`, not the checkout's line-ending-converted copy, to the target checkout with `git apply` (such a run is a control of the suite, never evidence about the target), run the suite argv from there without a shell, with `OVERDRIVE_LAB` set to that checkout and the environment contract, timeout and output cap, and record the `lab_runs` row. Neither the suite nor its harness is read from the live lab, which QA may be editing.
+4. When a run of the same suite on this target at the same revision, lab revision and mutant ended after the call arrived, return it marked `reused`. Otherwise sync `lab_revision` the same way into `.overdrive/lab/snapshots/` under the slot's directory name, for a mutant run apply its patch blob as committed at `lab_revision`, not the checkout's line-ending-converted copy, to the target checkout with `git apply` (such a run is a control of the suite, never evidence about the target), run the suite argv from there without a shell, with `OVERDRIVE_LAB` set to that checkout, `OVERDRIVE_DATA` set to the live lab's `.overdrive-workbench/data`, shared by all runs and outside every snapshot, and the environment contract, timeout and output cap, and record the `lab_runs` row. Neither the suite nor its harness is read from the live lab, which QA may be editing.
 
 The output keeps at most its last 500,000 characters of stdout and stderr in arrival order. Earlier output is dropped at a line end, or at whitespace inside a longer line, and an unfinished line over that length loses its start after a marker line, each together with any kept text that may continue a word or credential cut there, so redaction never depends on dropped text; it is redacted and written to `.overdrive/lab/runs/<id>/output.log`, and the row keeps its last 24,000 characters. Artifacts are listed with their path, size and sha256. A run whose processes cannot be confirmed stopped is `uncertain`, and its target and lab snapshot directories are never reused; the next run uses fresh sibling directories. A call holds its agent until it returns or the host moves it to the background, as Claude Code does after two minutes, so runs on different targets proceed in parallel across agents, within one batch, or across a Claude worker's backgrounded calls. A call on a busy target queues for its lock as long as its runs there could still finish within an hour (at least two minutes), then fails with `WORKSPACE_BUSY`; in a batch, only that target's runs fail.
 
@@ -107,7 +112,7 @@ The output keeps at most its last 500,000 characters of stdout and stderr in arr
 
 1. **One live turn per agent.** Per-agent control locks, persisted owner tokens, the `uncertain` dispatch state and process-tree guards prevent a second worker turn.
 2. **No data loss.** The runtime never resets, deletes or overwrites uncommitted work, and never deletes a partial directory. Only its own target clones are scratch.
-3. **No remote publication by the runtime.** Pushes, pull requests and merges into an adopted repository need the user's authority, exercised by the coordinator.
+3. **No remote publication by the runtime.** Pushes, pull requests and merges into an adopted repository need the user's authority, exercised by the coordinator. Workbench files never reach a delivered commit.
 4. **Evidence integrity.** A lab run is an execution the runtime performed at an exact target revision and lab snapshot. Agent reports are never recorded as runs.
 5. **Fast-forward promotion.** `project/` moves only by fast-forward, to a commit with a passing lab run and no open blocking findings on the lanes it includes.
 

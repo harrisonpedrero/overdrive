@@ -25,6 +25,8 @@ export function refusedRequest(error) {
 
 export const STATE_DIR = '.overdrive';
 export const CONFIG_FILE = 'overdrive.json';
+// Work that never ships (probes, harnesses, generated data, notes, plans); every repository OVERDRIVE uses ignores it.
+export const WORKBENCH_DIR = '.overdrive-workbench';
 
 export const now = () => new Date().toISOString();
 export const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));

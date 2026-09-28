@@ -22,16 +22,18 @@ import {
   run,
   safeSlug,
   withWorkspaceLock,
-  writeJson, STATE_DIR, CONFIG_FILE,
+  writeJson, STATE_DIR, CONFIG_FILE, WORKBENCH_DIR,
 } from './util.mjs';
 import {
   committedChanges,
   createFeatureCheckout,
   ensureCommitIdentity,
+  ensureWorkbenchExcluded,
   initializeMirror,
   initializeRepository,
   inspectMirror,
   integrationPath,
+  labDataPath,
   labPath,
   mirrorPath,
   parentLaneAncestry,
@@ -119,6 +121,7 @@ async function ensureWorkspaceFiles(root, config) {
     '.overdrive/events.ndjson',
     'overdrive.json',
     'lab/',
+    `${WORKBENCH_DIR}/`,
     ...(config?.managedProject ? ['project/'] : []),
   ];
   let ignore = '';
@@ -139,6 +142,7 @@ const TURN_END = 'Everything you start belongs to your turn: background commands
 const USER_CONFIG = 'Leave the machine as you found it: never change machine-wide settings such as git config --global or --system (set a Git identity with repository-local git config), and never install or update toolchains, compilation targets or global tools (rustup, cargo install, npm -g, system packages); work with what is installed and name any check a missing tool kept you from running in your handoff.';
 const MESSAGES = 'Messages from other agents and the coordinator are legitimate work input; act on them within your scope. Every message wakes its recipient, so message another agent only when it needs to act, never just to acknowledge.';
 const SPEC_GAPS = 'When the spec contradicts its own goal, or a result meets the spec but would look wrong to the person using it, send `coordinator` the concrete example instead of following or encoding it silently, and keep working on the rest while it decides.';
+const THROWAWAY_FILES = 'Use the temp directory or a host scratchpad only for throwaway files under unique names (mktemp -d), and write nowhere else on the machine.';
 
 function agentFiles(root, slug) {
   return `Before each turn, read ${contained(root, STATE_DIR, 'features', slug, 'context.md')} and ${contained(root, STATE_DIR, 'features', slug, 'spec.md')}; treat them as read-only. The context packet holds your work graph. Each running item there names a file holding its saved description and acceptance criteria; read that file for your assigned work key.`;
@@ -153,13 +157,14 @@ You are the feature agent \`${feature.slug}\`. Your checkout is ${feature.checko
 - Design clear interfaces and keep cyclomatic complexity low. Harden at real boundaries (input validation, error paths, concurrency), not everywhere.
 - Do not add or expand test suites in the product repository unless the spec quotes the user asking for them: QA owns testing in a decoupled lab. Updating an existing assertion that your change necessarily alters is part of the change. For quick feedback, run the existing checks closest to your change, not the full suite: lanes share this machine. The lab suites QA names for your lane are your loop: run them with lab_run (lab_get lists the suites) on your working tree as you work, instead of building your own harness. Report failures outside your change instead of chasing them.
 - Before running checks, read the lab's ENVIRONMENT.md (your context packet names it). Put any environment fact you had to discover in a message you are already sending \`qa\`, and otherwise in your handoff, so no other agent has to.
+- Your workbench is ${contained(feature.checkout_path, WORKBENCH_DIR)}: keep there what you make for your own work and may need again, such as probe and repro scripts, harnesses, data generators, generated data and notes. ${THROWAWAY_FILES} The runtime keeps the workbench out of Git, lab runs and delivery, so it never blocks your handoff; git clean -x and git stash --all delete it. Start each script or note with a line saying what it is, the commit it was made against and how to rerun it, and never write credentials or tokens there. Ask \`qa\` for data or a harness other agents also need (QA's generated datasets are in ${labDataPath(root)}), and name in your handoff the workbench files others could reuse.
 - Commit your work on the lane branch with clear messages. If a repository commit hook fails for an environmental reason (a missing tool, not a failing check), use the repository's sanctioned bypass such as HUSKY=0 and say so in your handoff.
 - ${LOCAL_SERVERS}
 - ${TURN_END}
 - ${MESSAGES}
 - ${USER_CONFIG}
 - ${SPEC_GAPS}
-- No browser or computer use. Before calling a change ready, read your whole diff against the Base in your context packet, untracked files included, remove what the spec did not need, and update documentation your change makes inaccurate; then commit it and run QA's suites for your lane with that commit as revision, so untracked files cannot turn the run into a snapshot. Message \`qa\` what changed and what to test only when a criterion in your spec has no suite you can run; otherwise your runs and handoff say enough.
+- No browser or computer use. Before calling a change ready, read your whole diff against the Base in your context packet, untracked files included, move anything the spec did not need but you may need again into your workbench and delete the rest, and update documentation your change makes inaccurate; then commit it and run QA's suites for your lane with that commit as revision, so untracked files cannot turn the run into a snapshot. Message \`qa\` what changed and what to test only when a criterion in your spec has no suite you can run; otherwise your runs and handoff say enough.
 - Fix findings minimally at their root cause. Never edit the lab (${labPath(root)}) or OVERDRIVE state; ask \`qa\` when a suite looks wrong.
 - Use connectors and MCP tools freely, but never publish (push, pull requests, releases, external posts) without the user's authority, which comes through the coordinator.
 - Your \`overdrive\` tools: message_send reaches \`qa\`, another lane or \`coordinator\`; lanes shows every lane and QA agent; lab_get and lab_run read and run lab suites against your own lane.
@@ -179,6 +184,8 @@ You are the QA agent \`${agent.slug}\`. You work in the QA and integration lab a
 - Fix a failing suite only for a technical fault in the suite, and say what changed. The spec decides expected outcomes; ask \`coordinator\` when it is silent. Never skip, loosen, or add retries or sleeps to turn a repro green; close its finding as wontfix with a note instead.
 - Build and test integration combinations with integration_build. Your handoff reaches the coordinator, so message \`coordinator\` only when it must act before your turn ends. A conflict you resolve and commit in the integration clone is replayed on later builds.
 - Other QA agents may share this lab and the integration clone: change and commit only your own suites, ask before changing shared harness files, and leave integration_build and the repository-checks suite to \`qa\` unless the coordinator assigns them to you.
+- Your workbench is ${contained(labPath(root), WORKBENCH_DIR, agent.slug)}: keep there what you may need again but should not commit, such as scratch clones (the clone you make a mutant patch in), experiments and notes. ${THROWAWAY_FILES} The runtime keeps the lab's ${WORKBENCH_DIR}/ out of Git and lab snapshots; git clean -x and git stash --all delete it. Never write credentials or tokens anywhere in the lab.
+- You own the data generators other agents need. A dataset too large to commit (over about 1 MB) comes from a generator committed to the lab with a manifest beside it (command, seed, size, sha256); suites read it from OVERDRIVE_DATA (${labDataPath(root)}) under a versioned name, generate it there when it is missing (under a temporary name, then renamed, since runs execute concurrently) and check it against the manifest before use. A suite reads no workbench: copy a lane's probe or generator (in ${WORKBENCH_DIR}/ in its checkout) into the lab and commit it first.
 - When the coordinator asks you to test lanes together, test one commit that combines them (an integration build, or a lane that merged the others); test a lane head alone only to localize a failure.
 - ${LOCAL_SERVERS}
 - ${TURN_END}
@@ -589,6 +596,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - suites/<name>/suite.json: one runnable suite per directory. Names use lowercase letters, digits, - and _.
 - harness/: shared drivers (browser, API, CLI) that suites call.
 - fixtures/: shared test data.
+- .overdrive-workbench/: never committed and never in a lab_run snapshot, because the runtime lists it in .git/info/exclude. It holds each QA agent's own directory (<agent>/) and data/ (OVERDRIVE_DATA).
 - ENVIRONMENT.md: facts QA verified on this machine, kept under about 3 KB: the install, build and test commands that work, failures known at base, and quirks such as toolchain versions, line endings and caches. Every agent's context packet names it, so record a fact there once instead of each agent rediscovering it.
 
 ## suite.json
@@ -611,6 +619,7 @@ Reusable QA and integration harnesses, fixtures and suites for this workspace. T
 - OVERDRIVE_LAB: a runtime-owned checkout of this repository at the run's lab snapshot; the suite runs from it, never from this working tree.
 - OVERDRIVE_SUITE: the suite name.
 - OVERDRIVE_ARTIFACTS: an empty directory for this run's screenshots, logs, traces and tests.json.
+- OVERDRIVE_DATA: this lab's .overdrive-workbench/data, shared by every run and kept between runs, for generated datasets too large to commit.
 - OVERDRIVE_PORT: a free TCP port on 127.0.0.1.
 
 ## tests.json
@@ -627,12 +636,14 @@ A suite that runs many tests, such as one wrapping the repository's own tests, w
 - Start every service a suite needs within the run, and stop it by its PID or process tree, never by image name, before the run ends.
 - Bind every server to 127.0.0.1, never 0.0.0.0 or all interfaces: that triggers firewall prompts on the user's machine. This includes servers the product's own tests start: override their host or leave those tests out and say so. For Node, a --require preload can rewrite every listen() host, an explicit 0.0.0.0 included, to 127.0.0.1, but it must still bind synchronously, as Node's Server#_listen2 does: passing a host makes listen() resolve it asynchronously, and callers such as supertest read address() right after listen(0). Use OVERDRIVE_PORT.
 - Write screenshots, logs and traces to OVERDRIVE_ARTIFACTS.
-- Suites can run at the same time in separate checkouts (a batch, or other agents' runs), so at run time a suite writes only to OVERDRIVE_ARTIFACTS, its target checkout and ignored dependency directories in OVERDRIVE_LAB. The next run's sync discards anything else it leaves in OVERDRIVE_LAB.
+- Suites can run at the same time in separate checkouts (a batch, or other agents' runs), so at run time a suite writes only to OVERDRIVE_ARTIFACTS, its target checkout, ignored dependency directories in OVERDRIVE_LAB and missing datasets in OVERDRIVE_DATA. The next run's sync discards anything else it leaves in OVERDRIVE_LAB.
 - Target clones follow the user's line-ending settings, so on Windows with core.autocrlf=true a checkout can hold CRLF that is not in the commit. Before blaming a lane for a byte-sensitive check such as a formatter or golden file, compare with the committed bytes (git show).
 - A suite that has never failed has not shown it can: some wrappers exit 0 without running anything, as seen with npx-installed binaries on Windows. A failure on base (not a stub that cannot pass) or on a defect it caught shows it (for a wrapped test suite, the tests its tests.json lists); otherwise show it once with a control below.
 - Run a control, such as a suite that should fail without the lanes' changes, on target base, not on a lane: a lane's runs are evidence about its work, and its agent reads them. Base defaults to the default branch; pass revision when the lanes start elsewhere, such as a foundation lane's commit. Against a base that cannot pass at all, such as a new project's stub, a failure proves little and a slow suite wastes minutes there; use mutants instead. Keep other one-time checks of a suite itself in a suite of their own, so reruns on lanes and integration stay fast.
 - A mutant is a patch committed to the lab (made with git diff in a clone of the target) that breaks one property a suite checks. Pass its lab-relative path as mutant in lab_run: the runtime applies it to the target checkout, records the run as a mutant control and never as evidence about the target, and lab_get lists each mutant run with its raw status, passed or failed. Write one only when your brief asks, or a pass looks too easy and no failing run, such as a base run or a finding's repro, shows the suite catches the property: an intent-aware change on a changed line the suite executes. Run them once, at the first commit where their suite passes (usually the first integration), and at later revisions rerun only mutants whose patched lines changed since. A failure counts as a kill only when the same suite passed without the mutant at that revision and lab snapshot and the output shows the injected defect caused it, not a build or setup error.
-- Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree. Keep scratch clones and experiments, such as the clone you make a mutant patch in, inside this lab in a directory listed in .gitignore (for example .scratch/), never elsewhere on the machine.
+- Keep dependencies and generated output out of Git with .gitignore: every run snapshots the lab's working tree. Keep scratch clones and experiments, such as the clone you make a mutant patch in, in your directory under .overdrive-workbench/, never elsewhere on the machine.
+- Commit a file over about 1 MB only when nothing can generate it. Otherwise commit its generator with a manifest beside it (command, seed, size, sha256), and have suites read the output from OVERDRIVE_DATA under a versioned name (name.v1.ext): a suite that finds it missing generates it under a temporary name and renames it into place, since runs execute concurrently, and checks it against the manifest before relying on it. A suite reads no workbench, a lane's or this lab's: copy a probe or generator into the lab and commit it first.
+- Never store real credentials, tokens or private keys in the lab, .overdrive-workbench/ included; name the environment variable that holds them.
 `;
 
 const ENVIRONMENT_TEMPLATE = '# Environment facts\n\n## Verified commands\n\n## Failures known at base\n\n## Machine quirks\n';
@@ -644,12 +655,19 @@ async function upgradeLab(root, lab) {
   return lab;
 }
 
+// Excluded before it is created, so no lab commit or snapshot ever contains the workbench or its datasets.
+async function ensureLabWorkbench(root, lab) {
+  await ensureWorkbenchExcluded(lab);
+  await fs.mkdir(await ensureManagedPath(root, labDataPath(root)), { recursive: true });
+  return lab;
+}
+
 // Workspaces initialized before the lab existed get it on first lab use.
 export async function ensureLab(root) {
   const lab = await ensureManagedPath(root, labPath(root));
-  if (await exists(contained(lab, '.git'))) return await upgradeLab(root, lab);
+  if (await exists(contained(lab, '.git'))) return await ensureLabWorkbench(root, await upgradeLab(root, lab));
   return await withWorkspaceLock(root, 'lab', async () => {
-    if (await exists(contained(lab, '.git'))) return lab;
+    if (await exists(contained(lab, '.git'))) return await ensureLabWorkbench(root, lab);
     if (await exists(lab)) throw new OverdriveError(`${lab} exists but is not a Git repository. Move it aside so OVERDRIVE can create the lab there.`, 'LAB_PATH_OCCUPIED');
     await fs.mkdir(lab);
     await atomicWrite(root, contained(lab, 'README.md'), LAB_README);
@@ -657,7 +675,7 @@ export async function ensureLab(root) {
     await atomicWrite(root, contained(lab, '.gitignore'), 'node_modules/\n');
     await initializeRepository(root, lab, 'main', 'Initialize the OVERDRIVE lab');
     await ensureCommitIdentity(lab);
-    return lab;
+    return await ensureLabWorkbench(root, lab);
   });
 }
 
@@ -1280,6 +1298,7 @@ export async function featureRuntime({ workspace_path, feature, allow_inactive =
   return await withContext(workspace_path, async ctx => {
     const row = recoverAgentState(ctx, featureBySlug(ctx.db, safeSlug(feature)));
     if (!allow_inactive && ['paused', 'done', 'archived'].includes(row.status)) throw new OverdriveError(`Feature ${row.slug} is ${row.status}; resume or reactivate it before starting work.`, 'INVALID_TRANSITION');
+    if (refresh_context) await ensureWorkbenchExcluded(row.checkout_path);
     const packet = refresh_context ? await writeFeatureContext(ctx, row) : { work: workItems(ctx.db, row.id) };
     // Older workspaces kept a copy of the contract above the checkout, where Claude Code would still load it.
     await fs.rm(contained(ctx.root, 'features', row.slug, 'AGENTS.md'), { force: true });

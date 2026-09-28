@@ -87,6 +87,7 @@ The runtime and the agent contracts hold these. Explain them when they shape a p
 - Worker processes, services they start included, end with their turns. When agents need a machine service such as Docker Desktop, start it yourself before starting them, or ask the user to.
 - No agent publishes: pushes, pull requests, releases and package publishes need the user's authority, through you.
 - A feature agent's lab access covers only its own lane, and among agents only QA agents record findings and build integrations. No agent can call your tools.
+- Work that never ships stays on this machine: each agent keeps its probes, harness scripts, generated data and notes in its workbench, an `.overdrive-workbench/` directory in its checkout or the lab, which the runtime keeps out of Git, lab snapshots and delivery. Keep your own plans, drafts, reviews and scripts in the workspace's `.overdrive-workbench/`, not the workspace root. Make a data generator that several agents need QA's job. Workbench files are never evidence; name those worth keeping by path in archive summaries and your final report.
 
 ## Recover
 

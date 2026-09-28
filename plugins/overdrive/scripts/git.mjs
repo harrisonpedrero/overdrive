@@ -11,13 +11,14 @@ import {
   git,
   redactString,
   run,
-  safeSlug, STATE_DIR,
+  safeSlug, STATE_DIR, WORKBENCH_DIR,
 } from './util.mjs';
 
 export const mirrorPath = root => contained(root, STATE_DIR, 'cache', 'repository.git');
 export const featureRoot = (root, slug) => contained(root, 'features', safeSlug(slug));
 export const checkoutPath = (root, slug) => contained(featureRoot(root, slug), 'repo');
 export const labPath = root => contained(root, 'lab');
+export const labDataPath = root => contained(labPath(root), WORKBENCH_DIR, 'data');
 export const integrationPath = root => contained(root, STATE_DIR, 'lab', 'integration');
 
 // Deep paths fail with "Filename too long" on Windows unless each working tree opts in; clone -c keeps it in the clone's config.
@@ -457,6 +458,18 @@ async function configureCommitIdentity(destination, config) {
   return readCommitIdentity(destination, note);
 }
 
+// Keeps a workbench out of add -A, snapshots, status and commits without changing a tracked file or the user's Git
+// configuration; worker file tools cannot write inside .git, so agents cannot remove the line.
+export async function ensureWorkbenchExcluded(repository) {
+  if (!await exists(path.join(repository, '.git'))) return;
+  const exclude = path.join(repository, '.git', 'info', 'exclude');
+  let text = '';
+  try { text = await fs.readFile(exclude, 'utf8'); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  if (text.split(/\r?\n/).includes(`${WORKBENCH_DIR}/`)) return;
+  await fs.mkdir(path.dirname(exclude), { recursive: true });
+  await fs.appendFile(exclude, `${text && !text.endsWith('\n') ? '\n' : ''}${WORKBENCH_DIR}/\n`, 'utf8');
+}
+
 export async function createFeatureCheckout(root, config, slug, baseRevision, baseRepository = mirrorPath(root)) {
   const destinationRoot = await ensureManagedPath(root, featureRoot(root, slug));
   const destination = await ensureManagedPath(root, checkoutPath(root, slug));
@@ -538,6 +551,13 @@ export async function isGitAncestor(repository, ancestor, descendant) {
     if (error?.code === 'COMMAND_FAILED') return false;
     throw error;
   }
+}
+
+// A workbench never reaches a delivered history, not even through a commit a later one reverted: an agent can force-add it.
+// Without --full-history, a merge that matches one parent there hides the other branch, such as a lane that added and removed one.
+export async function assertNoWorkbench(repository, base, commit) {
+  const touched = (await git(repository, 'rev-list', '-1', '--full-history', base ? `${base}..${commit}` : commit, '--', `:(glob)**/${WORKBENCH_DIR}/**`)).stdout;
+  if (touched) throw new OverdriveError(`${touched.slice(0, 12)}, in the history of ${commit.slice(0, 12)}, changes files under ${WORKBENCH_DIR}/, which are never delivered. Have the lane that made it rewrite its commits since base without them, then test and integrate the new commit.`, 'WORKBENCH_COMMITTED');
 }
 
 // Exact committed ancestry in a repository whose descendant commit was read: an ancestor object

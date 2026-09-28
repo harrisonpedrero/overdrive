@@ -5,10 +5,12 @@ import net from 'node:net';
 import path from 'node:path';
 import {
   applyMutant,
+  assertNoWorkbench,
   changesSinceMergeBase,
   committedChanges,
   integrationPath,
   isGitAncestor,
+  labDataPath,
   mergeConflicts,
   mergeIntoIntegration,
   mirrorPath,
@@ -665,7 +667,7 @@ async function runOnSlot(ctx, { name, target, lane, spec, mutant }, subject, slo
   const env = {
     ...process.env,
     OVERDRIVE_TARGET: checkout, OVERDRIVE_REVISION: commit, OVERDRIVE_LAB: lab, OVERDRIVE_SUITE: name,
-    OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_PORT: String(await freePort()),
+    OVERDRIVE_ARTIFACTS: artifacts, OVERDRIVE_DATA: labDataPath(ctx.root), OVERDRIVE_PORT: String(await freePort()),
   };
   const row = {
     id, suite: name, target, revision: commit, lab_revision: labRevision, lanes_json: lanesJson, mutant, argv_json: JSON.stringify(spec.argv), cwd,
@@ -1383,6 +1385,7 @@ async function suitesNotRunAt(ctx, runs) {
 }
 
 async function promote(ctx, { target, base, commit, source, branch, lanes }) {
+  await assertNoWorkbench(source, base, commit);
   const changes = await committedChanges(source, base, commit);
   // A base control belongs to no lane, even at a lane's commit, so it never qualifies a delivery; a legacy lane named base keeps that address, as in runLabSuite.
   const passing = ctx.db.prepare(`SELECT id FROM lab_runs WHERE revision = ? AND status = 'passed' AND mutant IS NULL
