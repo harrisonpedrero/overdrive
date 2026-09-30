@@ -67,7 +67,7 @@ export const TOOLS = [
   tool('workspace_init', 'Initialize OVERDRIVE', 'Adopt a Git repository in a control workspace. Creates a private bare cache and durable local state; it does not run repository setup scripts.', object({
     ...workspace,
     repository: string('Credential-free Git URL, SSH remote, or absolute local repository path.'),
-    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in overdrive.json.', { enum: ['codex', 'claude'] }),
+    harness: string('Lane worker harness: codex or claude. When omitted, follows the initializing host: claude from Claude Code, otherwise codex. Editable later as "harness" in overdrive.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'repository']), { destructiveHint: false, idempotentHint: true, openWorldHint: true }),
 
   tool('project_create', 'Create managed project', 'Start a new project from scratch inside the control workspace, create its initial Git commit, and initialize OVERDRIVE against it.', object({
@@ -75,7 +75,7 @@ export const TOOLS = [
     project_name: string('Human-readable project name.'),
     description: string('Concrete product brief for the new project.'),
     default_branch: string('Initial branch name; defaults to main.'),
-    harness: string('Lane worker harness: codex (default) or claude. Editable later as "harness" in overdrive.json.', { enum: ['codex', 'claude'] }),
+    harness: string('Lane worker harness: codex or claude. When omitted, follows the initializing host: claude from Claude Code, otherwise codex. Editable later as "harness" in overdrive.json.', { enum: ['codex', 'claude'] }),
   }, ['workspace_path', 'project_name', 'description']), { destructiveHint: false, idempotentHint: true }),
 
   tool('doctor', 'Check OVERDRIVE', 'Check the local Git, Node, configured worker harness CLI (Codex or Claude Code), state database, and repository cache needed by this workspace.', object(workspace, ['workspace_path']), { readOnlyHint: true, idempotentHint: true }),
@@ -151,7 +151,7 @@ export const TOOLS = [
     page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('agent_start', 'Start agent', 'Start or resume a lane or QA agent’s worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only its own context and the repository instructions. Messages waiting for the agent are included in the turn. For a bounded work item, include its key and outcome in instruction.', object({
+  tool('agent_start', 'Start agent', 'Start or resume a lane or QA agent’s worker task (a Codex task or Claude Code session on the harness and model overdrive.json configures; a recorded task resumes on the harness that created it) with only its own context and the repository instructions. Messages waiting for the agent are included in the turn. For a bounded work item, include its key and outcome in instruction.', object({
     ...workspace,
     ...agent,
     instruction: string('Optional immediate direction; otherwise the lane’s next action is used.'),
