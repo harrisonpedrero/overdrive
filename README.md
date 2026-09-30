@@ -5,7 +5,7 @@
 You describe the work to a coordinator. It writes a spec for each feature and gives each one its own clone and worker agent. QA agents build tests in a separate lab and send failures straight to the lane that owns them. A local runtime keeps the state, runs the tests and does the Git work, so the conversation stays about what to build and whether it is done.
 
 <p align="center">
-  <img src="docs/assets/overdrive.svg" width="860" alt="The coordinator sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages and executes lab runs. A lane goes to delivery directly or through an optional integration build that merges several, and delivery needs a passing run at the exact commit with no blocking findings.">
+  <img src="docs/assets/overdrive.svg" width="500" alt="The coordinator sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages and executes lab runs. A lane goes to delivery directly or through an optional integration build that merges several, and delivery needs a passing run at the exact commit with no blocking findings.">
 </p>
 
 ## Quick start
