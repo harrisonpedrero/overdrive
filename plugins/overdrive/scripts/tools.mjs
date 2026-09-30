@@ -151,7 +151,7 @@ export const TOOLS = [
     page: integer('Optional 24-item page of the default large-graph order, starting at 1. Each call reflects current state; after work status changes, start again at page 1 because page membership may shift. Cannot be combined with work_items.', 1, 1000),
   }, ['workspace_path', 'feature']), { readOnlyHint: true, idempotentHint: true }),
 
-  tool('agent_start', 'Start agent', 'Start or resume a lane or QA agent’s worker task (a GPT-6 Sol Codex task by default, or a Claude Code session when overdrive.json sets harness to claude) with only its own context and the repository instructions. Messages waiting for the agent are included in the turn. For a bounded work item, include its key and outcome in instruction.', object({
+  tool('agent_start', 'Start agent', 'Start or resume a lane or QA agent’s worker task (a Codex task or Claude Code session on the harness and model overdrive.json configures; a recorded task resumes on the harness that created it) with only its own context and the repository instructions. Messages waiting for the agent are included in the turn. For a bounded work item, include its key and outcome in instruction.', object({
     ...workspace,
     ...agent,
     instruction: string('Optional immediate direction; otherwise the lane’s next action is used.'),
