@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 300" width="860" height="300" role="img" aria-labelledby="title desc">
+  <title id="title">How OVERDRIVE fits together</title>
+  <desc id="desc">The coordinator conversation sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages, executes lab runs and does the Git work. Lanes merge into an integration build, and delivery requires a passing run at the exact commit: a managed project fast-forwards, an adopted repository gets push and fetch commands.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0 0L10 5L0 10z"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .title { font-size: 16px; font-weight: 600; }
+    .sub { font-size: 13px; fill: #59636e; }
+    .label { font-size: 12px; fill: #59636e; }
+    .box { fill: #ffffff; stroke: #d1d9e0; stroke-width: 1.5; }
+    .accent { fill: #f5f0ff; stroke: #7c3aed; stroke-width: 1.5; }
+    .line { fill: none; stroke: #818b98; stroke-width: 1.5; }
+    .head { fill: #818b98; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #f0f6fc; }
+      .sub, .label { fill: #9198a1; }
+      .box { fill: #151b23; stroke: #3d444d; }
+      .accent { fill: #221a38; stroke: #a78bfa; }
+      .line { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+
+  <rect class="accent" x="20" y="20" width="250" height="66" rx="8"/>
+  <text class="title" x="38" y="47">Coordinator</text>
+  <text class="sub" x="38" y="69">your Codex or Claude Code session</text>
+
+  <rect class="box" x="20" y="196" width="250" height="84" rx="8"/>
+  <text class="title" x="38" y="223">Runtime</text>
+  <text class="sub" x="38" y="245">local code: state, messages,</text>
+  <text class="sub" x="38" y="264">lab runs, Git mechanics</text>
+
+  <rect class="box" x="338" y="28" width="230" height="66" rx="8"/>
+  <rect class="box" x="334" y="24" width="230" height="66" rx="8"/>
+  <rect class="box" x="330" y="20" width="230" height="66" rx="8"/>
+  <text class="title" x="348" y="47">Feature lanes</text>
+  <text class="sub" x="348" y="69">a full clone and agent each</text>
+
+  <rect class="box" x="330" y="196" width="230" height="84" rx="8"/>
+  <text class="title" x="348" y="223">QA agents</text>
+  <text class="sub" x="348" y="245">suites in lab/, never pushed,</text>
+  <text class="sub" x="348" y="264">run at exact commits</text>
+
+  <rect class="box" x="620" y="20" width="220" height="66" rx="8"/>
+  <text class="title" x="638" y="47">Integration build</text>
+  <text class="sub" x="638" y="69">lanes merged for testing</text>
+
+  <rect class="box" x="620" y="196" width="220" height="84" rx="8"/>
+  <text class="title" x="638" y="223">Delivery</text>
+  <text class="sub" x="638" y="245">managed: fast-forward</text>
+  <text class="sub" x="638" y="264">adopted: push and fetch</text>
+
+  <path class="line" d="M270 53H328" marker-end="url(#arrow)"/>
+  <text class="label" x="280" y="45">specs</text>
+
+  <path class="line" d="M100 88V194" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text class="label" x="110" y="145">tools</text>
+
+  <path class="line" d="M272 238H328" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text class="label" x="284" y="230">runs</text>
+
+  <path class="line" d="M445 96V194" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text class="label" x="455" y="138">findings,</text>
+  <text class="label" x="455" y="154">fixes</text>
+
+  <path class="line" d="M572 53H618" marker-end="url(#arrow)"/>
+
+  <path class="line" d="M730 88V194" marker-end="url(#arrow)"/>
+  <text class="label" x="740" y="138">passing run,</text>
+  <text class="label" x="740" y="154">no blockers</text>
+</svg>

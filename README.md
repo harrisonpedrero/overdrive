@@ -1,90 +1,84 @@
 # OVERDRIVE
 
-OVERDRIVE runs parallel feature work against one repository from a single Codex or Claude Code conversation. Each feature lane gets its own full clone, spec and worker agent. QA agents build and run test suites in a separate lab and send findings straight to the lanes, and agents message each other as they work. A local runtime owns the clones, the durable state, the test evidence and the integration Git mechanics, and enforces what each worker may do. The conversation is the only interface.
+**Parallel feature work on one repository, run from a single Codex or Claude Code conversation.**
 
-## Daily use
+You describe the work to a coordinator. It writes a spec for each feature and gives each one its own clone and worker agent. QA agents build tests in a separate lab and send failures straight to the lane that owns them. A local runtime keeps the state, runs the tests and does the Git work, so the conversation stays about what to build and whether it is done.
 
-Open `workspace/` as the coordinator's working directory and ask in ordinary language:
+Nothing is pushed, opened as a pull request or merged into a repository you adopted until you ask.
 
-- `Use OVERDRIVE with https://github.com/owner/repository.git`
-- `Start a new OVERDRIVE project called Atlas that helps teams triage incidents.`
-- `Create a search-redesign lane, help me refine the spec, then start it.`
-- `Add a QA agent that covers the search and checkout journeys in the browser.`
-- `What is every agent doing, and is anything waiting on me?`
-- `Tell search-redesign to keep the public API stable.`
-- `Build an integration of search-redesign and billing-recovery and have QA test it.`
-- `Integrate the tested build into the project.`
-- `Push the tested search-redesign commit and open a pull request.`
+## How it works
 
-Agents run in parallel and coordinate through messages; the coordinator steps in to decide, unblock or redirect. Nothing is pushed, opened as a pull request or merged into an adopted repository until you ask.
+<p align="center">
+  <img src="docs/assets/overdrive.svg" width="860" alt="The coordinator sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages and executes lab runs. Lanes merge into an integration build, and a passing run at the exact commit with no blocking findings is required for delivery.">
+</p>
 
-## Models and harnesses
+**Lanes.** A lane is one feature: a full clone on `feature/<slug>`, a spec that survives restarts, and a worker agent. Lanes share no working tree, so one agent's half-finished edit is never another agent's build failure.
 
-The coordinator uses the model of your Codex task or Claude Code session. `workspace/.codex/config.toml` makes GPT-6 Astra the default for Codex tasks opened in `workspace/`.
+**The lab.** QA agents keep suites, harnesses and fixtures in `lab/`, a local Git repository beside the lanes that is never pushed. A test can span three lanes and their integration without landing in anyone's product commit, and feature agents add product tests only when you ask for them.
 
-Workers are configured separately in the workspace's `overdrive.json`:
+**Evidence.** `lab_run` executes a suite in a clean clone at an exact commit, with the lab pinned to a snapshot, and records the verdict, output and artifacts. Those records are evidence. An agent reporting that the tests pass has sent a message, and it is never recorded as a run.
 
-```json
-{
-  "harness": "codex",
-  "codex": { "model": "gpt-6-sol", "laneModels": { "search-redesign": "gpt-6-luna" } }
-}
-```
+**Messages.** Agents write to each other and to the coordinator directly. A QA finding reaches its lane with the suite that reproduces it, and a passing run of that suite on a commit containing the one it failed at resolves it. The coordinator steps in to decide, unblock or redirect, not to forward mail.
 
-`harness` is `codex` (the default) or `claude`. The matching `codex` or `claude` object sets a workspace `model` and per-agent `laneModels`, keyed by lane slug or QA agent name. Codex workers default to `gpt-6-sol`; Claude workers default to the Claude CLI's configured model and accept exact IDs such as `claude-opus-5-5`. When you name a worker model, the coordinator records it here. The [operator guide](docs/operator-guide.md#overdrivejson) lists every setting.
+**Delivery.** `integration_build` merges lanes into an integration clone for QA to test. For a project OVERDRIVE manages, `integrate` fast-forwards `project/` to a commit only when a lane or integration run passed at that exact commit and no blocking finding is open. For a repository you adopted, it publishes nothing: it returns push and fetch commands, and the coordinator runs the push only with your say-so.
 
-## The lab
+That is most of the machinery. Nothing moves a lane through stages; the runtime enforces the few rules it can check exactly (one live turn per agent, no lost uncommitted work, no publishing, evidence only from executed runs, fast-forward-only promotion) and leaves the rest to the coordinator's judgment. That includes not splitting: a tightly coupled change usually goes better as one lane than as three that have to agree.
 
-`lab/` in the workspace is a local Git repository that belongs to the QA agents: harnesses, fixtures and suites at `lab/suites/<name>/suite.json`. It is decoupled from the product repository and never pushed, so tests can span several lanes and their integration without landing in product commits. Feature agents do not add tests to the product repository unless you ask for them. Work that should never ship, such as probes, generated data and plans, stays in each agent's `.overdrive-workbench/`, which OVERDRIVE keeps out of Git and delivery.
+## Quick start
 
-Only runs the runtime executes count as evidence. `lab_run` runs a suite in a clean clone at an exact revision of a lane (by default its committed HEAD, or for the lane's own agent a snapshot of its working tree, uncommitted changes included) or of the integration build, with the lab itself pinned to a snapshot, and records the verdict, output and artifacts. An agent's report of a passing test is never recorded as a run. A passing run of a finding's repro suite resolves that finding, and integrating into a managed project requires a passing lane or integration run at that exact commit, never a base control run, with no open blocking findings.
+You need Node.js 24 or later, Git, and the Claude Code or Codex CLI. Clone the repository and register the checkout as a plugin marketplace:
 
-## Boundaries
-
-- The coordinator owns intent, specs, priorities, delivery decisions and your authority.
-- The runtime never pushes, never resets or deletes uncommitted work, and moves a managed `project/` only by fast-forward.
-- Every worker keeps your MCP servers, connectors, skills and web tools. The runtime denies publishing (push, pull request, release, package publish) to all workers, browser and computer control to feature agents, and OVERDRIVE's coordinator tools to both.
-- Private reasoning is never stored or shown; visible messages are reports, not proof.
-
-[Architecture](docs/architecture.md) describes how the runtime enforces this; the [operator guide](docs/operator-guide.md) covers configuration, the lab, integration and recovery.
-
-## Installation
-
-Requirements: Node.js 24 or later, Git, and the CLI of the worker harness you use (Codex or Claude Code). Both hosts install from the `overdrive-local` marketplace in this repository.
-
-Codex:
-
-```powershell
-codex plugin marketplace add C:\path\to\overdrive
-codex plugin add overdrive@overdrive-local
+```sh
+git clone https://github.com/harrisonpedrero/overdrive.git
+cd overdrive
 ```
 
 Claude Code:
 
-```powershell
-claude plugin marketplace add C:\path\to\overdrive
+```sh
+claude plugin marketplace add "$PWD"
 claude plugin install overdrive@overdrive-local
 ```
 
-Start a new task or session afterward so it loads the plugin. For a single Claude Code session without installing, run `claude --plugin-dir C:\path\to\overdrive\plugins\overdrive`.
+Codex:
 
-Claude Code loads a plugin from a local-directory marketplace, like the one above, in place: to pick up source changes, start a new session or run `/reload-plugins`. A marketplace added from a Git URL is installed as a cached copy versioned by commit, because the Claude manifest has no `version`. To update it, run `claude plugin marketplace update overdrive-local`, then `claude plugin update overdrive@overdrive-local`, then start a new session.
-
-Claude Code asks before every OVERDRIVE call. To be asked only where Codex asks (adopting a repository, integrating, and answering an agent's request), add this to your user or project settings:
-
-```json
-"permissions": {
-  "allow": ["mcp__plugin_overdrive_overdrive"],
-  "ask": [
-    "mcp__plugin_overdrive_overdrive__workspace_init",
-    "mcp__plugin_overdrive_overdrive__integrate",
-    "mcp__plugin_overdrive_overdrive__agent_request_resolve"
-  ]
-}
+```sh
+codex plugin marketplace add "$PWD"
+codex plugin add overdrive@overdrive-local
 ```
 
-Keep only one copy of the coordinator plugin enabled. If another copy is installed under a different name, disable it with `claude plugin disable <plugin>@<marketplace>` in Claude Code, or with `enabled = false` under its `[plugins."<plugin>@<marketplace>"]` entry in `~/.codex/config.toml`.
+`"$PWD"` works in PowerShell, bash and zsh, and the quotes keep a path with spaces in one piece.
 
-## Existing workspaces
+Open the `workspace/` folder in a new Claude Code session or Codex task and say what you want:
 
-OVERDRIVE upgrades a workspace in the older layout the first time it opens it. Before any lock or database is opened, the state directory and configuration file are renamed to `.overdrive/` and `overdrive.json`, the workspace `.gitignore` and `AGENTS.md` are updated, and the database schema is upgraded in place. Lanes, specs, work, agent sessions and history carry over, and recorded evidence stays readable in `feature_get`. Close other sessions using the workspace first. If both the old and the new state exist, OVERDRIVE stops with `MIGRATION_CONFLICT`; keep the one holding current state and move the other aside.
+> Use OVERDRIVE with https://github.com/acme/storefront.git. Add saved carts and faster product search as separate lanes, and have QA cover checkout and search in the browser.
+
+Later in the same conversation:
+
+> Build an integration of both lanes, have QA run everything against it, and tell me what stands between it and a pull request.
+
+To start from nothing instead, describe the product; the coordinator creates it as a managed project in `project/`.
+
+The [operator guide](docs/operator-guide.md) covers updating the plugin, quieter permission prompts in Claude Code, worker models and recovery.
+
+## Models
+
+The coordinator is whatever model your session uses. Workers are configured separately, in the workspace's `overdrive.json`: the `harness` (`claude` when the workspace was initialized from Claude Code, otherwise `codex`), a workspace `model` and per-agent `laneModels`. Name a worker model in conversation and the coordinator records it there. Codex workers default to `gpt-6-sol`; Claude workers default to the Claude CLI's configured model. Every setting is in the [operator guide](docs/operator-guide.md#overdrivejson).
+
+## Boundaries
+
+Workers keep your MCP servers, connectors, skills and web tools. The runtime's permission policy denies:
+
+- publishing, for every worker: `git push`, pull request and issue writes, releases, package publishes;
+- OVERDRIVE's coordinator tools, for every worker;
+- browser and computer control, for feature agents (QA agents keep it for UI testing);
+- `git config --global` and `--system` writes, and file-tool writes outside the agent's own checkout (for QA, `lab/` and the integration clone) and the temp directory.
+
+It is a capability boundary, not a sandbox. Shell commands run with your privileges and are not path-checked, and publishing is matched by command text, so a script that uploads something is not caught. On Claude Code the policy runs as a hook on every tool call; Claude Code still runs the call if the hook cannot start or times out, or if managed settings turn hooks off. On Codex it sees only escalations out of the `workspace-write` sandbox. [Architecture](docs/architecture.md#security-properties) has the details.
+
+Private reasoning is never stored or shown.
+
+## Documentation
+
+- [Operator guide](docs/operator-guide.md): setup, configuration, the lab, integration, updates and recovery.
+- [Architecture](docs/architecture.md): storage, capability profiles, message delivery, and how runs, findings and integration work.

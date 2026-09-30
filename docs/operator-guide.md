@@ -1,23 +1,43 @@
 # Operator guide
 
-The [README](../README.md) covers daily use and installation. This guide covers setup, configuration, the lab, integration and recovery.
+The [README](../README.md) covers the idea and the quick start. This guide covers installation details, configuration, the lab, integration and recovery.
+
+## Installing and updating
+
+The [quick start](../README.md#quick-start) registers your checkout as the `overdrive-local` marketplace and installs from it. To try the plugin in one Claude Code session without installing it, run `claude --plugin-dir "<checkout>/plugins/overdrive"` instead.
+
+- **Claude Code** loads a plugin from a local-directory marketplace in place: after pulling, start a new session or run `/reload-plugins`. A marketplace added from a Git URL is installed as a cached copy versioned by commit, because the Claude manifest has no `version`. Update it with `claude plugin marketplace update overdrive-local`, then `claude plugin update overdrive@overdrive-local`, then start a new session.
+- **Codex** installs a cached copy keyed by the plugin's version. After pulling a new version, run `codex plugin add overdrive@overdrive-local` again and start a new task.
+
+Keep only one copy of the coordinator plugin enabled. If another copy is installed under a different name, disable it with `claude plugin disable <plugin>@<marketplace>` in Claude Code, or with `enabled = false` under its `[plugins."<plugin>@<marketplace>"]` entry in `~/.codex/config.toml`.
+
+**Approval prompts.** In Codex, `workspace_init`, `integrate` and `agent_request_resolve` ask for approval before running, and other OVERDRIVE tools do not. Claude Code asks before every OVERDRIVE call. To be asked only where Codex asks, add this to your Claude Code user or project settings:
+
+```json
+"permissions": {
+  "allow": ["mcp__plugin_overdrive_overdrive"],
+  "ask": [
+    "mcp__plugin_overdrive_overdrive__workspace_init",
+    "mcp__plugin_overdrive_overdrive__integrate",
+    "mcp__plugin_overdrive_overdrive__agent_request_resolve"
+  ]
+}
+```
 
 ## Setup
 
-1. Install the plugin ([README](../README.md#installation)). OVERDRIVE looks for the worker CLI on `PATH`, and for Claude also in `~/.local/bin`. Set `CODEX_CLI_PATH` or `CLAUDE_CLI_PATH` to use a different executable; under a Codex coordinator only `CODEX_CLI_PATH` reaches the server.
+1. Install the plugin. OVERDRIVE looks for the worker CLI on `PATH`, and for Claude also in `~/.local/bin`. Set `CODEX_CLI_PATH` or `CLAUDE_CLI_PATH` to use a different executable.
 2. Open an empty folder, such as `workspace/`, as the coordinator's working directory.
-3. Adopt a repository with `workspace_init` (a credential-free URL, SSH remote or absolute local path), or start one from a brief with `project_create`. Either creates `overdrive.json`, `.overdrive/` and the lab. The response lists detected ecosystems and setup hints; nothing from the repository is executed.
+3. Adopt a repository with `workspace_init` (a credential-free URL, SSH remote or absolute local path), or start one from a brief with `project_create`. Either creates `overdrive.json`, `.overdrive/` and the lab, and records the worker harness: `claude` when the coordinator runs in Claude Code, `codex` otherwise, unless the call names one. The response lists detected ecosystems and setup hints; nothing from the repository is executed.
 4. Run `doctor` after setup or whenever something looks wrong. It checks Git, Node, the configured worker CLI, `overdrive.json`, database integrity, the repository cache, the managed project and lane paths.
 
 Each lane is a full clone at `features/<slug>/repo` on `feature/<slug>`, created from the refreshed default revision or from `base_revision`. To start from another lane's unintegrated commit, pass that lane as `base_feature` and the commit ID, full or at least 7 hex digits, as `base_revision`. Such a lane's `feature_get` and context packet name that parent lane from the lane's creation record and compare commits exactly each time they are refreshed: `parentLane` gives the parent's committed `head`, whether it still contains the selected base (`selectedInParentHistory`), and whether this lane's committed HEAD contains that parent HEAD (`headInLane`). The packet advises reviewing the lane's assumptions when either is false. When the parent's checkout or commits cannot be read, `parentLane` carries an `unavailable` reason instead. Nothing is fetched, merged or rebased, and only the direct parent is compared.
 
 A clone commits with a locally adopted repository's own `user.name` and `user.email` when that repository sets both, or else with your configured Git identity. Failing both, it commits as the clone-local `OVERDRIVE <overdrive@local.invalid>`. Global Git config is never changed. `feature_create` reports the identity Git will record and the commands for a lane-local override.
 
-In Codex, `workspace_init`, `integrate` and `agent_request_resolve` ask for approval before running.
-
 ## overdrive.json
 
-`workspace_init` and `project_create` write the repository fields; leave those alone. You, or the coordinator on your behalf, edit these:
+`workspace_init` and `project_create` write the repository fields; leave those alone. You, or the coordinator on your behalf, edit the worker settings:
 
 ```json
 {
@@ -37,7 +57,7 @@ In Codex, `workspace_init`, `integrate` and `agent_request_resolve` ask for appr
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `harness` | `codex` | Harness for new agent sessions. A saved session always resumes on the harness that created it; `agent_start` with `force_new_session: true` replaces it on the current one, and the old conversation stays in its backend. |
+| `harness` | Set at initialization to match the host; `codex` when absent | Harness for new agent sessions. A saved session always resumes on the harness that created it; `agent_start` with `force_new_session: true` replaces it on the current one, and the old conversation stays in its backend. |
 | `codex.model`, `claude.model` | `gpt-6-sol`; the Claude CLI's configured model | Worker model for the workspace. Claude accepts exact IDs and CLI aliases. |
 | `codex.laneModels`, `claude.laneModels` | none | Per-agent model, keyed by lane slug or QA agent name. |
 | `claude.permissionMode` | `acceptEdits` | One of `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`. Decides which calls prompt. |
@@ -130,6 +150,8 @@ Both results, and a lane's `git` in `feature_get`, `agent_inspect` and finished 
 - `AGENT_OWNED` means another live coordinator session runs the lane: use that session or wait for its turn to end.
 
 **Directories.** OVERDRIVE never deletes a directory it did not finish creating. For `PARTIAL_INITIALIZATION`, `FEATURE_PATH_OCCUPIED`, `LAB_PATH_OCCUPIED` or `CLONE_INVALID`, inspect the named path, keep what matters, move it aside and retry. `INTEGRATION_DIRTY` means an unfinished resolution in the integration clone: commit it or abort it there.
+
+**Older workspaces.** OVERDRIVE upgrades a workspace in the older layout the first time it opens it. Before any lock or database is opened, the state directory and configuration file are renamed to `.overdrive/` and `overdrive.json`, the workspace `.gitignore` and `AGENTS.md` are updated, and the database schema is upgraded in place. Lanes, specs, work, agent sessions and history carry over, and recorded evidence stays readable in `feature_get`. Close other sessions using the workspace first. If both the old and the new state exist, OVERDRIVE stops with `MIGRATION_CONFLICT`; keep the one holding current state and move the other aside.
 
 ## Windows notes
 
