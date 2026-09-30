@@ -5,7 +5,7 @@
 You describe the work to a coordinator. It writes a spec for each feature and gives each one its own clone and worker agent. QA agents build tests in a separate lab and send failures straight to the lane that owns them. A local runtime keeps the state, runs the tests and does the Git work, so the conversation stays about what to build and whether it is done.
 
 <p align="center">
-  <img src="docs/assets/overdrive.svg" width="860" alt="The coordinator sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages and executes lab runs. Lanes merge into an integration build, and delivery needs a passing run at the exact commit with no blocking findings.">
+  <img src="docs/assets/overdrive.svg" width="860" alt="The coordinator sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages and executes lab runs. A lane goes to delivery directly or through an optional integration build that merges several, and delivery needs a passing run at the exact commit with no blocking findings.">
 </p>
 
 ## Quick start
@@ -47,9 +47,9 @@ To start from nothing instead, describe the product; the coordinator creates it 
 
 **Lanes and the lab.** A lane is one feature: a full clone on `feature/<slug>`, a durable spec and a worker agent. Lanes share no working tree, so agents don't trip over each other's half-finished edits. QA agents keep suites, harnesses and fixtures in `lab/`, a local Git repository beside the lanes that is never pushed, so a test can span several lanes and their integration without landing in a product commit.
 
-**Evidence and messages.** `lab_run` executes a suite in a clean clone at an exact commit, with the lab pinned to a snapshot, and records the verdict, output and artifacts. Those records are the evidence; an agent saying the tests pass has sent a message, which is never recorded as a run. Agents message each other and the coordinator directly. A QA finding reaches its lane with the suite that reproduces it, and a passing run of that suite on a commit containing the one it failed at resolves it.
+**Evidence and messages.** `lab_run` executes a suite in a clean clone at an exact commit, with the lab pinned to a snapshot, and records the verdict, output and artifacts. Those records are the evidence; an agent saying the tests pass has sent a message, which is never recorded as a run. Agents message each other and the coordinator directly. A QA finding goes to the lane that owns it with how to reproduce it, and a passing rerun recorded after the fix can confirm it.
 
-**Delivery.** `integration_build` merges lanes into an integration clone for QA to test. For a project OVERDRIVE manages, `integrate` fast-forwards `project/` only to a commit with a passing lane or integration run at that exact commit and no open blocking findings. For a repository you adopted, it publishes nothing and returns push and fetch commands instead; the coordinator pushes or opens a pull request only when you ask.
+**Delivery.** A tested lane can be delivered on its own; when lanes need testing together, `integration_build` merges them into an integration clone first. For a project OVERDRIVE manages, `integrate` fast-forwards `project/` only to a commit with a passing lane or integration run at that exact commit and no open blocking findings. For a repository you adopted, it publishes nothing and returns push and fetch commands instead; the coordinator pushes or opens a pull request only when you ask.
 
 Everything else is judgment. Nothing moves a lane through stages: the runtime enforces the few rules it can check exactly and leaves specs, priorities, reviews and delivery calls to the coordinator. That includes not splitting work, since a tightly coupled change usually goes better as one lane than as three that have to agree.
 

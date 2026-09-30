@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 300" width="860" height="300" role="img" aria-labelledby="title desc">
   <title id="title">How OVERDRIVE fits together</title>
-  <desc id="desc">The coordinator conversation sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages, executes lab runs and does the Git work. Lanes merge into an integration build, and delivery requires a passing run at the exact commit: a managed project fast-forwards, an adopted repository gets push and fetch commands.</desc>
+  <desc id="desc">The coordinator conversation sends specs to feature lanes, each a full clone with its own agent. QA agents keep suites in a separate lab and exchange findings and fixes with the lanes. A local runtime holds state, delivers messages, executes lab runs and does the Git work. A lane goes to delivery directly or through an optional integration build that merges several, and delivery requires a passing run at the exact commit: a managed project fast-forwards, an adopted repository gets push and fetch commands.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path class="head" d="M0 0L10 5L0 10z"/>
@@ -47,7 +47,7 @@
 
   <rect class="box" x="620" y="20" width="220" height="66" rx="8"/>
   <text class="title" x="638" y="47">Integration build</text>
-  <text class="sub" x="638" y="69">lanes merged for testing</text>
+  <text class="sub" x="638" y="69">optional: lanes merged</text>
 
   <rect class="box" x="620" y="196" width="220" height="84" rx="8"/>
   <text class="title" x="638" y="223">Delivery</text>
@@ -69,7 +69,8 @@
 
   <path class="line" d="M572 53H618" marker-end="url(#arrow)"/>
 
+  <path class="line" d="M570 80H598V150H730"/>
   <path class="line" d="M730 88V194" marker-end="url(#arrow)"/>
-  <text class="label" x="740" y="138">passing run,</text>
-  <text class="label" x="740" y="154">no blockers</text>
+  <text class="label" x="740" y="170">passing run,</text>
+  <text class="label" x="740" y="186">no blockers</text>
 </svg>
